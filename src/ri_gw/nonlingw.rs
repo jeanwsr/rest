@@ -200,13 +200,17 @@ pub fn build_rpa_setup(
     if n_trans == 0 {
         panic!("[rpa] no RPA transitions survived the cutoffs");
     }
-    if n_trans > 6000 {
+    let max_transitions = qp_ctrl.feast_gw_rpa_max_transitions.max(1);
+    if n_trans > max_transitions {
         panic!(
             "[rpa] the dense RPA problem has {} transitions; this would need ~{:.1} GB. \
-             Reduce the transition space with feast_gw_rpa_energy_max, \
+             The configured limit is {} transitions.  Raise \
+             feast_gw_rpa_max_transitions if enough memory is available, or reduce \
+             the transition space with feast_gw_rpa_energy_max, \
              feast_gw_rpa_occ_max or feast_gw_rpa_vir_max.",
             n_trans,
-            (n_trans as f64 * n_trans as f64 * 8.0 * 2.0) / 1.0e9
+            (n_trans as f64 * n_trans as f64 * 8.0 * 2.0) / 1.0e9,
+            max_transitions
         );
     }
     if n_trans > 1500 {
@@ -361,6 +365,84 @@ impl SelfEnergyData {
         out
     }
 
+    /// Derivative of the real-axis correlation self-energy matvec,
+    /// `d/dlambda [Sigma_c(lambda) x]`, used for the quasiparticle spectral
+    /// weight.  The denominators are differentiated analytically so the result
+    /// is stable even when `eta` is small.
+    fn sigma_derivative_matvec(&self, lambda: f64, x: &[f64]) -> Vec<f64> {
+        let n_g = self.g_energies.len();
+        let n_active = self.n_active;
+        let mut out = vec![0.0_f64; n_active];
+        let mut y = vec![0.0_f64; n_g];
+        let mut z = vec![0.0_f64; n_active];
+
+        if self.diagonal_only {
+            for p in 0..n_active {
+                let mut diag = 0.0_f64;
+                for (s, u) in self.u_s.iter().enumerate() {
+                    let om = self.omega[s];
+                    for n in 0..n_g {
+                        let shift = if self.g_occupied[n] { om } else { -om };
+                        let denom = lambda - self.g_energies[n] + shift;
+                        let dd = if self.eta > 0.0 {
+                            let den2 = denom * denom + self.eta * self.eta;
+                            (self.eta * self.eta - denom * denom) / (den2 * den2)
+                        } else if denom.abs() < 1.0e-14 {
+                            0.0
+                        } else {
+                            -1.0 / (denom * denom)
+                        };
+                        let val = u[[n, p]];
+                        diag += val * val * dd;
+                    }
+                }
+                out[p] = diag * x[p];
+            }
+            return out;
+        }
+
+        for (s, u) in self.u_s.iter().enumerate() {
+            let om = self.omega[s];
+            _dgemv(u, x, &mut y, 'N', 1.0, 0.0, 1, 1);
+            for n in 0..n_g {
+                let shift = if self.g_occupied[n] { om } else { -om };
+                let denom = lambda - self.g_energies[n] + shift;
+                let dd = if self.eta > 0.0 {
+                    let den2 = denom * denom + self.eta * self.eta;
+                    (self.eta * self.eta - denom * denom) / (den2 * den2)
+                } else if denom.abs() < 1.0e-14 {
+                    0.0
+                } else {
+                    -1.0 / (denom * denom)
+                };
+                y[n] *= dd;
+            }
+            _dgemv(u, &y, &mut z, 'T', 1.0, 0.0, 1, 1);
+            for p in 0..n_active {
+                out[p] += z[p];
+            }
+        }
+        out
+    }
+
+    /// Quasiparticle spectral weight (residue) for a normalized Ritz vector:
+    ///
+    ///   Z = 1 / (1 - x^T dSigma_c/dlambda x).
+    ///
+    /// A positive, non-negligible Z is one of the indicators of a physical
+    /// quasiparticle pole; a negative or near-zero Z indicates a satellite or
+    /// a resonance-like solution.
+    fn spectral_weight(&self, lambda: f64, x: &[f64]) -> f64 {
+        let dsig = self.sigma_derivative_matvec(lambda, x);
+        let xdsig: f64 = x.iter().zip(dsig.iter()).map(|(a, b)| a * b).sum();
+        let denom = 1.0 - xdsig;
+        if denom.abs() < 1.0e-12 {
+            f64::NAN
+        } else {
+            1.0 / denom
+        }
+    }
+
     /// Full complex correlation self-energy matrix at a complex shift.
     ///
     /// Used only when the shifted FEAST systems include `Σ_c` (exact contour
@@ -487,6 +569,31 @@ impl DenseShiftSolvers {
         }
         out
     }
+
+    /// Apply the cached inverse to an entire block of real RHS columns at
+    /// once.  This turns the contour update from O(m0) matrix-vector products
+    /// per node into a single BLAS-3 complex GEMM, which is substantially
+    /// faster for the rather small m0 used by FEAST.
+    fn solve_block(&self, node_index: usize, rhs: &MatrixFull<f64>) -> MatrixFull<Complex<f64>> {
+        let n = self.n;
+        let m = rhs.size[1];
+        let mut b = MatrixFull::<Complex<f64>>::new([n, m], Complex::new(0.0, 0.0));
+        for i in 0..n {
+            for k in 0..m {
+                b[[i, k]] = Complex::new(rhs[[i, k]], 0.0);
+            }
+        }
+        let mut u = MatrixFull::<Complex<f64>>::new([n, m], Complex::new(0.0, 0.0));
+        u.lapack_zgemm(
+            &self.inverse[node_index],
+            &b,
+            'N',
+            'N',
+            Complex::new(1.0, 0.0),
+            Complex::new(0.0, 0.0),
+        );
+        u
+    }
 }
 
 // ============================================================================
@@ -595,9 +702,92 @@ impl NlepOperator for GwNlepOperator<'_> {
         _dgemm_full(q, 'T', &hq, 'N', &mut hq_proj, 1.0, 0.0);
 
         let max_inner = self.projected_max_inner.max(1);
+        let n_g = self.sigma.g_energies.len();
+        let full_sigma = !self.sigma.diagonal_only;
+
+        // Major optimization: precompute G_s = U_s^T Q once per projected
+        // solve (Q is fixed inside this call), instead of applying
+        // Sigma(lambda) to every Q column for every column/inner iteration.
+        //
+        //   Sigma(lambda) = sum_s U_s diag(d_s(lambda)) U_s^T
+        //   Q^T Sigma(lambda) Q = sum_s G_s diag(d_s(lambda)) G_s^T
+        //
+        // The old code formed Sigma(lambda_j) q_k for every j and k, i.e.
+        // O(m0^2) full self-energy matvecs per inner iteration.  Here the
+        // expensive O(n_s n_g n_active m0) contraction is done once, and each
+        // lambda evaluation only needs O(n_s n_g m0^2) BLAS-3 work.
+        let g_s: Vec<MatrixFull<f64>> = if full_sigma {
+            let mut gs = Vec::with_capacity(self.sigma.u_s.len());
+            for u in &self.sigma.u_s {
+                let mut g = MatrixFull::new([n_g, m0], 0.0);
+                _dgemm_full(u, 'T', q, 'N', &mut g, 1.0, 0.0);
+                gs.push(g);
+            }
+            gs
+        } else {
+            Vec::new()
+        };
+
+        let mut sigma_proj = MatrixFull::new([m0, m0], 0.0);
+        let mut work = MatrixFull::new([n_g, m0], 0.0);
+        let mut build_sigma_projected = |lam: f64, out: &mut MatrixFull<f64>| {
+            for i in 0..m0 {
+                for k in 0..m0 {
+                    out[[i, k]] = 0.0;
+                }
+            }
+            if full_sigma {
+                for (s, g) in g_s.iter().enumerate() {
+                    let om = self.sigma.omega[s];
+                    for n in 0..n_g {
+                        let shift = if self.sigma.g_occupied[n] { om } else { -om };
+                        let denom = lam - self.sigma.g_energies[n] + shift;
+                        let d = if self.sigma.eta > 0.0 {
+                            denom / (denom * denom + self.sigma.eta * self.sigma.eta)
+                        } else if denom.abs() < 1.0e-14 {
+                            0.0
+                        } else {
+                            1.0 / denom
+                        };
+                        for k in 0..m0 {
+                            work[[n, k]] = d * g[[n, k]];
+                        }
+                    }
+                    _dgemm_full(g, 'T', &work, 'N', out, 1.0, 1.0);
+                }
+            } else {
+                // Diagonal self-energy: Q^T diag(sigma_p) Q.  This preserves
+                // the semantics of feast_gw_zero_offdiag.
+                let mut diag = vec![0.0_f64; n];
+                for (s, u) in self.sigma.u_s.iter().enumerate() {
+                    let om = self.sigma.omega[s];
+                    for k in 0..n_g {
+                        let shift = if self.sigma.g_occupied[k] { om } else { -om };
+                        let denom = lam - self.sigma.g_energies[k] + shift;
+                        let d = if self.sigma.eta > 0.0 {
+                            denom / (denom * denom + self.sigma.eta * self.sigma.eta)
+                        } else if denom.abs() < 1.0e-14 {
+                            0.0
+                        } else {
+                            1.0 / denom
+                        };
+                        for p in 0..n {
+                            let val = u[[k, p]];
+                            diag[p] += val * val * d;
+                        }
+                    }
+                }
+                for i in 0..n {
+                    for k in 0..m0 {
+                        work[[i, k]] = diag[i] * q[[i, k]];
+                    }
+                }
+                _dgemm_full(q, 'T', &work, 'N', out, 1.0, 1.0);
+            }
+        };
+
         let mut lambdas = Vec::with_capacity(m0);
         let mut ritz = MatrixFull::new([n, m0], 0.0);
-        let mut sig_q = MatrixFull::new([n, m0], 0.0);
 
         for j in 0..m0 {
             let mut lam = lambda_init[j];
@@ -607,20 +797,11 @@ impl NlepOperator for GwNlepOperator<'_> {
                 .map(|k| if k == j { 1.0 } else { 0.0 })
                 .collect();
             for _inner in 0..max_inner {
-                // sig_q[:,k] = Σ(λ) q_k
-                for k in 0..m0 {
-                    let qk: Vec<f64> = (0..n).map(|i| q[[i, k]]).collect();
-                    let s = self.sigma.sigma_matvec_real(lam, &qk);
-                    for i in 0..n {
-                        sig_q[[i, k]] = s[i];
-                    }
-                }
                 let mut m = hq_proj.clone();
-                let mut tmp = MatrixFull::new([m0, m0], 0.0);
-                _dgemm_full(q, 'T', &sig_q, 'N', &mut tmp, 1.0, 0.0);
+                build_sigma_projected(lam, &mut sigma_proj);
                 for i in 0..m0 {
                     for k in 0..m0 {
-                        m[[i, k]] += tmp[[i, k]];
+                        m[[i, k]] += sigma_proj[[i, k]];
                     }
                 }
                 let (v_opt, evals, _nd) = _dsyevd(&m, 'V');
@@ -724,6 +905,18 @@ impl NlepOperator for GwNlepOperator<'_> {
                 let precond = BlockDiagPrecond::from_re_im(diag, &vec![-z_im; n]);
                 gmres(matvec, rhs, *restart, *max_it, *tol, false, Some(&precond))
             }
+        }
+    }
+
+    fn solve_shifted_block(
+        &self,
+        node_index: usize,
+        _z: Complex<f64>,
+        rhs: &MatrixFull<f64>,
+    ) -> Option<MatrixFull<Complex<f64>>> {
+        match &self.shift {
+            ShiftSolver::Direct(d) => Some(d.solve_block(node_index, rhs)),
+            ShiftSolver::Gmres { .. } => None,
         }
     }
 }
@@ -1171,6 +1364,22 @@ pub fn feast_gw_main(
     );
 
     println!("\n  NLFEAST iterations: {}", result.iterations);
+    let ft = result.timings;
+    let pct = |x: f64| if ft.total > 0.0 { 100.0 * x / ft.total } else { 0.0 };
+    let accounted = ft.projected_solve + ft.residual + ft.contour + ft.qr;
+    println!(
+        "  FEAST phase timings (s): projected={:.3} ({:.1}%), residual={:.3} ({:.1}%), contour={:.3} ({:.1}%), qr={:.3} ({:.1}%), other={:.3}, total={:.3}",
+        ft.projected_solve,
+        pct(ft.projected_solve),
+        ft.residual,
+        pct(ft.residual),
+        ft.contour,
+        pct(ft.contour),
+        ft.qr,
+        pct(ft.qr),
+        (ft.total - accounted).max(0.0),
+        ft.total
+    );
     if result.n_found == 0 {
         println!("  No quasiparticle eigenvalues found inside the contour.");
         return;
@@ -1178,48 +1387,109 @@ pub fn feast_gw_main(
 
     println!("\n  Found {} quasiparticle state(s) inside [{:.4}, {:.4}] Ha:",
         result.n_found, centre - radius, centre + radius);
-    println!("  #    MO     E_QP (Ha)        E_QP (eV)       ‖T(λ)x‖");
-    println!("  ───  ─────  ───────────────  ─────────────  ──────────");
+    println!("  #    MO     E_QP (Ha)        E_QP (eV)       ‖T(λ)x‖       Z      LUMO     HOMO");
+    println!("  ───  ─────  ───────────────  ─────────────  ──────────  ────────  ───────  ───────");
     let mut sorted: Vec<usize> = (0..result.n_found).collect();
     sorted.sort_by(|&a, &b| {
         result.eigenvalues[a]
             .partial_cmp(&result.eigenvalues[b])
             .unwrap()
     });
+
+    // Per-root diagnostics kept for the optional CSV dump.  Each entry is
+    // (root, E_Ha, E_eV, residual, Z, dominant MO, w_LUMO, w_HOMO, composition).
+    let mut root_rows: Vec<(usize, f64, f64, f64, f64, usize, f64, f64, Vec<(usize, f64)>)> =
+        Vec::with_capacity(result.n_found);
+
     for &k in &sorted {
-        // Identify the dominant active-window MO.
-        let mut best_p = 0;
-        let mut best_w = 0.0;
-        for p in 0..n_active {
-            let w = result.eigenvectors[[p, k]].abs();
-            if w > best_w {
-                best_w = w;
-                best_p = p;
-            }
-        }
+        // Ritz vector in the active-window KS-MO basis, normalized to unit norm.
+        let xk_raw: Vec<f64> = (0..n_active).map(|p| result.eigenvectors[[p, k]]).collect();
+        let norm2: f64 = xk_raw.iter().map(|v| v * v).sum();
+        let inv_norm = if norm2 > 0.0 { 1.0 / norm2.sqrt() } else { 0.0 };
+        let xk: Vec<f64> = xk_raw.iter().map(|v| v * inv_norm).collect();
+        let mut comp: Vec<(usize, f64)> = (0..n_active)
+            .map(|p| (window[p], xk[p] * xk[p]))
+            .collect();
+        comp.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let best_mo = comp.first().map(|(mo, _)| *mo).unwrap_or(0);
+        let w_lumo = comp
+            .iter()
+            .find(|(mo, _)| *mo == lumo)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+        let w_homo = comp
+            .iter()
+            .find(|(mo, _)| *mo == homo)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+        let z = sigma.spectral_weight(result.eigenvalues[k], &xk);
+
         println!(
-            "  {:>3}  {:>5}  {:>15.9}  {:>13.6}  {:>9.2e}",
+            "  {:>3}  {:>5}  {:>15.9}  {:>13.6}  {:>9.2e}  {:>8.3}  {:>7.3}  {:>7.3}",
             k,
-            window[best_p],
+            best_mo,
             result.eigenvalues[k],
             result.eigenvalues[k] * crate::constants::EV,
-            result.residuals[k]
+            result.residuals[k],
+            z,
+            w_lumo,
+            w_homo
         );
+        let top = comp
+            .iter()
+            .take(6)
+            .map(|(mo, w)| format!("MO{}:{:.3}", mo, w))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("       KS composition: {}", top);
         if std::env::var("REST_FEAST_GW_DEBUG").is_ok() {
-            let mut coeffs: Vec<(f64, usize)> = (0..n_active)
-                .map(|p| (result.eigenvectors[[p, k]].abs(), window[p]))
-                .collect();
-            coeffs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             eprintln!(
                 "      [debug] top coefficients: {}",
-                coeffs
-                    .iter()
+                comp.iter()
                     .take(6)
-                    .map(|(c, mo)| format!("MO{}:{:.3}", mo, c))
+                    .map(|(mo, w)| format!("MO{}:{:.3}", mo, w))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
         }
+        root_rows.push((
+            k,
+            result.eigenvalues[k],
+            result.eigenvalues[k] * crate::constants::EV,
+            result.residuals[k],
+            z,
+            best_mo,
+            w_lumo,
+            w_homo,
+            comp,
+        ));
+    }
+
+    if !qp_ctrl.feast_gw_dump_roots.is_empty() {
+        let path = qp_ctrl.feast_gw_dump_roots.clone();
+        let mut f = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("[feast_gw] cannot create {}: {}", path, e));
+        writeln!(
+            f,
+            "root,energy_ha,energy_ev,residual,Z,dominant_mo,w_lumo,w_homo,composition"
+        )
+        .unwrap();
+        for (k, e_ha, e_ev, res, z, best_mo, w_lumo, w_homo, comp) in &root_rows {
+            let comp_str = comp
+                .iter()
+                .take(20)
+                .map(|(mo, w)| format!("MO{}:{:.6}", mo, w))
+                .collect::<Vec<_>>()
+                .join(";");
+            writeln!(
+                f,
+                "{},{:.16e},{:.10e},{:.6e},{:.8e},{},{:.8e},{:.8e},\"{}\"",
+                k, e_ha, e_ev, res, z, best_mo, w_lumo, w_homo, comp_str
+            )
+            .unwrap();
+        }
+        println!("[feast_gw] wrote root diagnostics to {}", path);
     }
 
     // Store the quasiparticle energies back into the SCF record, keyed by the

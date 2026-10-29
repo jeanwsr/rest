@@ -312,7 +312,8 @@ pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
             &scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size)
     };
     // Diagonal preconditioner: M = diag(A_4c)
-    let energy_diag=ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
+    let energy_diag=ri_bse::construct_energy_diag_for_a_window(
+        &scf_data.gwqp.0,start_mo,occ_size,lumo,vir_size);
     let diag_13:Vec<f64>=energy_diag.iter().map(|d|d-external_field_freq).collect();
     let diag_24:Vec<f64>=energy_diag.iter().map(|d|d+external_field_freq).collect();
     let precond=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
@@ -497,7 +498,8 @@ pub fn response_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         vec4=vector_scaled_add(&vec4,1.0,&z.3,external_field_freq);
         (vec1,vec2,vec3,vec4)
     };
-    let energy_diag=ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
+    let energy_diag=ri_bse::construct_energy_diag_for_a_window(
+        &scf_data.gwqp.0,start_mo,occ_size,lumo,vir_size);
     let diag_13:Vec<f64>=energy_diag.iter().map(|d|d-external_field_freq).collect();
     let diag_24:Vec<f64>=energy_diag.iter().map(|d|d+external_field_freq).collect();
     let precond=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
@@ -732,7 +734,8 @@ pub fn response_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Ve
     };
 
     // Diagonal preconditioner: M = diag(A_4c)
-    let energy_diag = ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0, occ_size, vir_size);
+    let energy_diag = ri_bse::construct_energy_diag_for_a_window(
+        &scf_data.gwqp.0, start_mo, occ_size, lumo, vir_size);
     let diag_13: Vec<f64> = energy_diag.iter().map(|d| d - external_field_freq).collect();
     let diag_24: Vec<f64> = energy_diag.iter().map(|d| d + external_field_freq).collect();
     let precond = |z: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)| -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>) {

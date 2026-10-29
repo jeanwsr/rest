@@ -14,6 +14,21 @@ use rayon::result;
 use reqwest::blocking::Response;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
+
+/// Number of response matrices built by the dense CD residue loop
+/// ([`contour_rayon`]).  Used by the FSCD regression/performance tests.
+pub static CD_RESIDUE_RESPONSE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reset the dense-CD response-build counter.
+pub fn reset_cd_counter() {
+    CD_RESIDUE_RESPONSE_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the dense-CD response-build counter.
+pub fn cd_response_builds() -> usize {
+    CD_RESIDUE_RESPONSE_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
 use rest_tensors::{RIFull};
 use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
@@ -34,6 +49,7 @@ use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 pub mod ac;
+pub mod fscd;
 pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
@@ -774,30 +790,85 @@ pub fn current_orbital_energies(scf_data:&SCF)->Vec<f64>{
         scf_data.eigenvalues[0].clone()
     }
 }
+/// The `bse_cutoff_energy` window of the BSE transition space.
+///
+/// `bse_cutoff_energy = x` keeps
+///
+/// ```text
+/// occupied:  e_i >= e_HOMO - x
+/// virtual:   e_a <= e_LUMO + x
+/// ```
+///
+/// i.e. `x` Hartree *below the HOMO* and `x` Hartree *above the LUMO*.  The
+/// occupied side is the whole point of the keyword — the deep core orbitals
+/// cannot contribute to low-lying excitations but enter the `O(nocc^2)`
+/// screening blocks and the `O(dim^2)` BSE matrices quadratically.
+///
+/// Values at or above [`BSE_CUTOFF_DISABLED`] (the 1e6 default) leave the
+/// space untouched, which keeps the historical `rest` cards unchanged.
+pub const BSE_CUTOFF_DISABLED: f64 = 1.0e5;
+
+/// `(occ_start, num_state)` of the active window, see [`BSE_CUTOFF_DISABLED`].
+///
+/// `occ_start` is the first occupied orbital in the window (never above the
+/// HOMO), `num_state` the exclusive upper bound of the virtual manifold.
+pub fn bse_active_bounds(scf_data:&SCF, homo:usize, lumo:usize)->(usize,usize){
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let cutoff=qp_ctrl.bse_cutoff_energy;
+    let start_mo = scf_data.mol.start_mo;
+    let num_state = scf_data.mol.num_state;
+    // Pinned range (see `bse_active_occ_start`): a fixed index window keeps the
+    // active space -- and hence E(R) and dE/dR -- smooth across a relaxation.
+    if qp_ctrl.bse_active_occ_start >= 0 && qp_ctrl.bse_active_vir_end > 0 {
+        let lo = (qp_ctrl.bse_active_occ_start as usize).clamp(start_mo, homo);
+        let hi = (qp_ctrl.bse_active_vir_end as usize).clamp(lumo + 1, num_state);
+        return (lo, hi);
+    }
+    if !(cutoff > 0.0) || cutoff >= BSE_CUTOFF_DISABLED {
+        return (start_mo, num_state);
+    }
+    let e = current_orbital_energies(scf_data);
+    if e.len() < num_state {
+        return (start_mo, num_state);
+    }
+    // `x` below the HOMO on the occupied side, `x` above the LUMO on the
+    // virtual side.  `lumo` is the first virtual orbital index.
+    let e_homo = e[homo];
+    let e_lumo = e[lumo.min(e.len() - 1)];
+    let occ_start = (start_mo..=homo).find(|&i| e[i] >= e_homo - cutoff).unwrap_or(homo);
+    // `lumo + 1` virtuals at least: an empty virtual window is not physical.
+    let vir_end = (lumo..num_state)
+        .filter(|&a| e[a] <= e_lumo + cutoff)
+        .last()
+        .map(|a| a + 1)
+        .unwrap_or(lumo + 1)
+        .max(lumo + 1);
+    (occ_start, vir_end)
+}
+
 pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usize,usize,usize,usize,usize){
-    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let mut num_state = scf_data.mol.num_state;
     let mut homo = 0_usize;
     let mut lumo = num_state;
-    let start_mo = scf_data.mol.start_mo;
     for i_spin in 0..scf_data.mol.spin_channel {
         let i_homo = scf_data.homo.get(i_spin).unwrap().clone();
         let i_lumo = scf_data.lumo.get(i_spin).unwrap().clone();
         homo = homo.max(i_homo);
         lumo = lumo.min(i_lumo);
     }
-    let occ_size=homo-start_mo+1;
-    let mut vir_size=0;
-    if response_or_not=='Y'{
-        vir_size=num_state-occ_size;
-    }
-    
-    else if response_or_not=='N'{
-        // The cutoff defines which orbitals enter the calculation, so it must be
+    let mut start_mo = scf_data.mol.start_mo;
+    if response_or_not=='N'{
+        // The cutoff defines which orbitals enter the calculation, so it is
         // applied to the energies of the orbitals that are actually in use.
-        num_state=current_orbital_energies(scf_data).iter().filter(|x|**x<cutoff).count();
-        vir_size=num_state-occ_size;
+        let (occ_start, vir_end) = bse_active_bounds(scf_data, homo, lumo);
+        start_mo = occ_start;
+        num_state = vir_end;
     }
+    let occ_size = homo - start_mo + 1;
+    // The virtual block spans `lumo..num_state` (see `ri_bse::get_submatrix`),
+    // so its size is `num_state - lumo`.  For `start_mo == 0` this coincides
+    // with the historical `num_state - occ_size`.
+    let vir_size = num_state - lumo;
     (start_mo,num_state,occ_size,vir_size,homo,lumo)
 }
 
@@ -813,21 +884,35 @@ pub struct OccParams {
 }
 
 pub fn get_occ_params_per_spin(scf_data:&SCF,response_or_not:char)->[OccParams;2]{
-    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let start_mo = scf_data.mol.start_mo;
     let nspin = scf_data.mol.spin_channel.max(1);
     let mut out = [OccParams{start_mo, num_state:scf_data.mol.num_state, occ_size:0, vir_size:0, homo:0, lumo:scf_data.mol.num_state};2];
     for spin in 0..nspin {
         let homo = scf_data.homo[spin];
         let lumo = scf_data.lumo[spin];
-        let occ_size = homo.saturating_sub(start_mo) + 1;
+        let mut occ_start = start_mo;
         let mut num_state = scf_data.mol.num_state;
         if response_or_not=='N'{
-            num_state = scf_data.eigenvalues[spin].iter().filter(|x|**x<cutoff).count();
+            // same two-sided window as `get_occupation_parameters`, per spin
+            let cutoff = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
+            if cutoff > 0.0 && cutoff < BSE_CUTOFF_DISABLED {
+                let e = &scf_data.eigenvalues[spin];
+                if e.len() >= num_state {
+                    let e_lumo = e[lumo.min(e.len() - 1)];
+                    occ_start = (start_mo..=homo).find(|&i| e[i] >= e[homo] - cutoff).unwrap_or(homo);
+                    num_state = (lumo..num_state)
+                        .filter(|&a| e[a] <= e_lumo + cutoff)
+                        .last()
+                        .map(|a| a + 1)
+                        .unwrap_or(lumo + 1)
+                        .max(lumo + 1);
+                }
+            }
         }
+        let occ_size = homo.saturating_sub(occ_start) + 1;
         let lumo_eff = if response_or_not=='Y' { lumo } else { lumo.min(num_state) };
         let vir_size = num_state.saturating_sub(lumo_eff);
-        out[spin] = OccParams{start_mo, num_state, occ_size, vir_size, homo, lumo};
+        out[spin] = OccParams{start_mo:occ_start, num_state, occ_size, vir_size, homo, lumo};
     }
     if scf_data.mol.spin_channel==1 {
         out[1] = out[0];
@@ -1695,6 +1780,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let de=omega-quasiparticle_energies_g[occ_size+a];
             if de>-res_tol{
                 let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
+                CD_RESIDUE_RESPONSE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(occ_size+a).copied().collect::<Vec<f64>>();
@@ -1712,6 +1798,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let de=quasiparticle_energies_g[i]-omega;
             if de>-res_tol{
                 let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
+                CD_RESIDUE_RESPONSE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(i).copied().collect::<Vec<f64>>();
@@ -2343,7 +2430,7 @@ fn get_homo_lumo_qp_only_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
     let n = homo;
     let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts = eigenenergies[n] + exchange - vxc_nn[n];
@@ -2408,6 +2495,7 @@ pub struct LowRankVChiV {
 }
 
 /// Collection of low-rank sqrt(v)*chi*sqrt(v) on a real-axis frequency grid
+
 pub struct RealAxisVChiV {
     pub grid: Vec<LowRankVChiV>,
     pub omega_min: f64,
@@ -3011,6 +3099,21 @@ pub fn interpolate_vchiv_bracket<'a>(
 /// under the sign and the ordering of the eigenvectors, so the two
 /// factorisations can simply be contracted separately and combined with the
 /// interpolation weights.
+/// The single mapping from the card string `low_rank_interp` to the internal
+/// interpolation code: `0 = nearest`, `1 = linear`.
+///
+/// This used to be open-coded at five places (three here, two in `scgw`), and a
+/// value the copies did not know about was silently downgraded to `linear` --
+/// which is how the QP energy kept using the linear rule while the gradient
+/// engine would have used a different rule.  Always call this.
+pub fn low_rank_interp_code(s: &str) -> usize {
+    if s.eq_ignore_ascii_case("nearest") {
+        0
+    } else {
+        1
+    }
+}
+
 pub fn compute_residue_lowrank_interp(
     real_axis: &RealAxisVChiV,
     de_abs: f64,
@@ -3805,7 +3908,7 @@ pub fn gw_calculations_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     // Check whether self-energy correction is enabled
     let use_fourier = qp_ctrl.fourier_self_energy;
@@ -4020,7 +4123,7 @@ pub fn linearized_gw_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     let h = qp_ctrl.gw_linearize_derivative_h;
     let use_fourier = qp_ctrl.fourier_self_energy;

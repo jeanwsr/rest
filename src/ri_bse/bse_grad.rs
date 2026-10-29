@@ -199,7 +199,17 @@ fn solve_columns(a: &MatrixFull<f64>, rhs: &[f64], naux: usize, ncol: usize) -> 
 /// full-space response entering `D0 = J - Q0` (its derivative chains over all
 /// occupied-virtual pairs, not only the active ones).
 pub struct BseScreening {
+    /// **active** occupied orbitals (`occ_start .. occ_start + nocc`).  Deep
+    /// core orbitals below the `bse_cutoff_energy` window are not in the
+    /// transition space, so every occupied block here is compacted over this
+    /// window while the orbital index of active occupied `i` is
+    /// `occ_start + i`.
     pub nocc: usize,
+    /// first active occupied orbital (0 unless the window cuts the core)
+    pub occ_start: usize,
+    /// first active virtual orbital (the mean-field `nocc`, i.e. the HOMO+1);
+    /// active virtual `a` is orbital `vir_start + a`
+    pub vir_start: usize,
     /// active virtuals in the BSE transition space (<= nvir_full)
     pub nvir: usize,
     /// all virtual orbitals of the mean-field reference
@@ -237,34 +247,41 @@ impl BseScreening {
         nmo: usize,
         eps_screen: &[f64],
     ) -> BseScreening {
-        Self::build_from_parts_cutoff(q, j_mat, nocc, nmo, nmo - nocc, eps_screen)
+        Self::build_from_parts_cutoff(q, j_mat, 0, nocc, nocc, nmo, nmo - nocc, eps_screen)
     }
 
     /// Build the static screening with the BSE transition space restricted to
-    /// the lowest `nvir_act` virtual orbitals.  The static RPA response `Q0`
-    /// (and hence `D0` and its derivative chain) still runs over *all*
-    /// occupied-virtual pairs built from `eps_screen`; only the solved
-    /// W(0) blocks handed to the BSE operator are restricted.
+    /// the occupied orbitals `occ_start .. occ_start + nocc` and to the
+    /// `nvir_act` lowest virtual orbitals starting at `vir_start` (the
+    /// mean-field `nocc`, i.e. the HOMO+1).
+    ///
+    /// The static RPA response `Q0` (and hence `D0` and its derivative chain)
+    /// runs over every occupied-virtual pair of the *active* space; only the
+    /// deep core orbitals below the `bse_cutoff_energy` window are left out of
+    /// it as well, which is the approximation that window makes.
     pub fn build_from_parts_cutoff(
         q: &[f64],
         j_mat: &MatrixFull<f64>,
+        occ_start: usize,
         nocc: usize,
+        vir_start: usize,
         nmo: usize,
         nvir_act: usize,
         eps_screen: &[f64],
     ) -> BseScreening {
         let naux = j_mat.size()[0];
-        let nvir_full = nmo - nocc;
+        let nvir_full = nmo - vir_start;
+        assert!(nocc >= 1 && occ_start + nocc <= vir_start, "bse_grad: invalid active occupied window");
         assert!(nvir_act >= 1 && nvir_act <= nvir_full, "bse_grad: invalid active virtual count");
         let pair = |p: usize, q_mo: usize| p + q_mo * nmo;
 
         let nov_full = nocc * nvir_full;
         let nov = nocc * nvir_act;
         let mut qov_full = vec![0.0f64; naux * nov_full];
-        for a in nocc..nmo {
+        for a in vir_start..nmo {
             for i in 0..nocc {
-                let src = pair(i, a) * naux;
-                let dst = (i + (a - nocc) * nocc) * naux;
+                let src = pair(occ_start + i, a) * naux;
+                let dst = (i + (a - vir_start) * nocc) * naux;
                 qov_full[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
             }
         }
@@ -273,7 +290,7 @@ impl BseScreening {
         let mut qoo = vec![0.0f64; naux * nocc * nocc];
         for j in 0..nocc {
             for i in 0..nocc {
-                let src = pair(i, j) * naux;
+                let src = pair(occ_start + i, occ_start + j) * naux;
                 let dst = (i + j * nocc) * naux;
                 qoo[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
             }
@@ -281,19 +298,19 @@ impl BseScreening {
         let mut qvv = vec![0.0f64; naux * nvir_act * nvir_act];
         for b in 0..nvir_act {
             for a in 0..nvir_act {
-                let src = pair(nocc + a, nocc + b) * naux;
+                let src = pair(vir_start + a, vir_start + b) * naux;
                 let dst = (a + b * nvir_act) * naux;
                 qvv[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
             }
         }
         let mut gap_full = vec![0.0f64; nov_full];
         let mut gap = vec![0.0f64; nov];
-        for a in nocc..nmo {
+        for a in vir_start..nmo {
             for i in 0..nocc {
-                let g = eps_screen[a] - eps_screen[i];
-                gap_full[i + (a - nocc) * nocc] = g;
-                if a - nocc < nvir_act {
-                    gap[i + (a - nocc) * nocc] = g;
+                let g = eps_screen[a] - eps_screen[occ_start + i];
+                gap_full[i + (a - vir_start) * nocc] = g;
+                if a - vir_start < nvir_act {
+                    gap[i + (a - vir_start) * nocc] = g;
                 }
             }
         }
@@ -321,6 +338,8 @@ impl BseScreening {
         let u_ia = solve_columns(&d0m, &qov, naux, nov);
         BseScreening {
             nocc,
+            occ_start,
+            vir_start,
             nvir: nvir_act,
             nvir_full,
             naux,
@@ -428,7 +447,9 @@ pub fn build_bse_matrices(
     let ia_i: Vec<usize> = (0..dim).map(|c| c % nocc).collect();
     let ia_a: Vec<usize> = (0..dim).map(|c| c / nocc).collect();
     let gap_diag: Vec<f64> = (0..dim)
-        .map(|c| qp_energies[nocc + ia_a[c]] - qp_energies[ia_i[c]])
+        .map(|c| {
+            qp_energies[screen.vir_start + ia_a[c]] - qp_energies[screen.occ_start + ia_i[c]]
+        })
         .collect();
     let n_oo = nocc * nocc;
     {
@@ -552,6 +573,12 @@ pub fn solve_bse_dense(
             uv += u[r] * vv;
         }
         // metric normalisation X^T X - Y^T Y = U^T V = 1
+        if !(uv > 0.0) {
+            eprintln!(
+                "[bse_grad] dense BSE: root omega={omega:.6} has a non-positive metric norm \
+                 U^T V = {uv:+.6e}; the amplitudes and their gradient are then NaN"
+            );
+        }
         let nrm = uv.sqrt();
         for r in 0..dim {
             x[r] /= nrm;
@@ -737,6 +764,11 @@ pub struct KernelVjpCompact {
     pub ovbar: Vec<f64>,
     pub ncols: usize,
     pub nocc: usize,
+    /// first active occupied orbital and first active virtual orbital: the
+    /// compact block indices are `i`/`a`, the *orbital* indices they stand for
+    /// are `occ_start + i` and `vir_start + a` (see [`BseScreening`]).
+    pub occ_start: usize,
+    pub vir_start: usize,
     pub nvir: usize,
     /// All virtuals of the mean-field reference: the (o,v) block of `theta`
     /// spans them (the screening chain contributes for every virtual), so the
@@ -763,12 +795,13 @@ impl KernelVjpCompact {
         let n_vv = self.nvir * self.nvir;
         let nv = self.nvir_full;
         let ncv = self.nocc * nv;
+        let (os, vs) = (self.occ_start, self.vir_start);
         let mut acc = 0.0f64;
         // (o,o) and (v,v): `theta` mirrors the full-pair covector entry, and the
         // full-pair contraction counts both symmetric entries of a pair -> x2
         for i in 0..self.nocc {
             for j in 0..self.nocc {
-                let base = (i + j * nmo) * naux;
+                let base = ((os + i) + (os + j) * nmo) * naux;
                 let mut s = 0.0f64;
                 for p in 0..naux {
                     s += self.theta[i + j * self.nocc + p * self.ncols] * qx[base + p];
@@ -778,7 +811,7 @@ impl KernelVjpCompact {
         }
         for a in 0..self.nvir {
             for b in 0..self.nvir {
-                let (ga, gb) = (self.nocc + a, self.nocc + b);
+                let (ga, gb) = (vs + a, vs + b);
                 let base = (ga + gb * nmo) * naux;
                 let mut s = 0.0f64;
                 for p in 0..naux {
@@ -790,8 +823,8 @@ impl KernelVjpCompact {
         // (o,v): `ovbar` is the two-entry pair sum, so no extra factor
         for i in 0..self.nocc {
             for a in 0..nv {
-                let ga = self.nocc + a;
-                let base = (i + ga * nmo) * naux;
+                let ga = vs + a;
+                let base = ((os + i) + ga * nmo) * naux;
                 let mut s = 0.0f64;
                 for p in 0..naux {
                     s += self.ovbar[i + a * self.nocc + p * ncv] * qx[base + p];
@@ -826,6 +859,7 @@ impl KernelVjpCompact {
         let nocc = self.nocc;
         let nvir = self.nvir;
         let nvir_full = self.nvir_full;
+        let (os, vs) = (self.occ_start, self.vir_start);
         let n_oo = nocc * nocc;
         let ncv = nocc * nvir_full;
         for p in 0..naux {
@@ -833,26 +867,26 @@ impl KernelVjpCompact {
             for j in 0..nocc {
                 for i in 0..nocc {
                     let v = self.theta[i + j * nocc + p * self.ncols];
-                    qbar[p + (i + j * nmo) * naux] += v;
-                    qbar[p + (j + i * nmo) * naux] += v;
+                    qbar[p + ((os + i) + (os + j) * nmo) * naux] += v;
+                    qbar[p + ((os + j) + (os + i) * nmo) * naux] += v;
                 }
             }
             // (v,v): the active virtuals only (inactive columns are zero)
             for b in 0..nvir {
                 for a in 0..nvir {
                     let v = self.theta[n_oo + a + b * nvir + p * self.ncols];
-                    let (ga, gb) = (nocc + a, nocc + b);
+                    let (ga, gb) = (vs + a, vs + b);
                     qbar[p + (ga + gb * nmo) * naux] += v;
                     qbar[p + (gb + ga * nmo) * naux] += v;
                 }
             }
             // (o,v) over the full virtual space: `ovbar` is the pair sum
             for a in 0..nvir_full {
-                let ga = nocc + a;
+                let ga = vs + a;
                 for i in 0..nocc {
                     let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
-                    qbar[p + (i + ga * nmo) * naux] += v;
-                    qbar[p + (ga + i * nmo) * naux] += v;
+                    qbar[p + ((os + i) + ga * nmo) * naux] += v;
+                    qbar[p + (ga + (os + i) * nmo) * naux] += v;
                 }
             }
         }
@@ -872,11 +906,12 @@ impl KernelVjpCompact {
         let nocc = self.nocc;
         let nvir = self.nvir;
         // `qbar` may be stored banded (`min(p, q) < nrow`): every block written below lives in
-        // the band `nrow = nocc + nvir`, and the packed index of a banded covector is the same
-        // as in the full layout.
-        let npack = crate::ri_gw::gw_grad::banded_pair_count(nmo, nocc + nvir);
+        // the band `nrow = vir_start + nvir` (the largest orbital written is `vir_start+nvir-1`),
+        // and the packed index of a banded covector is the same as in the full layout.
+        let npack = crate::ri_gw::gw_grad::banded_pair_count(nmo, self.vir_start + nvir);
         assert!(qbar.len() >= naux * npack, "add_into_packed: qbar too small");
         let nvir_full = self.nvir_full;
+        let (os, vs) = (self.occ_start, self.vir_start);
         let n_oo = nocc * nocc;
         let ncv = nocc * nvir_full;
         for p in 0..naux {
@@ -889,7 +924,7 @@ impl KernelVjpCompact {
                 for i in j..nocc {
                     let v = self.theta[i + j * nocc + p * self.ncols]
                         + self.theta[j + i * nocc + p * self.ncols];
-                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, i, j) * naux + p] += v;
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, os + i, os + j) * naux + p] += v;
                 }
             }
             // (v,v): the active virtuals only (inactive columns are zero)
@@ -897,16 +932,16 @@ impl KernelVjpCompact {
                 for a in b..nvir {
                     let v = self.theta[n_oo + a + b * nvir + p * self.ncols]
                         + self.theta[n_oo + b + a * nvir + p * self.ncols];
-                    let (ga, gb) = (nocc + a, nocc + b);
+                    let (ga, gb) = (vs + a, vs + b);
                     qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, ga, gb) * naux + p] += v;
                 }
             }
             // (o,v) over the full virtual space: `ovbar` is the pair sum
             for a in 0..nvir_full {
-                let ga = nocc + a;
+                let ga = vs + a;
                 for i in 0..nocc {
                     let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
-                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, i, ga) * naux + p] += v;
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, os + i, ga) * naux + p] += v;
                 }
             }
         }
@@ -1119,6 +1154,8 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
             ovbar,
             ncols,
             nocc,
+            occ_start: screen.occ_start,
+            vir_start: screen.vir_start,
             nvir,
             nvir_full,
             jbar_ex,
@@ -1146,7 +1183,8 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
     // `ebar` covers EVERY orbital of the mean-field reference: the screening
     // response of the inactive virtuals still enters `dOmega` through the
     // `eps1` channel even though those orbitals carry no amplitude weight.
-    let nmo = nocc + screen.nvir_full;
+    let nmo = screen.vir_start + screen.nvir_full;
+    let (os, vs) = (screen.occ_start, screen.vir_start);
     let mut qbar_bov = vec![0.0f64; naux * nocc * screen.nvir_full];
     let mut ebar = vec![0.0f64; nmo];
     let dbar_m = to_mat(dbar, naux, naux);
@@ -1165,8 +1203,8 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
                 * inv_gap
                 * inv_gap;
         }
-        ebar[i] -= bar_gap;
-        ebar[nocc + a] += bar_gap;
+        ebar[os + i] -= bar_gap;
+        ebar[vs + a] += bar_gap;
         let col = i + a * nocc;
         for p in 0..naux {
             qbar_bov[col * naux + p] -= 8.0 * q_times[p + c * naux] * inv_gap;
@@ -1224,8 +1262,8 @@ fn chain_from_dbar(
     // column-split across the pool, as in `chain_from_dbar_compact`
     let q_times = gemm_nn_cols_par(&dbar_m, &screen.qov_full, naux, nov, -1.0);
     for c in 0..nov {
-        let i = c % nocc;
-        let a = nocc + c / nocc;
+        let i = screen.occ_start + c % nocc;
+        let a = screen.vir_start + c / nocc;
         let inv_gap = 1.0 / screen.gap_full[c];
         let col = q_pair_layout(i, a) * naux;
         let ctrans = q_pair_layout(a, i) * naux;
@@ -1257,7 +1295,8 @@ pub fn kernel_vjp_pieces(
     let naux = screen.naux;
     let nov = nocc * nvir;
     let dim = nocc * nvir;
-
+    // compact block indices -> orbital indices (see `BseScreening`)
+    let (os, vs) = (screen.occ_start, screen.vir_start);
     let mut qbar_ex = vec![0.0f64; naux * nmo * nmo];
     let mut jbar_ex = vec![0.0f64; naux * naux];
     let mut timers = [0.0f64; 6];
@@ -1277,8 +1316,8 @@ pub fn kernel_vjp_pieces(
         vz[p] = acc;
     }
     for c in 0..nov {
-        let i = c % nocc;
-        let a = nocc + c / nocc;
+        let i = os + c % nocc;
+        let a = vs + c / nocc;
         let col = q_pair_layout(i, a) * naux;
         let ctrans = q_pair_layout(a, i) * naux;
         for p in 0..naux {
@@ -1340,8 +1379,8 @@ pub fn kernel_vjp_pieces(
         }
         for p in 0..naux {
             for ij in 0..nocc * nocc {
-                let i = ij % nocc;
-                let j = ij / nocc;
+                let i = os + ij % nocc;
+                let j = os + ij / nocc;
                 let col = q_pair_layout(i, j) * naux;
                 let ctrans = q_pair_layout(j, i) * naux;
                 qbar_oo[col + p] -= 0.5 * foo[p * nocc * nocc + ij];
@@ -1379,8 +1418,8 @@ pub fn kernel_vjp_pieces(
         }
         for p in 0..naux {
             for ab in 0..nvir * nvir {
-                let a = nocc + ab % nvir;
-                let b = nocc + ab / nvir;
+                let a = vs + ab % nvir;
+                let b = vs + ab / nvir;
                 let col = q_pair_layout(a, b) * naux;
                 let ctrans = q_pair_layout(b, a) * naux;
                 qbar_vv[col + p] -= 0.5 * fvv[p * nvir * nvir + ab];
@@ -1432,7 +1471,7 @@ pub fn kernel_vjp_pieces(
     }
     for c in 0..nov {
         let i = c % nocc;
-        let a = nocc + c / nocc;
+        let a = vs + c / nocc;
         let col = q_pair_layout(i, a) * naux;
         let ctrans = q_pair_layout(a, i) * naux;
         for p in 0..naux {
@@ -1743,7 +1782,21 @@ impl<'a> BseGradEngine<'a> {
         multi: char,
         screening_energy: ScreeningEnergy,
     ) -> Self {
-        Self::new_with_cutoff(scf, gw, multi, screening_energy, f64::INFINITY)
+        Self::new_with_window(
+            scf, gw, multi, screening_energy, f64::INFINITY, f64::NEG_INFINITY,
+        )
+    }
+
+    /// [`Self::new_with_window`] with the full occupied manifold and a virtual
+    /// cutoff only (the historical signature).
+    pub fn new_with_cutoff(
+        scf: &'a SCF,
+        gw: &'a GwGradEngine<'a>,
+        multi: char,
+        screening_energy: ScreeningEnergy,
+        vir_cutoff: f64,
+    ) -> Self {
+        Self::new_with_window(scf, gw, multi, screening_energy, vir_cutoff, f64::NEG_INFINITY)
     }
 
     /// Build the engine with the BSE transition space restricted to virtual
@@ -1755,26 +1808,58 @@ impl<'a> BseGradEngine<'a> {
     /// QP caches are only solved for orbitals that carry a finite gradient
     /// weight: the occupied orbitals and the active virtuals.  Inactive
     /// virtuals get empty dummy caches, which `qp_pullback` skips.
-    pub fn new_with_cutoff(
+    pub fn new_with_window(
         scf: &'a SCF,
         gw: &'a GwGradEngine<'a>,
         multi: char,
         screening_energy: ScreeningEnergy,
         vir_cutoff: f64,
+        occ_cutoff: f64,
     ) -> Self {
         let nvir_full = gw.nmo - gw.nocc;
-        let nvir_act = if vir_cutoff.is_infinite() {
-            nvir_full
+        // Orbital window: rank both manifolds by the energies of the orbital
+        // set actually in use (renormalized-singles energies when the RS
+        // orbitals have been installed).  `vir_cutoff` bounds the virtuals from
+        // above (`e_LUMO + x`), `occ_cutoff` bounds the occupied orbitals from
+        // below (`e_HOMO - x`); the pair of them is the `bse_cutoff_energy`
+        // window that `ri_gw::bse_active_bounds` implements for the
+        // non-gradient BSE path.
+        let (occ_start, nocc_act, nvir_act) = if vir_cutoff.is_infinite()
+            && occ_cutoff.is_infinite()
+        {
+            (0, gw.nocc, nvir_full)
         } else {
-            // Orbital window: rank the virtuals by the energies of the orbital
-            // set actually in use (renormalized-singles energies when the RS
-            // orbitals have been installed).
             let eps_ref = crate::ri_gw::current_orbital_energies(scf);
             let eps_ref = &eps_ref[..gw.nmo];
-            let nvir_act = (gw.nocc..gw.nmo).filter(|&a| eps_ref[a] < vir_cutoff).count();
+            let vir_start = gw.nocc;
+            let nvir_act = if vir_cutoff.is_infinite() {
+                nvir_full
+            } else {
+                (vir_start..gw.nmo).filter(|&a| eps_ref[a] < vir_cutoff).count()
+            };
             assert!(nvir_act >= 1, "bse_grad: virtual cutoff leaves no active virtual orbitals");
-            nvir_act
+            // The HOMO itself always stays in the window: dropping it would
+            // leave no occupied orbital to excite from.
+            let occ_start = if occ_cutoff.is_infinite() {
+                0
+            } else {
+                (0..gw.nocc)
+                    .find(|&i| eps_ref[i] >= occ_cutoff)
+                    .unwrap_or(gw.nocc - 1)
+                    .min(gw.nocc - 1)
+            };
+            (occ_start, gw.nocc - occ_start, nvir_act)
         };
+        let vir_start = gw.nocc;
+        if occ_start != 0 || nocc_act != gw.nocc {
+            println!(
+                "    [bse window] active occupied #{}..#{} ({} of {}), active virtuals #{}..#{} \
+                 ({} of {}), dim {}",
+                occ_start, vir_start - 1, nocc_act, gw.nocc,
+                vir_start, vir_start + nvir_act - 1, nvir_act, nvir_full,
+                nocc_act * nvir_act
+            );
+        }
         // Only the orbitals that actually carry a BSE amplitude weight need a
         // QP energy: the occupied and the active virtuals.  With `Qp` screening
         // every orbital enters the screening response and all of them are
@@ -1782,7 +1867,8 @@ impl<'a> BseGradEngine<'a> {
         // gradient rebuilds them on demand (and skips them entirely when their
         // weight vanishes).
         let needed = |n: usize| {
-            n < gw.nocc + nvir_act || matches!(screening_energy, ScreeningEnergy::Qp)
+            (n >= occ_start && n < vir_start + nvir_act)
+                || matches!(screening_energy, ScreeningEnergy::Qp)
         };
         // Only the QP *energies* are needed up to the gradient (the BSE
         // matrices are built from them); the response caches themselves are
@@ -1839,16 +1925,31 @@ impl<'a> BseGradEngine<'a> {
             .unwrap_or_else(|| rayon::current_num_threads())
             .max(1);
         rest_tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_want);
+        let mut n_qp_built = 0usize;
         for n in 0..gw.nmo {
             if needed(n) {
                 let c = gw.build_target_cache_compact(n);
                 qp_energies[n] = c.omega;
                 qp_caches[n] = c;
+                n_qp_built += 1;
             }
             if n % 16 == 15 {
                 crate::hessian::memory_monitor::trim_to_os(0);
             }
         }
+        // Cost evidence for the `bse_cutoff_energy` window: the QP (GW) solve is
+        // the expensive part of the engine, and only the orbitals that carry a
+        // BSE amplitude weight need one.  Without the window this is `nmo`.
+        println!(
+            "[bse_grad] GW quasiparticle solves: {n_qp_built} of {} orbitals \
+             (active {nocc_act} occupied + {nvir_act} virtual){}",
+            gw.nmo,
+            if occ_start == 0 && nocc_act == gw.nocc && vir_start + nvir_act == gw.nmo {
+                ""
+            } else {
+                " -- deep/inactive orbitals skipped"
+            }
+        );
         rest_tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_saved);
         // the metric-transformed blocks are only read while a QP cache is
         // built; the low-rank factors they helped build stay resident for the
@@ -1891,7 +1992,9 @@ impl<'a> BseGradEngine<'a> {
             ScreeningEnergy::Reference => crate::ri_gw::current_orbital_energies(scf)[..gw.nmo].to_vec(),
         };
         let screen = gw.with_q(|q| {
-            BseScreening::build_from_parts_cutoff(q, &gw.j_mat, gw.nocc, gw.nmo, nvir_act, &eps_screen)
+            BseScreening::build_from_parts_cutoff(
+                q, &gw.j_mat, occ_start, nocc_act, vir_start, gw.nmo, nvir_act, &eps_screen,
+            )
         });
         let kappa = match multi {
             's' | 'S' => 2.0,
@@ -1926,12 +2029,12 @@ impl<'a> BseGradEngine<'a> {
     pub fn rebuild_screening(&mut self, eps_screen: &[f64]) {
         assert_eq!(eps_screen.len(), self.gw.nmo, "rebuild_screening: energy length");
         self.eps_screen = eps_screen.to_vec();
-        let nocc = self.gw.nocc;
         let nmo = self.gw.nmo;
-        let nvir_act = self.screen.nvir;
+        let (occ_start, nocc) = (self.screen.occ_start, self.screen.nocc);
+        let (vir_start, nvir_act) = (self.screen.vir_start, self.screen.nvir);
         self.screen = self.gw.with_q(|q| {
             BseScreening::build_from_parts_cutoff(
-                q, &self.gw.j_mat, nocc, nmo, nvir_act, &self.eps_screen,
+                q, &self.gw.j_mat, occ_start, nocc, vir_start, nmo, nvir_act, &self.eps_screen,
             )
         });
     }
@@ -1942,12 +2045,14 @@ impl<'a> BseGradEngine<'a> {
         if !self.screen.blocks_released() {
             return;
         }
-        let nocc = self.gw.nocc;
         let nmo = self.gw.nmo;
-        let nvir_act = self.screen.nvir;
+        let (occ_start, nocc) = (self.screen.occ_start, self.screen.nocc);
+        let (vir_start, nvir_act) = (self.screen.vir_start, self.screen.nvir);
         let eps = self.eps_screen.clone();
         self.screen = self.gw.with_q(|q| {
-            BseScreening::build_from_parts_cutoff(q, &self.gw.j_mat, nocc, nmo, nvir_act, &eps)
+            BseScreening::build_from_parts_cutoff(
+                q, &self.gw.j_mat, occ_start, nocc, vir_start, nmo, nvir_act, &eps,
+            )
         });
     }
 
@@ -2065,6 +2170,8 @@ impl<'a> BseGradEngine<'a> {
         let naux = self.gw.naux;
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
+        let nocc_act = self.screen.nocc;
+        let (occ_start, vir_start) = (self.screen.occ_start, self.screen.vir_start);
         let nvir = self.screen.nvir;
 
         if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
@@ -2091,9 +2198,12 @@ impl<'a> BseGradEngine<'a> {
             let root = &self.roots[k];
             // amplitude weights cover the occupied orbitals and the active
             // virtuals; inactive virtuals carry zero QP weight
-            let w_act = qp_gap_weights(&root.x, &root.y, nocc, nvir);
+            let w_act = qp_gap_weights(&root.x, &root.y, nocc_act, nvir);
             let mut w = vec![0.0f64; nmo];
-            w[..nocc + nvir].copy_from_slice(&w_act);
+            // `w_act` is compacted over the active window: occupied `i` is
+            // orbital `occ_start + i`, active virtual `a` is `vir_start + a`.
+            w[occ_start..occ_start + nocc_act].copy_from_slice(&w_act[..nocc_act]);
+            w[vir_start..vir_start + nvir].copy_from_slice(&w_act[nocc_act..]);
             let kv = kernel_vjp_compact(&self.screen, &root.x, &root.y, self.kappa);
             let ebar = kv.ebar(nmo);
             match self.screening_energy {
@@ -2548,6 +2658,8 @@ impl<'a> BseGradEngine<'a> {
         let nmo = self.gw.nmo;
         let naux = self.gw.naux;
         let nocc = self.gw.nocc;
+        let nocc_act = self.screen.nocc;
+        let (occ_start, vir_start) = (self.screen.occ_start, self.screen.vir_start);
         let nvir = self.screen.nvir;
         let pair = |p: usize, q: usize| p + q * nmo;
         let theta: Vec<KernelVjpCompact> = self
@@ -2594,6 +2706,62 @@ impl<'a> BseGradEngine<'a> {
         out
     }
 
+    /// Expand one root's compact kernel covector into the full-pair layout and
+    /// compare it **entry by entry** with the explicit full-pair route, so a
+    /// mis-mapped block index can be located (the scalar contraction of
+    /// [`Self::kernel_contraction_compare`] only shows *that* something is off).
+    /// Returns `(compact, full, naux, nmo)`.
+    pub fn kernel_covector_compare(&mut self, k: usize) -> (Vec<f64>, Vec<f64>, usize, usize) {
+        self.ensure_screening();
+        let nmo = self.gw.nmo;
+        let naux = self.gw.naux;
+        let pair = |p: usize, q: usize| p + q * nmo;
+        let r = &self.roots[k];
+        let kv = kernel_vjp_compact(&self.screen, &r.x, &r.y, self.kappa);
+        let mut compact = vec![0.0f64; naux * nmo * nmo];
+        kv.add_into_full_pair(&mut compact, naux, nmo);
+        let pcs = kernel_vjp_pieces(&self.screen, &r.x, &r.y, self.kappa, pair, nmo);
+        let mut full = pcs.qbar_ex.clone();
+        for src in [
+            &pcs.qbar_oo,
+            &pcs.qbar_vv,
+            &pcs.qbar_ov_direct,
+            &pcs.qbar_bov_a,
+            &pcs.qbar_bov_b,
+        ] {
+            for (d, s) in full.iter_mut().zip(src.iter()) {
+                *d += s;
+            }
+        }
+        (compact, full, naux, nmo)
+    }
+
+    /// Per-piece value of one root's kernel covector at one orbital pair
+    /// (`naux`-summed? no: at every `naux` row), used to localise an index
+    /// mismatch between the compact and the full-pair route.
+    pub fn kernel_pieces_at(&mut self, k: usize, p_orb: usize, q_orb: usize) -> Vec<(&'static str, f64, f64)> {
+        self.ensure_screening();
+        let nmo = self.gw.nmo;
+        let naux = self.gw.naux;
+        let pair = |p: usize, q: usize| p + q * nmo;
+        let r = &self.roots[k];
+        let kv = kernel_vjp_compact(&self.screen, &r.x, &r.y, self.kappa);
+        let mut compact = vec![0.0f64; naux * nmo * nmo];
+        kv.add_into_full_pair(&mut compact, naux, nmo);
+        let pcs = kernel_vjp_pieces(&self.screen, &r.x, &r.y, self.kappa, pair, nmo);
+        let base = pair(p_orb, q_orb) * naux;
+        let sum = |v: &[f64]| (0..naux).map(|a| v[base + a]).sum::<f64>();
+        vec![
+            ("ex", sum(&pcs.qbar_ex), sum(&pcs.qbar_ex)),
+            ("oo", sum(&pcs.qbar_oo), sum(&pcs.qbar_oo)),
+            ("vv", sum(&pcs.qbar_vv), sum(&pcs.qbar_vv)),
+            ("ov_direct", sum(&pcs.qbar_ov_direct), sum(&pcs.qbar_ov_direct)),
+            ("bov_a", sum(&pcs.qbar_bov_a), sum(&pcs.qbar_bov_a)),
+            ("bov_b", sum(&pcs.qbar_bov_b), sum(&pcs.qbar_bov_b)),
+            ("COMPACT", sum(&compact), sum(&compact)),
+        ]
+    }
+
     /// Reference implementation of [`Self::analytic_gradients`] that uses the
     /// original **full-pair** kernel covector (`kernel_vjp`) and a
     /// non-streaming QP pullback.  It only exists to validate the
@@ -2604,6 +2772,8 @@ impl<'a> BseGradEngine<'a> {
         let nk = self.roots.len();
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
+        let nocc_act = self.screen.nocc;
+        let (occ_start, vir_start) = (self.screen.occ_start, self.screen.vir_start);
         let nvir = self.screen.nvir;
         let pair = |p: usize, q: usize| p + q * nmo;
         let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
@@ -2611,9 +2781,12 @@ impl<'a> BseGradEngine<'a> {
         let mut bq_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
         for root in &self.roots {
-            let w_act = qp_gap_weights(&root.x, &root.y, nocc, nvir);
+            let w_act = qp_gap_weights(&root.x, &root.y, nocc_act, nvir);
             let mut w = vec![0.0f64; nmo];
-            w[..nocc + nvir].copy_from_slice(&w_act);
+            // `w_act` is compacted over the active window: occupied `i` is
+            // orbital `occ_start + i`, active virtual `a` is `vir_start + a`.
+            w[occ_start..occ_start + nocc_act].copy_from_slice(&w_act[..nocc_act]);
+            w[vir_start..vir_start + nvir].copy_from_slice(&w_act[nocc_act..]);
             let (qbar, jbar, ebar) =
                 kernel_vjp(&self.screen, &root.x, &root.y, self.kappa, pair, nmo);
             match self.screening_energy {
@@ -2707,6 +2880,7 @@ mod layout_tests {
         let naux = screen.naux;
         let nov = nocc * nvir;
         let dim = nocc * nvir;
+        let (os, vs) = (screen.occ_start, screen.vir_start);
         let mut qbar_ex = vec![0.0f64; naux * nmo * nmo];
         let mut jbar_ex = vec![0.0f64; naux * naux];
         let mut z = vec![0.0f64; dim];
@@ -2722,8 +2896,8 @@ mod layout_tests {
             vz[p] = acc;
         }
         for c in 0..nov {
-            let i = c % nocc;
-            let a = nocc + c / nocc;
+            let i = os + c % nocc;
+            let a = vs + c / nocc;
             let col = pair(i, a) * naux;
             let ctrans = pair(a, i) * naux;
             for p in 0..naux {
@@ -2784,8 +2958,8 @@ mod layout_tests {
             }
             for p in 0..naux {
                 for ab in 0..nvir * nvir {
-                    let a = nocc + ab % nvir;
-                    let b = nocc + ab / nvir;
+                    let a = vs + ab % nvir;
+                    let b = vs + ab / nvir;
                     let col = pair(a, b) * naux;
                     let ctrans = pair(b, a) * naux;
                     qbar_vv[col + p] -= 0.5 * fvv[p + ab * naux];
@@ -2821,8 +2995,8 @@ mod layout_tests {
             }
         }
         for c in 0..nov {
-            let i = c % nocc;
-            let a = nocc + c / nocc;
+            let i = os + c % nocc;
+            let a = vs + c / nocc;
             let col = pair(i, a) * naux;
             let ctrans = pair(a, i) * naux;
             for p in 0..naux {
@@ -2882,6 +3056,8 @@ mod layout_tests {
         let nov_full = nocc * nvir_full;
         let screen = BseScreening {
             nocc,
+            occ_start: 0,
+            vir_start: nocc,
             nvir,
             nvir_full,
             naux,
@@ -2932,6 +3108,8 @@ mod layout_tests {
         let nov = nocc * nvir;
         let screen = BseScreening {
             nocc,
+            occ_start: 0,
+            vir_start: nocc,
             nvir,
             nvir_full,
             naux,

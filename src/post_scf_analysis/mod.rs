@@ -693,6 +693,22 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 // historical behaviour; a positive value restricts the
                 // transition space to `e_F + window` (the same convention as the
                 // timing driver's `PAPER_WINDOW`).
+                // `bse_cutoff_energy = w` (finite, and not the 1e6 default)
+                // turns on the **two-sided** window `[e_H - w, e_H + w]` around
+                // the molecular Fermi level E_F = e_HOMO: the occupied manifold
+                // is then truncated from below as well, so deep core orbitals —
+                // which cannot contribute to low-lying excitations but enter
+                // the O(nocc^2) screening blocks and the O(dim^2) matrices
+                // quadratically — stay out of the BSE entirely.
+                // `bse_cutoff_energy = x`: `x` Ha below the HOMO (occupied
+                // side) and `x` Ha above the LUMO (virtual side).
+                let (e_homo, e_lumo, two_sided) = {
+                    let e = &scf_data.eigenvalues[0];
+                    let homo = scf_data.homo[0];
+                    let lumo = scf_data.lumo[0].min(e.len() - 1);
+                    let w = qp_ctrl.bse_cutoff_energy;
+                    (e[homo], e[lumo], w > 0.0 && w < 1.0e5)
+                };
                 let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
                     // Fixed *count*: the cutoff sits halfway between the n-th and
                     // the (n+1)-th virtual at this geometry, so the transition
@@ -708,6 +724,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     } else {
                         f64::INFINITY
                     }
+                } else if two_sided {
+                    e_lumo + qp_ctrl.bse_cutoff_energy
                 } else if qp_ctrl.gradient_bse_window > 0.0 {
                     let e = &scf_data.eigenvalues[0];
                     let nocc = scf_data.homo[0] + 1;
@@ -715,8 +733,13 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 } else {
                     f64::INFINITY
                 };
-                let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_cutoff(
-                    scf_data, &gw, multi, screen, cutoff);
+                let occ_cutoff = if two_sided {
+                    e_homo - qp_ctrl.bse_cutoff_energy
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_window(
+                    scf_data, &gw, multi, screen, cutoff, occ_cutoff);
                 println!(
                     "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
                     bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full

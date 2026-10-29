@@ -115,6 +115,10 @@ pub fn save_bse_amplitudes(excitations:&Vec<(f64,Vec<f64>)>,occ_size:usize,vir_s
         Err(err)=>println!("Warning: could not create {}: {}",path,err),
     }
 }
+fn qp_ctrl_energy(scf_data:&SCF)->f64{
+    scf_data.mol.ctrl.quasiparticle_methods.clone().map(|q|q.bse_cutoff_energy).unwrap_or(0.0)
+}
+
 pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     if scf_data.mol.spin_channel == 2 {
         return bse_main_unrestricted(scf_data);
@@ -122,6 +126,17 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     report_orbital_representation(scf_data);
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    {
+        // Report the transition space: with `bse_cutoff_energy` set, both
+        // manifolds are truncated to the window, which is what the tables list.
+        let cutoff = qp_ctrl_energy(scf_data);
+        println!(
+            "BSE active space: occupied #{}..#{} ({} of {}), virtual #{}..#{} ({} of {}), dim {} \
+             (bse_cutoff_energy = {})",
+            start_mo, homo, occ_size, homo + 1, lumo, num_state - 1, vir_size, scf_data.mol.num_state - lumo,
+            occ_size * vir_size, cutoff
+        );
+    }
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -469,10 +484,19 @@ pub fn identity_matrix(n: usize) -> MatrixFull<f64> {
     mat
 }
 pub fn construct_energy_diag_for_a(quasiparticle_energies:&Vec<f64>,occ_size:usize,vir_size:usize)->Vec<f64>{
+    construct_energy_diag_for_a_window(quasiparticle_energies,0,occ_size,occ_size,vir_size)
+}
+
+/// [`construct_energy_diag_for_a`] for an explicit transition window: compact
+/// occupied `i` is orbital `occ_start + i`, compact virtual `a` is orbital
+/// `vir_start + a` (with `vir_start = occ_start + occ_size`).
+pub fn construct_energy_diag_for_a_window(
+    quasiparticle_energies:&Vec<f64>,occ_start:usize,occ_size:usize,vir_start:usize,vir_size:usize,
+)->Vec<f64>{
     let mut energy_diag = Vec::new();
     for a in 0..vir_size{
         for i in 0..occ_size{
-            let energy_gap=quasiparticle_energies[occ_size+a]-quasiparticle_energies[i];
+            let energy_gap=quasiparticle_energies[vir_start+a]-quasiparticle_energies[occ_start+i];
             energy_diag.push(energy_gap);
         }
     }
@@ -541,7 +565,8 @@ pub fn construct_submat_a(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,quas
     let raw_w=construct_raw_w(&ri_oo,&ri_vv,&inverse_dielectric);
     let mut w=reorganize_w(raw_w, 'A', occ_size, vir_size);
     w.self_multiple(-1.0);
-    let mut energy_diag=construct_energy_diag_for_a(quasiparticle_energies,occ_size,vir_size);
+    let mut energy_diag=construct_energy_diag_for_a_window(
+        quasiparticle_energies,start_mo,occ_size,lumo,vir_size);
     let mut a=w;
     a.iter_diagonal_mut().unwrap().zip(energy_diag.iter_mut()).for_each(|(x,e)|{(*x,*e)=(*x+*e,*e)});
     if xlet=='S'{
@@ -615,7 +640,8 @@ pub fn construct_tdhf_tda_hamiltonian(scf_data:&SCF,xlet:char,quasiparticle_ener
     let raw_exchange=construct_coulomb(&ri_oo,&ri_vv);
     let mut exchange=reorganize_w(raw_exchange, 'A', occ_size, vir_size);
     exchange.self_multiple(-1.0);
-    let mut energy_diag=construct_energy_diag_for_a(quasiparticle_energies,occ_size,vir_size);
+    let mut energy_diag=construct_energy_diag_for_a_window(
+        quasiparticle_energies,start_mo,occ_size,lumo,vir_size);
     let mut a=exchange;
     a.iter_diagonal_mut().unwrap().zip(energy_diag.iter_mut()).for_each(|(x,e)| {(*x,*e)=(*x+*e,*e)});
     if xlet=='S'{

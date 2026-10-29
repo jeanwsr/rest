@@ -15,7 +15,8 @@ pub fn diagonal_elements_contribution(scf_data:&SCF,vec:&Vec<f64>)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let qp=scf_data.gwqp.0.clone();
     let mut prod_vec=vec![0.0;occ_size*vir_size];
-    (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{prod_vec[i+a*occ_size]=(qp[a+occ_size]-qp[i])*vec[i+a*occ_size]});
+    // compact `i` -> orbital `start_mo + i`, compact `a` -> orbital `lumo + a`
+    (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{prod_vec[i+a*occ_size]=(qp[lumo+a]-qp[start_mo+i])*vec[i+a*occ_size]});
     prod_vec
 }
 

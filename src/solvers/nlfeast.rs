@@ -23,6 +23,7 @@
 
 use num::Complex;
 use rest_tensors::matrix::{MathMatrix, MatrixFull};
+use std::time::Instant;
 
 /// A single quadrature node z_j = z_re + i·z_im with complex weight
 /// ω_j = w_re + i·w_im on the search contour.
@@ -32,6 +33,22 @@ pub struct ContourNode {
     pub z_im: f64,
     pub w_re: f64,
     pub w_im: f64,
+}
+
+/// Wall-clock breakdown of the NLFEAST kernel (seconds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NLFeastTimings {
+    /// Time spent in `NlepOperator::projected_solve`.
+    pub projected_solve: f64,
+    /// Time spent evaluating real-axis residuals `T(lambda) x`.
+    pub residual: f64,
+    /// Time spent in the contour-integral subspace update (shifted solves and
+    /// accumulation).
+    pub contour: f64,
+    /// Time spent in QR orthonormalisation.
+    pub qr: f64,
+    /// Total time spent inside the NLFEAST kernel.
+    pub total: f64,
 }
 
 /// Result of the NLFEAST solver.
@@ -47,6 +64,8 @@ pub struct NLFeastResult {
     pub iterations: usize,
     /// ‖T(λ_k) x_k‖ for every returned eigenpair.
     pub residuals: Vec<f64>,
+    /// Wall-clock breakdown of the subspace iteration.
+    pub timings: NLFeastTimings,
 }
 
 /// Operator interface consumed by the NLFEAST kernel.
@@ -81,6 +100,19 @@ pub trait NlepOperator {
     /// contour integral.  `node_index` identifies which contour node is being
     /// processed (some operators hold node-dependent data).
     fn solve_shifted(&self, node_index: usize, z: Complex<f64>, rhs: &[f64]) -> Vec<f64>;
+
+    /// Optional block version of `solve_shifted`: solve for all columns of
+    /// `rhs` at once.  The default returns `None`, in which case the kernel
+    /// falls back to column-by-column solves.  Operators with a cached dense
+    /// inverse should override this to use a single BLAS-3 GEMM per node.
+    fn solve_shifted_block(
+        &self,
+        _node_index: usize,
+        _z: Complex<f64>,
+        _rhs: &MatrixFull<f64>,
+    ) -> Option<MatrixFull<Complex<f64>>> {
+        None
+    }
 }
 
 /// Modified Gram–Schmidt QR orthonormalisation.  Linearly dependent columns are
@@ -178,6 +210,7 @@ fn build_final_result(
         n_found,
         iterations: 0,
         residuals: final_res,
+        timings: NLFeastTimings::default(),
     }
 }
 
@@ -213,6 +246,8 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
     let centre_cplx = Complex::new(centre, 0.0);
 
     let mut n_iter = 0;
+    let mut timings = NLFeastTimings::default();
+    let feast_start = Instant::now();
     let mut prev_lambda: Vec<f64> = Vec::new();
     let mut last_lambda_real: Vec<f64> = Vec::new();
     let mut last_x_mat = MatrixFull::new([n, 0], 0.0);
@@ -228,7 +263,9 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
         lambda_init.truncate(m0_eff);
 
         // ---- Step 1: Solve the projected NLEVP at current lambda_init ----
+        let t_phase = Instant::now();
         let (all_lambda, all_x) = op.projected_solve(&q_mat, &lambda_init);
+        timings.projected_solve += t_phase.elapsed().as_secs_f64();
         if it == 0 {
             eprint!("  Initial eigenvalue estimates (first 8):");
             for j in 0..8.min(all_lambda.len()) {
@@ -244,7 +281,7 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
             .collect();
         with_dist.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let lambda_cur: Vec<Complex<f64>> = with_dist[..m0_eff.min(n_all)]
+        let mut lambda_cur: Vec<Complex<f64>> = with_dist[..m0_eff.min(n_all)]
             .iter()
             .map(|(_, idx)| all_lambda[*idx])
             .collect();
@@ -254,7 +291,7 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
                 x_mat[[i, pj]] = all_x[[i, *idx]];
             }
         }
-        let m0_eff = lambda_cur.len();
+        let mut m0_eff = lambda_cur.len();
 
         // ---- Step 3: Convergence check (real-axis residuals) ----
         let mut n_inside = 0;
@@ -263,6 +300,7 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
         let mut residuals = Vec::with_capacity(m0_eff);
         let mut inside_flags = vec![false; m0_eff];
 
+        let t_phase = Instant::now();
         for j in 0..m0_eff {
             let lam = lambda_cur[j];
             let lam_real = lam.re;
@@ -288,6 +326,7 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
                 }
             }
         }
+        timings.residual += t_phase.elapsed().as_secs_f64();
 
         eprintln!(
             "NLFEAST iter {}: max ‖T(λ)x‖_inside = {:.2e}, inside {}/{}",
@@ -306,7 +345,60 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
                 radius,
             );
             result.iterations = n_iter;
+            result.timings = timings;
+            result.timings.total = feast_start.elapsed().as_secs_f64();
             return result;
+        }
+
+        // Adaptive subspace compression: once the interior count is known,
+        // there is no reason to keep a much larger m0 than n_inside + buffer.
+        // Shrinking here reduces the cost of every remaining projected solve,
+        // residual evaluation and contour update.  The buffer protects against
+        // roots entering/leaving the contour in later iterations.
+        let adaptive_m0 = std::env::var("REST_FEAST_GW_NO_ADAPTIVE_M0").is_err();
+        if adaptive_m0 && n_iter >= 2 && n_inside > 0 && m0_eff > 12 {
+            let target = (n_inside + 6).max(10).min(m0_eff);
+            if target < m0_eff {
+                let mut keep: Vec<usize> = (0..m0_eff)
+                    .filter(|&j| inside_flags[j])
+                    .collect();
+                let mut outside: Vec<usize> = (0..m0_eff)
+                    .filter(|&j| !inside_flags[j])
+                    .collect();
+                outside.sort_by(|&a, &b| {
+                    (lambda_cur[a] - centre_cplx)
+                        .norm()
+                        .partial_cmp(&(lambda_cur[b] - centre_cplx).norm())
+                        .unwrap()
+                });
+                for j in outside {
+                    if keep.len() >= target {
+                        break;
+                    }
+                    keep.push(j);
+                }
+                keep.truncate(target);
+                keep.sort_by(|&a, &b| lambda_cur[a].re.partial_cmp(&lambda_cur[b].re).unwrap());
+                let new_m = keep.len();
+                let mut new_x = MatrixFull::new([n, new_m], 0.0);
+                let mut new_lam = Vec::with_capacity(new_m);
+                let mut new_res = Vec::with_capacity(new_m);
+                for (new_j, &old_j) in keep.iter().enumerate() {
+                    new_lam.push(lambda_cur[old_j]);
+                    new_res.push(residuals[old_j]);
+                    for i in 0..n {
+                        new_x[[i, new_j]] = x_mat[[i, old_j]];
+                    }
+                }
+                eprintln!(
+                    "  → shrinking FEAST subspace from {} to {} (inside={})",
+                    m0_eff, new_m, n_inside
+                );
+                lambda_cur = new_lam;
+                x_mat = new_x;
+                residuals = new_res;
+                m0_eff = new_m;
+            }
         }
 
         // Stagnation detection
@@ -335,6 +427,8 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
                 radius,
             );
             result.iterations = n_iter;
+            result.timings = timings;
+            result.timings.total = feast_start.elapsed().as_secs_f64();
             return result;
         }
         // Save best results for fallback
@@ -351,6 +445,7 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
         //
         // First compute the block residual T(Λ)·X on the real axis, then solve
         // T(z_j)·U_j = T(Λ)·X for each node and accumulate.
+        let t_phase = Instant::now();
         let mut tx_mat = MatrixFull::new([n, m0_eff], 0.0);
         for j in 0..m0_eff {
             let lam = lambda_cur[j].re;
@@ -368,16 +463,26 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
             let mut u_re = MatrixFull::new([n, m0_eff], 0.0);
             let mut u_im = MatrixFull::new([n, m0_eff], 0.0);
 
-            for col in 0..m0_eff {
-                // RHS is always real: [tx_col; 0] in the 2N embedding
-                let mut b_2n = vec![0.0; 2 * n];
+            if let Some(u) = op.solve_shifted_block(node_index, z, &tx_mat) {
+                // Cached dense inverse: one BLAS-3 GEMM for all RHS columns.
                 for i in 0..n {
-                    b_2n[i] = tx_mat[[i, col]];
+                    for col in 0..m0_eff {
+                        u_re[[i, col]] = u[[i, col]].re;
+                        u_im[[i, col]] = u[[i, col]].im;
+                    }
                 }
-                let x_2n = op.solve_shifted(node_index, z, &b_2n);
-                for i in 0..n {
-                    u_re[[i, col]] = x_2n[i];
-                    u_im[[i, col]] = x_2n[n + i];
+            } else {
+                for col in 0..m0_eff {
+                    // RHS is always real: [tx_col; 0] in the 2N embedding
+                    let mut b_2n = vec![0.0; 2 * n];
+                    for i in 0..n {
+                        b_2n[i] = tx_mat[[i, col]];
+                    }
+                    let x_2n = op.solve_shifted(node_index, z, &b_2n);
+                    for i in 0..n {
+                        u_re[[i, col]] = x_2n[i];
+                        u_im[[i, col]] = x_2n[n + i];
+                    }
                 }
             }
 
@@ -406,8 +511,12 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
             }
         }
 
+        timings.contour += t_phase.elapsed().as_secs_f64();
+
         // ---- Step 5: QR orthogonalise Q_new ----
+        let t_phase = Instant::now();
         q_mat = qr_orthonormalise(&q_new);
+        timings.qr += t_phase.elapsed().as_secs_f64();
         if q_mat.size[1] < m0_eff / 2 {
             eprintln!("  Warning: subspace collapsed, stopping.");
             break;
@@ -433,6 +542,8 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
             radius,
         );
         result.iterations = n_iter;
+        result.timings = timings;
+        result.timings.total = feast_start.elapsed().as_secs_f64();
         return result;
     }
     NLFeastResult {
@@ -441,5 +552,6 @@ pub fn nlfeast<O: NlepOperator + ?Sized>(
         n_found: 0,
         iterations: n_iter,
         residuals: vec![],
+        timings,
     }
 }

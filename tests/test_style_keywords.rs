@@ -73,3 +73,30 @@ gw_tensor_style = "mo"
     assert!(t.get("gw_ao_screening_tol").is_some());
     println!("style keyword round-trip OK");
 }
+
+#[test]
+fn fscd_keywords_round_trip() {
+    use pyrest::ctrl_io::quasiparticle_methods::{parse_quasiparticle_keywords, GwVariant};
+
+    let src = r#"
+[quasiparticle_methods]
+gw_scheme = "extrapolated"
+gw_variant = "fscd"
+fscd_domega = 0.02
+fscd_rel_tol = 5.0e-4
+fscd_interp = "cubic"
+fscd_fallback_residual = 2.0e-3
+"#;
+    let keys = toml::from_str::<serde_json::Value>(src).unwrap();
+    let qp = parse_quasiparticle_keywords(&keys).unwrap().unwrap();
+    assert_eq!(qp.gw_variant, GwVariant::Fscd);
+    assert!((qp.fscd_domega - 0.02).abs() < 1.0e-15);
+    assert!((qp.fscd_rel_tol - 5.0e-4).abs() < 1.0e-15);
+    assert_eq!(qp.fscd_interp, "cubic");
+    assert!((qp.fscd_fallback_residual - 2.0e-3).abs() < 1.0e-15);
+
+    let table = qp.to_toml();
+    assert_eq!(table.get("gw_variant").unwrap().as_str().unwrap(), "fscd");
+    assert_eq!(table.get("fscd_interp").unwrap().as_str().unwrap(), "cubic");
+    assert!((table.get("fscd_domega").unwrap().as_float().unwrap() - 0.02).abs() < 1.0e-15);
+}

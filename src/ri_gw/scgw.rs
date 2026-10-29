@@ -58,6 +58,9 @@ pub fn g0w0(
             GwVariant::Ac => {
                 gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
             }
+            GwVariant::Fscd => {
+                gw_near_fermi_surface_fscd(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold, gw_ctx)
+            }
         }
     } else if gw_scheme == "no gw" {
         Vec::new()
@@ -360,7 +363,7 @@ fn gw_near_fermi_surface_spin_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = ri_gw::low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
@@ -1585,6 +1588,417 @@ pub fn gw_near_fermi_surface_ac(
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());
     gwqp
 }
+
+/// Frequency-sampled contour-deformation G0W0 for one orbital.
+///
+/// The residue part of `Sigma_c` is read from a precomputed
+/// [`ri_gw::fscd::FscdTable`]; the imaginary-axis part is identical to the
+/// ordinary CD path.  The root-search logic mirrors [`single_orbital_gw`].
+#[allow(clippy::too_many_arguments)]
+pub fn single_orbital_gw_fscd(
+    scf_data: &mut SCF,
+    route: &ri_gw::GwTensorRoute,
+    ri_ov: &MatrixFull<f64>,
+    v_matrix: &MatrixFull<f64>,
+    ri_row_n: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    table: &ri_gw::fscd::FscdTable,
+    target_index: usize,
+    n: usize,
+    num_freq: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let start = Instant::now();
+    let gwqp_g = scf_data.gwqp.0.clone();
+    let gwqp_w = scf_data.gwqp.1.clone();
+    let e_ks_n = scf_data.eigenvalues[0][n];
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let side = if n >= occ_size { 1.0 } else { -1.0 };
+    let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let res_tol = qp_ctrl.cdgw_res_tol;
+    let print_level = scf_data.mol.ctrl.print_level;
+
+    let qp_eq_func = |omega: f64| {
+        ri_gw::fscd::quasiparticle_equation_fscd(
+            table,
+            target_index,
+            omega,
+            n,
+            consts,
+            &gwqp_g,
+            &gwqp_w,
+            num_state,
+            w_c_at_freqs,
+            res_tol,
+        )
+    };
+
+    let rootfinder = qp_ctrl.gw_rootfinder.clone();
+    let qp_energy_no_fse;
+
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) =
+            one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!(
+                "  [z_update diag, FSCD] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                central_difference(&qp_eq_func, e_in, 1.0e-5),
+                central_difference(&qp_eq_func, e_in, 1.0e-3),
+                central_difference(&qp_eq_func, e_in, 1.0e-2),
+                central_difference(&qp_eq_func, e_in, 5.0e-2)
+            );
+        }
+        println!(
+            "Orbital #{} (FSCD, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+            n,
+            mode_label(kind),
+            e_in,
+            z,
+            g0,
+            dq,
+            e_out
+        );
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
+        println!(
+            "Orbital #{} (FSCD): |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
+            n,
+            e_ks_n.abs(),
+            qp_ctrl.gw_switch_fallback_threshold,
+            qp_energy_no_fse
+        );
+    } else if rootfinder == "newton".to_string() {
+        println!("Orbital #{} (FSCD, first round):", n);
+        let empty = MatrixFull::empty();
+        qp_energy_no_fse = ri_gw::newton_solver(
+            |om, _nn, _cc, _ov, _rn, _qg, _qw, _os, _vs, _ns, _wf| qp_eq_func(om),
+            n,
+            consts,
+            &empty,
+            ri_row_n,
+            &gwqp_g,
+            &gwqp_w,
+            occ_size,
+            vir_size,
+            num_state,
+            w_c_at_freqs,
+            e_ks_n,
+            0.00001,
+            50,
+            side,
+            print_level,
+        );
+        println!("First round QP energy (FSCD): {}", qp_energy_no_fse);
+    } else if rootfinder == "interpolation".to_string() {
+        println!("Orbital #{} (FSCD, first round):", n);
+        let (have_crossing, mut qp_energy) = ri_gw::linear_interpolation_solver(
+            qp_eq_func,
+            e_ks_n,
+            side,
+            qp_ctrl.gw_search_grid,
+            qp_ctrl.gw_span_energy,
+        );
+        if !have_crossing {
+            println!(
+                "No graphical crossings found for n={} (FSCD), using Newton solver instead.",
+                n
+            );
+            let empty = MatrixFull::empty();
+            qp_energy = ri_gw::newton_solver(
+                |om, _nn, _cc, _ov, _rn, _qg, _qw, _os, _vs, _ns, _wf| qp_eq_func(om),
+                n,
+                consts,
+                &empty,
+                ri_row_n,
+                &gwqp_g,
+                &gwqp_w,
+                occ_size,
+                vir_size,
+                num_state,
+                w_c_at_freqs,
+                e_ks_n,
+                0.00001,
+                50,
+                side,
+                print_level,
+            );
+        }
+        qp_energy_no_fse = qp_energy;
+        println!("First round QP energy (FSCD): {}", qp_energy_no_fse);
+    } else {
+        panic!("Invalid choice of GW rootfinder!");
+    }
+
+    if !qp_energy_no_fse.is_finite() {
+        panic!(
+            "FSCD-GW failed to produce a finite QP energy for orbital {}",
+            n
+        );
+    }
+
+    // One-point exact-CD guard.  The sampled self-energy differs from the
+    // dense one by the interpolation error, which is small in the smooth
+    // region but can move a quasiparticle root that sits close to a pole of
+    // W.  Evaluate the *dense* CD equation once at the FSCD root; if it is
+    // not a root of the exact equation, redo this orbital with the exact CD
+    // engine.  This costs one residue sum (n_poles response builds) instead
+    // of a full CD root search (n_scan * n_poles builds).
+    if qp_ctrl.fscd_fallback_residual > 0.0 {
+        let exact_residual = route.quasiparticle_equation(
+            scf_data,
+            Some(ri_ov),
+            qp_energy_no_fse,
+            n,
+            consts,
+            &gwqp_g,
+            &gwqp_w,
+            occ_size,
+            vir_size,
+            num_state,
+            ri_row_n,
+            w_c_at_freqs,
+            res_tol,
+            qp_ctrl.cdgw_eta,
+        );
+        if exact_residual.abs() > qp_ctrl.fscd_fallback_residual {
+            println!(
+                "FSCD orbital #{}: exact-CD residual at the FSCD root is {:.3e} Ha (> {:.1e}); \
+                 falling back to the exact CD engine for this orbital.",
+                n, exact_residual, qp_ctrl.fscd_fallback_residual
+            );
+            return single_orbital_gw(
+                scf_data,
+                route,
+                v_matrix,
+                Some(ri_ov),
+                ri_row_n,
+                w_c_at_freqs,
+                n,
+                num_freq,
+                vxc_nn,
+            );
+        }
+    }
+
+    if qp_ctrl.fourier_self_energy || qp_ctrl.hermite_self_energy {
+        println!(
+            "GW(FSCD) orbital #{}: Fourier/Hermite self-energy correction is not supported in the FSCD path; using the bare FSCD result.",
+            n
+        );
+    }
+
+    println!("GW of orbital #{} (FSCD) took {:?}", n, start.elapsed());
+    if print_level > 1 {
+        println!("Shift = {}", qp_energy_no_fse - e_ks_n);
+    }
+    qp_energy_no_fse
+}
+
+/// G0W0 with the frequency-sampled contour-deformation (FSCD) residue sum.
+///
+/// This is the third `gw_variant`, alongside `"cd"` and `"ac"`.  It uses the
+/// same frontier-orbital window and the same outside-window rigid-shift
+/// extrapolation as the ordinary `"cd"` driver; only the residue evaluation is
+/// frequency-sampled.
+///
+/// FSCD deliberately uses the MO-basis RI tensors (`ri_ov`, `ri_row`) because
+/// its response matrix must be identical to the one used by the CD reference.
+/// `gw_tensor_style = "ao"` is therefore ignored for this variant.
+pub fn gw_near_fermi_surface_fscd(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &Vec<f64>,
+    occ_threshold: f64,
+    vir_threshold: f64,
+    _gw_ctx: &mut ri_gw::GwContext,
+) -> Vec<f64> {
+    let t_start = Instant::now();
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    // The exact-CD guard and the MO tensor calls below use the historical
+    // MO route (no AO plan).
+    let route = ri_gw::GwTensorRoute { plan: None };
+    let ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
+    let v_matrix = ri_gw::v_matrix_from_scf(scf_data);
+    let ks_energies = scf_data.eigenvalues[0].clone();
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+
+    let w_c_at_freqs: Vec<(f64, f64, MatrixFull<f64>)> = if qp_ctrl.gw_imag_rayon {
+        ri_gw::generate_w_c(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    } else {
+        ri_gw::generate_w_c_serial(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    };
+
+    let e_homo = ks_energies[occ_size - 1];
+    let e_lumo = ks_energies[occ_size];
+    let calc_orbs_indices: Vec<usize> = ks_energies
+        .iter()
+        .enumerate()
+        .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+        .map(|(n, _)| n)
+        .collect();
+    println!("FSCD calculated orbital indices:{:?}", calc_orbs_indices);
+
+    let ri_rows: Vec<MatrixFull<f64>> = calc_orbs_indices
+        .iter()
+        .map(|&n| ri_gw::compute_ri3mo_row(scf_data, n))
+        .collect();
+
+    let cfg = ri_gw::fscd::FscdConfig {
+        domega: qp_ctrl.fscd_domega,
+        rel_tol: qp_ctrl.fscd_rel_tol,
+        // Diagnostic hook for the eta study: `REST_FSCD_ETA` overrides the
+        // regularisation of the sampled `W_np`, including `0.0` (which the card
+        // value cannot express, because a non-positive `cdgw_eta` falls back to
+        // the 1 mHa default below).  Unset -> the historical behaviour.
+        eta: std::env::var("REST_FSCD_ETA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(if qp_ctrl.cdgw_eta > 0.0 { qp_ctrl.cdgw_eta } else { 1.0e-3 }),
+        res_tol: qp_ctrl.cdgw_res_tol,
+        span: qp_ctrl.gw_span_energy.max(1.0),
+        interp: ri_gw::fscd::FscdInterp::from_str(&qp_ctrl.fscd_interp),
+        // Gradient-capable mode: when the real-axis range is pinned by
+        // `omega_chi_max`, reuse *exactly* the lattice the analytic-gradient
+        // engine builds (its nodes then have zero sensitivity to the geometry),
+        // so the FSCD energy and its derivative refer to the same grid.
+        freqs: if qp_ctrl.omega_chi_max > 0.0 && qp_ctrl.nomega_chi_real > 0 {
+            let nmo = scf_data.eigenvalues[0].len();
+            let nsemin = (occ_size.saturating_sub(1))
+                .saturating_sub(qp_ctrl.selfenergy_state_range);
+            let nsemax = (occ_size + qp_ctrl.selfenergy_state_range).min(nmo - 1);
+            let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
+            let g = ri_gw::gw_grad::build_real_axis_grid(
+                &scf_data.eigenvalues[0],
+                occ_size,
+                qp_ctrl.nomega_chi_real,
+                nsemin,
+                nsemax,
+                qp_ctrl.nomega_sigma,
+                qp_ctrl.step_sigma,
+                qp_ctrl.cdgw_res_tol,
+                grid_type,
+                qp_ctrl.omega_chi_max,
+                1.0e-8,
+            );
+            println!(
+                "FSCD: pinned geometry-independent grid ({} nodes, 0..{:.4} Ha) shared with the gradient engine",
+                g.nodes.len(),
+                g.nodes.last().copied().unwrap_or(0.0)
+            );
+            Some(g.nodes)
+        } else {
+            None
+        },
+    };
+    let table = ri_gw::fscd::build_fscd_table(
+        &ri_ov,
+        &ri_rows,
+        &calc_orbs_indices,
+        &scf_data.gwqp.0,
+        &scf_data.gwqp.1,
+        occ_size,
+        vir_size,
+        &cfg,
+    );
+    println!(
+        "FSCD: {} target orbitals, {} sampled frequencies, {} tabulated (target, pole) pairs, {} response builds (thresholds: {:.4} Ha / {:.2e}, interp={:?})",
+        calc_orbs_indices.len(),
+        table.n_grid(),
+        table.n_pairs(),
+        table.n_response_builds,
+        cfg.domega,
+        cfg.rel_tol,
+        cfg.interp
+    );
+
+    let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
+        .iter()
+        .enumerate()
+        .map(|(idx, &n)| {
+            (
+                n,
+                single_orbital_gw_fscd(
+                    scf_data,
+                    &route,
+                    &ri_ov,
+                    &v_matrix,
+                    &ri_rows[idx],
+                    &w_c_at_freqs,
+                    &table,
+                    idx,
+                    n,
+                    num_freq,
+                    vxc_nn[n],
+                ),
+            )
+        })
+        .collect();
+
+    let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift =
+        calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    let mut gwqp: Vec<f64> = Vec::new();
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("low extrapolations:{}", calc_orbs[0].0);
+        println!("calculated orbitals:{}", calc_orbs.len());
+        println!(
+            "high extrapolations:{}",
+            num_state - 1 - calc_orbs[calc_orbs.len() - 1].0
+        );
+        println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
+    }
+    for i in 0..calc_orbs[0].0 {
+        gwqp.push(scf_data.eigenvalues[0][i] + occ_shift)
+    }
+    for i in 0..calc_orbs.len() {
+        gwqp.push(calc_orbs[i].1)
+    }
+    for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
+        gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
+    }
+    ri_gw::display::extrapolation_quasiparticles(
+        &gwqp,
+        occ_size,
+        &calc_orbs_indices,
+        occ_threshold,
+        vir_threshold,
+    );
+    scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    println!("FSCD G0W0 driver finished in {:.2} s", t_start.elapsed().as_secs_f64());
+    gwqp
+}
+
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
     let route=gw_ctx.route(scf_data);
     let t_riov = Instant::now();
@@ -1706,7 +2120,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             qp_ctrl.cdgw_eta,
             qp_ctrl.cdgw_res_tol,
             );
-            ra.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+            ra.interp = ri_gw::low_rank_interp_code(&qp_ctrl.low_rank_interp);
             ra
         };
         println!("Real-axis v*chi*v precompute: {:.2} s", t_ra.elapsed().as_secs_f64());

@@ -392,6 +392,31 @@ pub struct GwGradConfig {
     /// core level (e.g. the O `1s` of water at -20.5 Ha) is treated on-shell
     /// while valence levels keep the root functional.
     pub static_fallback_threshold: f64,
+    /// Energy above which a **virtual** level takes the linearized (one-step
+    /// Newton) functional *directly*, without any root search: the counterpart
+    /// of [`Self::static_fallback_threshold`] for the empty states.
+    ///
+    /// ```text
+    /// E_lin = e_n + Z(e_n) [ consts_n + Re Sigma_c(e_n) - e_n ],  Z = 1/(1 - dSigma_c/domega)
+    /// ```
+    ///
+    /// High-lying diffuse virtuals are where the quantised-residue
+    /// self-energy has several roots: at the S1 minimum of azobenzene/def2-TZVPP
+    /// 21 virtuals (e_n >= +0.5 Ha) came out 0.1-0.5 Ha away from the root that
+    /// the contour engine finds, and those bad QP energies poisoned the BSE
+    /// gradient.  Taking the linear branch there keeps `Z` (the physical
+    /// spectral weight) and is smooth in the geometry, exactly as the static
+    /// branch is for the deep occupied levels.  A level is "high" when
+    /// `n >= nocc` **and** `e_n > linear_fallback_threshold`; `f64::INFINITY`
+    /// (the default) disables the rule.
+    pub linear_fallback_threshold: f64,
+    /// Upper bound on the linearized step `|Z * shift|` (Ha).  `Z` of a
+    /// high-lying virtual can be negative and large (`Z = -24.8` was observed),
+    /// in which case the linear extrapolation would move the level by ~1 Ha.
+    /// The step is clamped to this value and a warning is printed; the clamped
+    /// `Z` is stored in the cache (`z_factor`) so the analytic gradient uses
+    /// the same functional that produced the energy.  `0` disables the clamp.
+    pub linear_step_cap: f64,
     /// Tolerance (Hartree) for recognising symmetry-protected **degenerate**
     /// orbital shells of the reference (default `1e-8`).
     ///
@@ -603,6 +628,8 @@ impl Default for GwGradConfig {
             qpe_max_iter: 100,
             exact_residue_z: false,
             static_fallback_threshold: 1.0,
+            linear_fallback_threshold: f64::INFINITY,
+            linear_step_cap: 0.5,
             low_rank_interp: 1,
             graphical_rescue: false,
             smooth_pole: false,
@@ -656,8 +683,14 @@ impl GwGradConfig {
             selfenergy_state_range: qp.selfenergy_state_range,
             omega_chi_max: qp.omega_chi_max,
             static_fallback_threshold: qp.gw_switch_fallback_threshold,
-            low_rank_interp: if qp.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 },
+            linear_fallback_threshold: qp.gradient_linear_threshold,
+            linear_step_cap: qp.gradient_linear_step_cap,
+            low_rank_interp: crate::ri_gw::low_rank_interp_code(&qp.low_rank_interp),
             graphical_rescue: qp.gradient_graphical_rescue,
+            // `gradient_qp_graphical` (card) or `REST_QP_GRAPHICAL=1` (env): pick the
+            // QP root with the production graphical scan instead of the Newton cascade.
+            qpe_graphical: qp.gradient_qp_graphical
+                || std::env::var("REST_QP_GRAPHICAL").map(|v| v != "0").unwrap_or(false),
             smooth_pole: qp.gradient_smooth_pole,
             // The input card is the authority for the route choice; the
             // `REST_ADJOINT_DFT` environment variable can still force it off
@@ -4086,6 +4119,53 @@ impl<'a> GwGradEngine<'a> {
         self.linearized_cache(n, consts, table, want_y)
     }
 
+    /// [`Self::linearized_cache`] with the step `Z * shift` clamped to
+    /// `GwGradConfig::linear_step_cap`.  The clamped `Z` is what the cache
+    /// reports as `z_factor` and `omega = e_n + Z_clamped * shift`, so the
+    /// analytic gradient differentiates the same functional that defines the
+    /// energy (no separate bookkeeping is needed in the pullback).
+    fn linearized_cache_capped(
+        &self,
+        n: usize,
+        consts: f64,
+        table: &QpRowTable,
+        want_y: bool,
+        why: &str,
+    ) -> QpCache {
+        let e_n = self.e[n];
+        let (sigma_n, dsdw_n) = self.sigma_c_and_d_with(e_n, n, table);
+        let mut z = 1.0 / (1.0 - dsdw_n);
+        let shift = consts + sigma_n - e_n;
+        let cap = self.config.linear_step_cap;
+        let step = z * shift;
+        if cap > 0.0 && step.abs() > cap {
+            let z_capped = if shift != 0.0 { cap / shift.abs() * z.signum() } else { 0.0 };
+            println!(
+                "warning!!! gw_grad orbital {n}: {why} linear step |Z*shift| = {:.3} Ha is \
+                 clamped to {:.3} Ha (Z {:.3} -> {:.3})",
+                step.abs(), cap, z, z_capped
+            );
+            z = z_capped;
+        }
+        let (_c, _i, y_imag, residues) = self.sigma_c_parts_with(e_n, n, true, want_y, table);
+        QpCache {
+            target: n,
+            omega: e_n + z * shift,
+            freq: e_n,
+            z_factor: z,
+            dsigma_domega: dsdw_n,
+            static_fallback: false,
+            linearized: true,
+            lin_shift: shift,
+            w_imag: table.w_imag.clone(),
+            y_imag: if want_y { y_imag } else { Vec::new() },
+            m_imag: self.compact_m_imag(&table.m, !want_y),
+            w0: table.w0.clone(),
+            y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
+            residues,
+        }
+    }
+
     fn linearized_cache(&self, n: usize, consts: f64, table: &QpRowTable, want_y: bool) -> QpCache {
         let e_n = self.e[n];
         let (sigma_n, dsdw_n) = self.sigma_c_and_d_with(e_n, n, table);
@@ -4162,6 +4242,14 @@ impl<'a> GwGradEngine<'a> {
         if deeply_occupied || self.config.force_static_fallback.contains(&n) {
             return self.static_fallback_cache(n, consts, &table, want_y);
         }
+        // Counterpart of the rule above for the **empty** states: a virtual
+        // above `linear_fallback_threshold` takes the linearized (one-step
+        // Newton) functional directly, keeping the physical spectral weight
+        // `Z`.  No root search, hence no spurious root -- and, being a smooth
+        // function of the geometry, no branch switch either.
+        if n >= self.nocc && self.e[n] > self.config.linear_fallback_threshold {
+            return self.linearized_cache_capped(n, consts, &table, want_y, "high virtual");
+        }
         // Validation pin (`gradient_force_linearized`): take the linearized
         // branch regardless of what the root search would do, so that a
         // displaced geometry cannot switch the branch under a finite
@@ -4180,9 +4268,14 @@ impl<'a> GwGradEngine<'a> {
             let (have_crossing, xg) =
                 crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
             if !have_crossing {
+                // No root in the scanned window: take the **linear** fallback
+                // (one-step Newton, physical Z) rather than the static on-shell
+                // energy, which is reserved for the deep occupied levels.
                 println!(
-                    "warning!!! gw_grad graphical solver found no crossing for orbital {n}!"
+                    "warning!!! gw_grad graphical solver found no crossing for orbital {n}; \
+                     using the linearized (one-step Newton) functional"
                 );
+                return self.linearized_cache_capped(n, consts, &table, want_y, "no crossing");
             }
             let omega = xg;
             let (_contour, _imag, y_imag, residues) =
@@ -4256,7 +4349,7 @@ impl<'a> GwGradEngine<'a> {
                          using the linearized (one-step Newton) functional \
                          (graphical_rescue = false)"
                     );
-                    return self.linearized_guarded(n, consts, &table, want_y);
+                    return self.linearized_cache_capped(n, consts, &table, want_y, "newton failed");
                 }
                 let mut fq = |om: f64| consts + self.sigma_c(om, n) - om;
                 let (have_crossing, xg) =
@@ -4275,7 +4368,7 @@ impl<'a> GwGradEngine<'a> {
                         "warning!!! gw_grad Newton (exact mode) did not converge for orbital {n}; \
                          using the linearized (one-step Newton) functional"
                     );
-                    return self.linearized_guarded(n, consts, &table, want_y);
+                    return self.linearized_cache_capped(n, consts, &table, want_y, "newton failed");
                 }
             }
             let omega = x;
@@ -4411,7 +4504,7 @@ impl<'a> GwGradEngine<'a> {
                         "warning!!! gw_grad Newton solver did not converge for orbital {n}; \
                          using the linearized (one-step Newton) functional"
                     );
-                    return self.linearized_guarded(n, consts, &table, want_y);
+                    return self.linearized_cache_capped(n, consts, &table, want_y, "newton failed");
                 }
             } else {
                 println!(
@@ -4439,7 +4532,7 @@ impl<'a> GwGradEngine<'a> {
                  is below z_min = {:.3}; using the linearized (one-step Newton) functional",
                 self.config.z_min
             );
-            return self.linearized_guarded(n, consts, &table, want_y);
+            return self.linearized_cache_capped(n, consts, &table, want_y, "z below z_min");
         }
         let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
         let m_imag = self.compact_m_imag(&m, !want_y);

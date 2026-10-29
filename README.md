@@ -529,10 +529,39 @@ use_low_rank_contour = true
 - `gw_variant`: 取值String，GW 变体类型：
     - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
     - `"ac"`：解析延拓（Analytic Continuation）路径。配合 `gw_scheme = "extrapolated"` 使用。`ac` 路径暂不支持 `fourier_self_energy` 或 `hermite_self_energy`。
+    - `"fscd"`：频率采样轮廓变形（Frequency-Sampled Contour Deformation）路径。配合 `gw_scheme = "extrapolated"` 使用，是 `"cd"` 的近似加速版本，详见下一节。
 - `ac_num_samples`: 取值usize，Padé 虚轴采样点数。从 quadrature 频点中按 PySCF 风格的指数递减步长选取。缺省为 16。
 - `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
 - `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
 - `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
+
+### FSCD-GW（频率采样轮廓变形 GW 变体）
+
+`gw_variant = "fscd"` 在 `"cd"` 的残数求和框架上做频率采样加速。CD-GW 的残数项需要在每个极点频率 `|ω−ε_p|` 上计算屏蔽相互作用 `W_np`；求根过程会对每个试探 `ω` 重新计算一遍，深能级/大体系的极点很多时这是主要开销。FSCD 先收集这些精确残数频率，把相距很近的频率合并成一个采样点，只在采样点上构造响应矩阵和介电矩阵，其余频率用插值得到。因此响应矩阵的构造次数从“每个极点 × 每次求根试探”降为“采样频率数”。
+
+- `fscd_domega`: 取值f64，单位Hartree。频率合并的绝对阈值；两个候选频率相差小于它时只保留一个。缺省 `0.05` Ha（1.361 eV，对应 TURBOMOLE 的 `thrs1`）。减小它可提高精度、增加采样点数。采样梯级最多 201 点（窗口为 `±max(gw_span_energy, 1.0)` Ha），因此 `fscd_domega` 小于约 `2*span/200`（默认约 0.01 Ha）后有效间距由该上限决定。
+- `fscd_rel_tol`: 取值f64。频率合并的相对阈值，缺省 `1e-3`（0.1%，对应 `thrs2`）。
+- `fscd_interp`: 取值String。采样点之间的插值方式，`"linear"`（缺省）或 `"cubic"`。`cubic` 对尖锐的屏蔽极点更准确，推荐在深能级/大体系中使用。
+- `fscd_fallback_residual`: 取值f64，单位Hartree。缺省 `1e-3`。FSCD 求根后，用**精确 CD** 自能在该根上算一次残差；若超过此阈值，说明近似自能把根移到了错误位置，该轨道自动回退到精确 CD 引擎。这个“一点校验”只花一次残数求和，比完整 CD 求根便宜得多，可避免在多根/极点附近选错根。
+- FSCD 使用 MO 基组的 RI 张量（`ri_ov`、`ri_row`），因此 `gw_tensor_style = "ao"` 对该变体不生效。
+- 本实现用采样点之间的线性/三次插值得到其余频率的 `W_np`（不是 `W` 的 Padé 解析延拓），并用上面的精确 CD 一点校验兜底。FSCD 需要为窗口内每个目标轨道保留一行 RI 三中心张量以及 `n_grid × n_pole` 的采样表；目标窗口很大时内存会增长。
+- FSCD 是近似方法：在屏蔽相互作用变化平缓的区域（价态、常规 HOMO/LUMO）精度很好；在自能极点附近，插值误差可能让求根跳到另一个根，此时 `fscd_fallback_residual` 校验会触发精确 CD 回退。若需要更高精度，优先减小 `fscd_domega` 并使用 `fscd_interp = "cubic"`。
+
+典型输入：
+
+```toml
+[quasiparticle_methods]
+gw_scheme = "extrapolated"
+gw_variant = "fscd"
+scgw = "g0w0"
+fscd_domega = 0.02
+fscd_interp = "cubic"
+gw_rootfinder = "newton"
+gw_extrapolate_occ_threshold = 30.0
+gw_extrapolate_vir_threshold = 30.0
+```
+
+在本仓库的 `tests/gw_bse/test_fscd.rs` 中给出了一组验证：H2O/STO-3G 全谱 QP 能量与 CD 的最大偏差约 `2.6e-7` Ha（`fscd_interp = "cubic"`；2 个轨道因一点校验触发精确 CD 回退），FSCD 采样表的响应矩阵构造次数从 792 降到 196（约 4 倍）；苯/STO-3G 的 36 个轨道中 35 个与 CD 在 5 meV 内一致，含校验/回退的总响应构造次数从 3900 降到 1017（约 3.8 倍），墙钟时间从 39.8 s 降到 13.3 s（约 3 倍）。
 
 ### GW结果导出
 

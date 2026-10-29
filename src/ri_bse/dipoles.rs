@@ -54,7 +54,9 @@ pub fn compute_dipole_matrix(scf_data:&SCF)->MatrixFull<f64>{
     let eigenvectors=scf_data.eigenvectors[0].clone();
     //eigenvectors.formated_output(1000,"full");
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
-        let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,i,a+occ_size);
+        // compact occupied `i` -> orbital `start_mo + i`; compact virtual `a`
+        // -> orbital `lumo + a` (the virtual block spans `lumo..num_state`)
+        let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,start_mo+i,lumo+a);
         dipole_matrix[[0,i+a*occ_size]]=mu_ia[0];
         dipole_matrix[[1,i+a*occ_size]]=mu_ia[1];
         dipole_matrix[[2,i+a*occ_size]]=mu_ia[2];

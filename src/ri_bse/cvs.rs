@@ -121,23 +121,35 @@ pub fn resolve_options(scf_data: &SCF) -> CvsOptions {
     }
 
     let energies = ri_gw::current_orbital_energies(scf_data);
+    let core_start = qp.cvs_core_start;
+    if core_start >= occ_size_all {
+        panic!(
+            "CVS BSE: cvs_core_start = {} is not an occupied orbital (there are {} occupied \
+             orbitals).",
+            core_start, occ_size_all
+        );
+    }
     let core: Vec<usize> = if qp.cvs_ncore > 0 {
-        if qp.cvs_ncore > occ_size_all {
+        let end = core_start + qp.cvs_ncore;
+        if end > occ_size_all {
             panic!(
-                "CVS BSE: cvs_ncore = {} exceeds the number of occupied orbitals ({}).",
-                qp.cvs_ncore, occ_size_all
+                "CVS BSE: cvs_core_start + cvs_ncore = {} exceeds the number of occupied \
+                 orbitals ({}).",
+                end, occ_size_all
             );
         }
-        (0..qp.cvs_ncore).collect()
+        (core_start..end).collect()
     } else {
-        (0..occ_size_all)
+        (core_start..occ_size_all)
             .filter(|&i| energies[i] < qp.cvs_core_energy_max)
             .collect()
     };
     if core.is_empty() {
         panic!(
-            "CVS BSE: no core orbitals were found.  Set cvs_ncore explicitly, or lower \
-             cvs_core_energy_max (currently {} Ha); the occupied energies are {:?}.",
+            "CVS BSE: no core orbitals were found in cvs_core_start..occupied (start = {}).  \
+             Set cvs_ncore explicitly, or lower cvs_core_energy_max (currently {} Ha); the \
+             occupied energies are {:?}.",
+            core_start,
             qp.cvs_core_energy_max,
             &energies[0..occ_size_all]
         );
@@ -145,13 +157,14 @@ pub fn resolve_options(scf_data: &SCF) -> CvsOptions {
     // The RI range helpers expect a contiguous core window.  Auto-detection by
     // an energy threshold is contiguous for a physically ordered spectrum; make
     // the failure explicit rather than silently dropping a core level.
-    for (expected, &actual) in core.iter().enumerate() {
+    for (offset, &actual) in core.iter().enumerate() {
+        let expected = core_start + offset;
         if expected != actual {
             panic!(
-                "CVS BSE: the selected core orbitals are not a contiguous lowest-energy \
-                 window (selected {:?}).  Set cvs_ncore = {} instead.",
-                core,
-                core.iter().filter(|&&i| i < actual).count() + 1
+                "CVS BSE: the selected core orbitals are not a contiguous window starting at \
+                 cvs_core_start = {} (selected {:?}).  Set cvs_ncore explicitly instead.",
+                core_start,
+                core
             );
         }
     }

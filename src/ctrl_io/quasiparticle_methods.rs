@@ -5,6 +5,7 @@ use serde::{Deserialize,Serialize};
 pub enum GwVariant {
     Cd,
     Ac,
+    Fscd,
 }
 
 impl Default for GwVariant {
@@ -18,6 +19,7 @@ impl GwVariant {
         match self {
             Self::Cd => "cd",
             Self::Ac => "ac",
+            Self::Fscd => "fscd",
         }
     }
 }
@@ -52,6 +54,19 @@ pub struct QuasiParticle {
     ///   `"triplet"` / `"both"` are rejected (see `bse_main_unrestricted`).
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
+    /// **Pinned** BSE active space, as absolute MO indices
+    /// `[occ_start, vir_end)`: when both are >= 0 they override the energy
+    /// window of [`Self::bse_cutoff_energy`].
+    ///
+    /// The energy window is defined by the *current* Kohn-Sham energies, so it
+    /// changes as the nuclei move: at step 16 of a DA1/def2-TZVP relaxation one
+    /// occupied and ten virtual orbitals fell out of a +-0.4 Ha window
+    /// (`dim 1269 -> 888`) and the gradient jumped from 0.030 to 1.673 Ha/Bohr.
+    /// Pinning the indices makes the active space -- and therefore the energy
+    /// and its gradient -- a smooth function of the geometry, which is what a
+    /// geometry optimisation needs.
+    pub bse_active_occ_start:i64,
+    pub bse_active_vir_end:i64,
     // ---- core-valence separated (CVS) BSE --------------------------------
     // Triggered by `gw_or_bse = "cvs bse"`.  See `ri_bse::cvs` for the method.
     /// First occupied orbital (0-based) of the CVS core window.
@@ -331,6 +346,20 @@ pub struct QuasiParticle {
     /// strictly `Newton -> linearized (one-step Newton) -> static on-shell`, so
     /// every branch is a smooth function of the geometry.
     pub gradient_graphical_rescue:bool,
+    /// Solve the QP equation in the **gradient** engine with REST's production
+    /// graphical linear-interpolation solver
+    /// ([`crate::ri_gw::linear_interpolation_solver`]) instead of the
+    /// analytic-derivative Newton iteration: one damped Newton step centres a
+    /// uniform 21-point scan of +-0.1 Ha, the root is the interpolated sign
+    /// change with the largest spectral weight.  `false` (default) keeps the
+    /// Newton cascade `Newton -> linearized -> static on-shell`, whose every
+    /// branch is a smooth function of the geometry.
+    ///
+    /// Set this to reproduce the *energy* path's root selection inside the
+    /// gradient, e.g. to test whether a spurious Newton root (an orbital whose
+    /// QP energy lands far from `eps`) survives when the root is picked by
+    /// scanning instead.
+    pub gradient_qp_graphical:bool,
     /// **Experimental.**  Evaluate the residue poles at their *exact* frequency
     /// `|e_m - omega|` instead of reading the quantised real-axis grid, and skip
     /// the grid-node sensitivity terms (one low-rank factorisation per pole and
@@ -449,6 +478,22 @@ pub struct QuasiParticle {
     /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
     /// large broadening from incorrectly halving off-contour residues.
     pub cdgw_res_tol: f64,
+    /// FSCD absolute frequency-merge threshold (Ha).  Candidate residue
+    /// frequencies closer than this are represented by a single sampled
+    /// frequency.  Default 0.05 Ha (1.361 eV), matching TURBOMOLE's `thrs1`.
+    pub fscd_domega: f64,
+    /// FSCD relative frequency-merge threshold.  Default 1e-3 (0.1%),
+    /// matching TURBOMOLE's `thrs2`.
+    pub fscd_rel_tol: f64,
+    /// How FSCD interpolates the sampled `W_np` between grid points:
+    /// `"linear"` (default) or `"cubic"`.
+    pub fscd_interp: String,
+    /// Residual (Ha) of the **exact** CD quasiparticle equation at the FSCD
+    /// root.  If it exceeds this threshold, the orbital is recomputed with the
+    /// exact CD engine.  This cheap one-point guard prevents the approximate
+    /// FSCD self-energy from selecting a spurious root near a self-energy pole.
+    /// Default 1e-3 Ha.
+    pub fscd_fallback_residual: f64,
     /// Number of imaginary-axis self-energy samples used for Padé continuation.
     pub ac_num_samples: usize,
     /// Maximum external imaginary frequency (Ha) used for Padé sampling.
@@ -554,6 +599,10 @@ pub struct QuasiParticle {
     /// Maximum number of virtual orbitals entering the RPA transition space.
     /// `0` keeps all virtual orbitals (default).
     pub feast_gw_rpa_vir_max: usize,
+    /// Hard safety limit on the number of RPA transitions for the dense
+    /// direct-RPA eigenproblem.  The default is 6000; raise it explicitly when
+    /// enough memory is available (memory ~= 16 * n_trans^2 bytes).
+    pub feast_gw_rpa_max_transitions: usize,
     /// Number of states below/above the active window kept in the Green's
     /// function sum of the self-energy.  `0` keeps all states (default).
     pub feast_gw_selfenergy_state_range: usize,
@@ -599,6 +648,11 @@ pub struct QuasiParticle {
     /// fully analytic (diagonal) G0W0 result.  Useful for validating the
     /// off-diagonal machinery.
     pub feast_gw_zero_offdiag: bool,
+    /// If non-empty, dump one row per FEAST root to this CSV path.  Each row
+    /// contains the root energy, residual, spectral weight `Z`, dominant MO,
+    /// HOMO/LUMO weights and the leading KS-orbital composition.  This is the
+    /// machine-readable counterpart of the root table printed by `feast_gw`.
+    pub feast_gw_dump_roots: String,
     /// If non-empty, dump the full `Σ_c(ω)` matrix (and the MO energies /
     /// coefficients) at `feast_gw_dump_omega` to this path, then return
     /// without running FEAST.  Intended for element-by-element comparison
@@ -690,6 +744,22 @@ pub struct QuasiParticle {
     /// (static `W`, no root search) — see
     /// `GwGradConfig::static_fallback_threshold`.  Default **1.0 Ha**.
     pub gw_switch_fallback_threshold: f64,
+    /// Energy (Ha) above which a **virtual** level takes the linearized
+    /// (one-step Newton) functional directly, without a root search -- the
+    /// counterpart of [`Self::gw_switch_fallback_threshold`] for the empty
+    /// states.  Requires `n >= nocc` and `e_n > threshold`; `f64::INFINITY`
+    /// (the default) disables the rule.
+    ///
+    /// The same functional (physical spectral weight `Z`, evaluated at the
+    /// mean-field level) is the **fallback** whenever the root search fails:
+    /// the static on-shell energy is now reserved for the deep occupied levels
+    /// and is never used as a "no solution" escape.
+    pub gradient_linear_threshold: f64,
+    /// Clamp (Ha) on the linearized step `|Z * shift|`; `Z` of a high-lying
+    /// virtual can be negative and large.  The clamped `Z` is stored in the QP
+    /// cache so the analytic gradient differentiates the same functional.
+    /// `0` disables the clamp.
+    pub gradient_linear_step_cap: f64,
 }
 
 impl Default for QuasiParticle {
@@ -711,6 +781,8 @@ impl Default for QuasiParticle {
             print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
+            bse_active_occ_start:-1,
+            bse_active_vir_end:-1,
             cvs_core_start:0,
             cvs_ncore:0,
             cvs_core_energy_max:-10.0,
@@ -766,6 +838,7 @@ impl Default for QuasiParticle {
             gradient_force_fallback:String::new(),
             gradient_force_linearized:String::new(),
             gradient_graphical_rescue:false,
+            gradient_qp_graphical:false,
             gradient_exact_residue:false,
             gradient_smooth_pole:false,
             gradient_z_min:0.3,
@@ -814,6 +887,10 @@ impl Default for QuasiParticle {
             qsgw_eta: 0.001,
             cdgw_eta: 0.001,
             cdgw_res_tol: 0.001,
+            fscd_domega: 0.05,
+            fscd_rel_tol: 1.0e-3,
+            fscd_interp: String::from("linear"),
+            fscd_fallback_residual: 1.0e-3,
             ac_num_samples: 16,
             ac_omega_max: 5.0,
             ac_eta: 0.001,
@@ -861,6 +938,7 @@ impl Default for QuasiParticle {
             feast_gw_rpa_energy_max: 1.0e6,
             feast_gw_rpa_occ_max: 0,
             feast_gw_rpa_vir_max: 0,
+            feast_gw_rpa_max_transitions: 6000,
             feast_gw_selfenergy_state_range: 0,
             feast_gw_eta: 0.0,
             feast_gw_shift_solver: String::from("auto"),
@@ -870,6 +948,7 @@ impl Default for QuasiParticle {
             feast_gw_shift_correlation: String::from("auto"),
             feast_gw_validate_diagonal: false,
             feast_gw_zero_offdiag: false,
+            feast_gw_dump_roots: String::new(),
             feast_gw_dump_sigma: String::new(),
             feast_gw_dump_omega: 0.0,
             dynamic_bse_kernel: String::from("bse"),
@@ -882,6 +961,8 @@ impl Default for QuasiParticle {
             bse_ao_screening_tol: 0.0,
             bse_pair_screening_tol: 0.0,
             gw_switch_fallback_threshold: 1.0,
+            gradient_linear_threshold: f64::INFINITY,
+            gradient_linear_step_cap: 0.5,
         }
     }
 }
@@ -909,6 +990,8 @@ impl QuasiParticle {
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
         table.insert("bse_cutoff_energy".to_string(), toml::Value::Float(self.bse_cutoff_energy));
+        table.insert("bse_active_occ_start".to_string(), toml::Value::Integer(self.bse_active_occ_start));
+        table.insert("bse_active_vir_end".to_string(), toml::Value::Integer(self.bse_active_vir_end));
         table.insert("cvs_core_start".to_string(), toml::Value::Integer(self.cvs_core_start as i64));
         table.insert("cvs_ncore".to_string(), toml::Value::Integer(self.cvs_ncore as i64));
         table.insert("cvs_core_energy_max".to_string(), toml::Value::Float(self.cvs_core_energy_max));
@@ -965,6 +1048,7 @@ impl QuasiParticle {
         table.insert("gradient_force_fallback".to_string(), toml::Value::String(self.gradient_force_fallback.clone()));
         table.insert("gradient_force_linearized".to_string(), toml::Value::String(self.gradient_force_linearized.clone()));
         table.insert("gradient_graphical_rescue".to_string(), toml::Value::Boolean(self.gradient_graphical_rescue));
+        table.insert("gradient_qp_graphical".to_string(), toml::Value::Boolean(self.gradient_qp_graphical));
         table.insert("gradient_exact_residue".to_string(), toml::Value::Boolean(self.gradient_exact_residue));
         table.insert("gradient_smooth_pole".to_string(), toml::Value::Boolean(self.gradient_smooth_pole));
         table.insert("gradient_z_min".to_string(), toml::Value::Float(self.gradient_z_min));
@@ -1014,6 +1098,10 @@ impl QuasiParticle {
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
         table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("fscd_domega".to_string(), toml::Value::Float(self.fscd_domega));
+        table.insert("fscd_rel_tol".to_string(), toml::Value::Float(self.fscd_rel_tol));
+        table.insert("fscd_interp".to_string(), toml::Value::String(self.fscd_interp.clone()));
+        table.insert("fscd_fallback_residual".to_string(), toml::Value::Float(self.fscd_fallback_residual));
         table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
         table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
         table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
@@ -1059,6 +1147,7 @@ impl QuasiParticle {
         table.insert("feast_gw_rpa_energy_max".to_string(), toml::Value::Float(self.feast_gw_rpa_energy_max));
         table.insert("feast_gw_rpa_occ_max".to_string(), toml::Value::Integer(self.feast_gw_rpa_occ_max as i64));
         table.insert("feast_gw_rpa_vir_max".to_string(), toml::Value::Integer(self.feast_gw_rpa_vir_max as i64));
+        table.insert("feast_gw_rpa_max_transitions".to_string(), toml::Value::Integer(self.feast_gw_rpa_max_transitions as i64));
         table.insert("feast_gw_selfenergy_state_range".to_string(), toml::Value::Integer(self.feast_gw_selfenergy_state_range as i64));
         table.insert("feast_gw_eta".to_string(), toml::Value::Float(self.feast_gw_eta));
         table.insert("feast_gw_shift_solver".to_string(), toml::Value::String(self.feast_gw_shift_solver.clone()));
@@ -1068,6 +1157,7 @@ impl QuasiParticle {
         table.insert("feast_gw_shift_correlation".to_string(), toml::Value::String(self.feast_gw_shift_correlation.clone()));
         table.insert("feast_gw_validate_diagonal".to_string(), toml::Value::Boolean(self.feast_gw_validate_diagonal));
         table.insert("feast_gw_zero_offdiag".to_string(), toml::Value::Boolean(self.feast_gw_zero_offdiag));
+        table.insert("feast_gw_dump_roots".to_string(), toml::Value::String(self.feast_gw_dump_roots.clone()));
         table.insert("feast_gw_dump_sigma".to_string(), toml::Value::String(self.feast_gw_dump_sigma.clone()));
         table.insert("feast_gw_dump_omega".to_string(), toml::Value::Float(self.feast_gw_dump_omega));
         table.insert("dynamic_bse_kernel".to_string(), toml::Value::String(self.dynamic_bse_kernel.clone()));
@@ -1079,6 +1169,8 @@ impl QuasiParticle {
         table.insert("bse_ao_screening_tol".to_string(), toml::Value::Float(self.bse_ao_screening_tol));
         table.insert("bse_pair_screening_tol".to_string(), toml::Value::Float(self.bse_pair_screening_tol));
         table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
+        table.insert("gradient_linear_threshold".to_string(), toml::Value::Float(self.gradient_linear_threshold));
+        table.insert("gradient_linear_step_cap".to_string(), toml::Value::Float(self.gradient_linear_step_cap));
         toml::Value::Table(table)
     }
 }
@@ -1176,9 +1268,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                     match value.trim().to_ascii_lowercase().as_str() {
                         "cd" => GwVariant::Cd,
                         "ac" => GwVariant::Ac,
+                        "fscd" | "fs-cd" | "fs_cd" => GwVariant::Fscd,
                         other => {
                             anyhow::bail!(
-                                "Invalid gw_variant '{}'. Supported values are 'cd' and 'ac'.",
+                                "Invalid gw_variant '{}'. Supported values are 'cd', 'ac' and 'fscd'.",
                                 other
                             );
                         }
@@ -1187,7 +1280,7 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Null => GwVariant::Cd,
                 other => {
                     anyhow::bail!(
-                        "Invalid type for gw_variant: {:?}. Expected the string 'cd' or 'ac'.",
+                        "Invalid type for gw_variant: {:?}. Expected the string 'cd', 'ac' or 'fscd'.",
                         other
                     );
                 }
@@ -1238,6 +1331,16 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("none"),
+            };
+            tmp_input.bse_active_occ_start = match tmp_ctrl.get("bse_active_occ_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(-1),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(-1),
+                _ => -1,
+            };
+            tmp_input.bse_active_vir_end = match tmp_ctrl.get("bse_active_vir_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(-1),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(-1),
+                _ => -1,
             };
             tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1000000.0_f64)},
@@ -1593,6 +1696,21 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
                 _ => false,
             };
+            tmp_input.gradient_qp_graphical = match tmp_ctrl.get("gradient_qp_graphical").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+            tmp_input.gradient_linear_threshold = match tmp_ctrl.get("gradient_linear_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(f64::INFINITY),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(f64::INFINITY),
+                _ => f64::INFINITY,
+            };
+            tmp_input.gradient_linear_step_cap = match tmp_ctrl.get("gradient_linear_step_cap").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.5),
+                _ => 0.5,
+            };
             tmp_input.gradient_exact_residue = match tmp_ctrl.get("gradient_exact_residue").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
@@ -1730,6 +1848,22 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.cdgw_res_tol = match tmp_ctrl.get("cdgw_res_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
+            };
+            tmp_input.fscd_domega = match tmp_ctrl.get("fscd_domega").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.05),
+                _ => 0.05,
+            };
+            tmp_input.fscd_rel_tol = match tmp_ctrl.get("fscd_rel_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-3),
+                _ => 1.0e-3,
+            };
+            tmp_input.fscd_interp = match tmp_ctrl.get("fscd_interp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("linear"),
+            };
+            tmp_input.fscd_fallback_residual = match tmp_ctrl.get("fscd_fallback_residual").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-3),
+                _ => 1.0e-3,
             };
             tmp_input.ac_num_samples = match tmp_ctrl.get("ac_num_samples").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(16) as usize,
@@ -1944,6 +2078,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
                 _ => 0,
             };
+            tmp_input.feast_gw_rpa_max_transitions = match tmp_ctrl.get("feast_gw_rpa_max_transitions").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(6000) as usize,
+                _ => 6000,
+            };
             tmp_input.feast_gw_selfenergy_state_range = match tmp_ctrl.get("feast_gw_selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
                 _ => 0,
@@ -1979,6 +2117,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.feast_gw_zero_offdiag = match tmp_ctrl.get("feast_gw_zero_offdiag").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => false,
+            };
+            tmp_input.feast_gw_dump_roots = match tmp_ctrl.get("feast_gw_dump_roots").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
             };
             tmp_input.feast_gw_dump_sigma = match tmp_ctrl.get("feast_gw_dump_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
@@ -2054,6 +2196,20 @@ mod tests {
 
         let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
         assert_eq!(qp.gw_variant, GwVariant::Cd);
+    }
+
+    #[test]
+    fn gw_variant_accepts_fscd_case_insensitively() {
+        for value in ["fscd", "FSCD", "FsCd", "fs-cd", "fs_cd"] {
+            let input = json!({
+                "quasiparticle_methods": {
+                    "gw_variant": value
+                }
+            });
+
+            let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+            assert_eq!(qp.gw_variant, GwVariant::Fscd);
+        }
     }
 
     #[test]
