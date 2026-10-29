@@ -228,7 +228,23 @@ impl PcmStatic{
                     println!("PCM static: j2c factor via Newton-Schulz ({} x {})", m.size[0], m.size[1]);
                     Some(m)
                 }
-                None => crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp).into(),
+                None => match mol.ctrl.j2c_decomp.policy {
+                    // spectral `J^{-1/2}` (with eigenvalue truncation) is only exposed for
+                    // the eig policy; the Cd branch of `prepare_j2c_solve_factor` returns a
+                    // Cholesky SOLVE factor that is NOT `M`, and using it as `M` silently
+                    // produces garbage (measured: system1 SCF energy -3.2e9 Ha). Newton
+                    // fails to converge on ill-conditioned metrics (tiny eigenvalues make
+                    // `J^{-1/2}` unbounded; only the spectral route truncates them), so a
+                    // Cd-policy run then simply disables the reuse prototype.
+                    crate::ri_jk::J2CDecompPolicy::Eig => {
+                        println!("PCM static: Newton-Schulz did not converge; falling back to the spectral j2c factor");
+                        Some(crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp))
+                    }
+                    _ => {
+                        println!("PCM static: Newton-Schulz did not converge and the Cd policy has no spectral fallback; RI reuse disabled");
+                        None
+                    }
+                },
             }
         } else {
             None
