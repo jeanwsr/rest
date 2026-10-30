@@ -23,6 +23,10 @@ struct Cache {
     /// is refreshed by the J path before K runs, so the K increment must compare
     /// against its own base, not `dm`.
     dm_k: Option<Vec<MatrixFull<f64>>>,
+    /// one-shot request for a full rebuild, set when the SCF criteria passed while
+    /// the cached Fock was not fresh (increment or reuse). The energy reported at a
+    /// "converged" point must come from a Fock built at exactly that density.
+    force_full: bool,
 }
 
 /// reuse threshold as a multiple of `scf_acc_rho`: the Fock may lag the density by a
@@ -64,6 +68,7 @@ pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<Matri
         let near_conv = dm_delta(scf, c).map_or(true, |d| d < scf.mol.ctrl.scf_acc_rho);
         let hit = !c.vj.is_empty()
             && !near_conv
+            && !c.force_full
             && c.stale < MAX_STALE
             && dm_delta(scf, c).map_or(false, |d| d < tol);
         if hit {
@@ -85,11 +90,13 @@ pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<Matri
         Some(c) => {
             // this build used the current density, so the cache's reference density must be it
             c.reuse_now = false;
+            if c.force_full { println!("[incremental] fresh-Fock validation rebuild (J)"); }
+            c.force_full = false;
             c.stale = 0;
             c.dm = scf.density_matrix.clone();
             c.vj = vj.clone();
         }
-        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: vj.clone(), vk: Vec::new(), stale: 0, reuse_now: false, inc_streak: 0, dm_k: None }),
+        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: vj.clone(), vk: Vec::new(), stale: 0, reuse_now: false, inc_streak: 0, dm_k: None, force_full: false }),
     }
     vj
 }
@@ -99,7 +106,7 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
     // follow the decision the J call of this iteration already took, so J and K never mix
     // a stale and a fresh half within one Fock build
     if let Some(c) = g.as_ref() {
-        if c.reuse_now && !c.vk.is_empty() {
+        if c.reuse_now && !c.vk.is_empty() && !c.force_full {
             println!("[incremental] K reused");
             return c.vk.clone();
         }
@@ -111,7 +118,8 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
     // screening criterion is ABSOLUTE against the full-density scale (eps × scale(D))
     // rather than relative to Δ itself — a uniformly small Δ then retains fewer and fewer
     // rows as the SCF converges, which is the whole point of the update.
-    if let Some(vk_inc) = k_spectral_increment(scf, g.as_ref()) {
+    let forced = g.as_ref().map_or(false, |c| c.force_full);
+    if let Some(vk_inc) = if forced { None } else { k_spectral_increment(scf, g.as_ref()) } {
         let mut g = g;
         let c = g.as_mut().unwrap();
         c.inc_streak += 1;
@@ -122,8 +130,8 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
     }
     let vk = scf.generate_vk_with_ri_v(scaling_factor, scf.mol.ctrl.use_dm_only, mpi_operator);
     match g.as_mut() {
-        Some(c) => { c.reuse_now = false; c.dm = scf.density_matrix.clone(); c.dm_k = Some(scf.density_matrix.clone()); c.vk = vk.clone(); if c.inc_streak > 0 { println!("[incremental] full K rebuild after {} increments", c.inc_streak); } c.inc_streak = 0; }
-        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: Vec::new(), vk: vk.clone(), stale: 0, reuse_now: false, inc_streak: 0, dm_k: Some(scf.density_matrix.clone()) }),
+        Some(c) => { c.reuse_now = false; c.dm = scf.density_matrix.clone(); c.dm_k = Some(scf.density_matrix.clone()); c.vk = vk.clone(); if c.inc_streak > 0 { println!("[incremental] full K rebuild after {} increments", c.inc_streak); } c.inc_streak = 0; if c.force_full { println!("[incremental] fresh-Fock validation rebuild (K)"); c.force_full = false; } }
+        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: Vec::new(), vk: vk.clone(), stale: 0, reuse_now: false, inc_streak: 0, dm_k: Some(scf.density_matrix.clone()), force_full: false }),
     }
     vk
 }
@@ -206,4 +214,20 @@ fn reduced_occ_weights(scf: &SCF, i_spin: usize) -> Option<Vec<f64>> {
         }
     }
     Some(crate::ri_jk::orbital_weights(&tmp))
+}
+
+
+/// Whether the cached Fock state is not fresh (an increment or a reuse was the last
+/// update). Callers should demand a fresh full rebuild before accepting convergence.
+pub fn fock_is_stale() -> bool {
+    cache().lock().unwrap().as_ref().map_or(false, |c| c.inc_streak > 0 || c.reuse_now)
+}
+
+/// Request a full J and K rebuild on the next evaluation (the "fresh-Fock validation
+/// pass"): the SCF loop calls this when the convergence criteria pass but the cached
+/// Fock lags the density, and simply runs one more iteration.
+pub fn request_full_rebuild() {
+    if let Some(c) = cache().lock().unwrap().as_mut() {
+        c.force_full = true;
+    }
 }

@@ -6353,6 +6353,22 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         };
         let dt1_3 = time::Local::now();
         scf_converge = scf_data.check_scf_convergence(&scf_records);
+        // ---- fresh-Fock validation gate ------------------------------------------------
+        // With the incremental Fock active, the criteria can pass while the cached J/K
+        // still lags the density by the last increment; the energy printed at that
+        // point would be systematically off (measured on a tight-criterion w30 run:
+        // 3.3e-3 Ha above the fully converged value, independent of the screening
+        // tightness). When the criteria pass on a stale cache, force one more
+        // iteration with a full rebuild — the accepted energy then comes from a Fock
+        // built at exactly the converged density.
+        if scf_data.mol.ctrl.incremental_fock
+            && (scf_converge[0] || scf_converge[1])
+            && incremental::fock_is_stale()
+        {
+            incremental::request_full_rebuild();
+            scf_converge = [false, false];
+            println!("[incremental] convergence criteria met on a lagged Fock: one fresh validation iteration follows");
+        }
         let dt1_4 = time::Local::now();
         
         // -------------------------
