@@ -47,6 +47,54 @@ use crate::dft::libxc_helper::{xc_code_fdqc, xc_func_init, lda_exc_vxc, gga_exc_
 /// `REST_XC_TIME=1`. All counters are nanoseconds accumulated across the rayon
 /// chunks, so the per-iteration wall share is the sum divided by the number of
 /// chunks that run in parallel.
+/// Process-level cache of the per-batch maximum density from the previous XC pass.
+/// Batches whose cached max density is below `REST_XC_BATCH_SKIP` × (global max) are
+/// skipped entirely in the next pass — density contraction, gradient contraction and
+/// Vxc formation — because their contribution to both the XC energy and the Vxc
+/// matrix is bounded by that maximum. The cache is keyed by the batch count only:
+/// a geometry change re-partitions the grid, the count changes, and the cache
+/// resets itself (the first pass after a reset computes everything).
+pub mod batch_rho_cache {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<Vec<f64>>>> = OnceLock::new();
+
+    fn enabled_threshold() -> Option<f64> {
+        std::env::var("REST_XC_BATCH_SKIP").ok().and_then(|v| v.parse().ok())
+    }
+
+    /// reset when the batch structure changed; cheap no-op otherwise
+    pub fn begin_pass(nbatches: usize) {
+        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let mut g = c.lock().unwrap();
+        if g.as_ref().map_or(true, |v| v.len() != nbatches) {
+            *g = Some(vec![f64::INFINITY; nbatches]); // INF = "unknown, do not skip"
+        }
+    }
+
+    /// true when this batch may be skipped in the current pass
+    pub fn should_skip(ibatch: usize) -> bool {
+        let Some(thr) = enabled_threshold() else { return false; };
+        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let g = c.lock().unwrap();
+        let Some(v) = g.as_ref() else { return false; };
+        let Some(&mine) = v.get(ibatch) else { return false; };
+        if !mine.is_finite() { return false; }
+        let global = v.iter().filter(|x| x.is_finite()).fold(0.0_f64, |m, x| m.max(*x));
+        global > 0.0 && mine < thr * global
+    }
+
+    /// record this batch's max density (per point, max over spins)
+    pub fn update(ibatch: usize, batch_max: f64) {
+        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let mut g = c.lock().unwrap();
+        if let Some(v) = g.as_mut() {
+            if ibatch < v.len() {
+                v[ibatch] = batch_max;
+            }
+        }
+    }
+}
+
 pub mod xc_timing {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
@@ -4779,6 +4827,10 @@ impl Grids {
         let mut ref_vxc_ao: Vec<MatrixFull<f64>> = Vec::new();
 
         for ibatch in ibatch_start..ibatch_end {
+            // batches screened out of the density pass contribute nothing here either
+            if batch_rho_cache::should_skip(ibatch) {
+                continue;
+            }
             let batch_ao = &ao_c.batches[ibatch];
             let indices = &ao_c.batch_ao_map[ibatch];
             let n_active = indices.len();
@@ -7184,6 +7236,7 @@ impl Grids {
 
         let ibatch_start = range_grids.start / ao_c.blksize;
         let ibatch_end = ((range_grids.end + ao_c.blksize - 1) / ao_c.blksize).min(ao_c.batches.len());
+        batch_rho_cache::begin_pass(ao_c.batches.len());
 
         // The occupation weights and the scaled MO coefficients do not depend on the
         // grid batch, so build them once per spin instead of in every batch.
@@ -7219,6 +7272,15 @@ impl Grids {
         } else { RIFull::empty() };
 
         for ibatch in ibatch_start..ibatch_end {
+            // ---- batch-level density screening --------------------------------------
+            // Batches whose previous-pass max density is negligible contribute nothing
+            // measurable to rho, sigma, the XC energy or the Vxc matrix; skip their
+            // entire contraction work here (the Vxc formation consults the same cache).
+            // The first pass after a (re)build of the grid computes everything.
+            if batch_rho_cache::should_skip(ibatch) {
+                continue;
+            }
+            let mut batch_rho_max = 0.0_f64;
             let batch_ao = &ao_c.batches[ibatch];
             let indices = &ao_c.batch_ao_map[ibatch];
             let n_active = indices.len();
@@ -7254,6 +7316,7 @@ impl Grids {
                 for g in 0..n_batch {
                     let rho_val: f64 = (0..nocc).map(|i| tmo[[i, g]] * tmo[[i, g]]).sum();
                     cur_rho[[g_out_start + g, i_spin]] = rho_val;
+                    if rho_val > batch_rho_max { batch_rho_max = rho_val; }
                 }
 
                 // ---- ∇ρ from the same wmo/tmo ----
@@ -7281,8 +7344,8 @@ impl Grids {
                     }
                 }
             }
+            batch_rho_cache::update(ibatch, batch_rho_max);
         }
-
         (cur_rho, cur_rhop)
     }
 
