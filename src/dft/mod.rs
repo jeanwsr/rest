@@ -55,8 +55,17 @@ use crate::dft::libxc_helper::{xc_code_fdqc, xc_func_init, lda_exc_vxc, gga_exc_
 /// a geometry change re-partitions the grid, the count changes, and the cache
 /// resets itself (the first pass after a reset computes everything).
 pub mod batch_rho_cache {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<Vec<f64>>>> = OnceLock::new();
+
+    struct State {
+        per_batch: Vec<f64>,
+        /// running maximum over the finite entries (INF right after a reset)
+        global_max: f64,
+    }
+    static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
+    static SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
     fn enabled_threshold() -> Option<f64> {
         std::env::var("REST_XC_BATCH_SKIP").ok().and_then(|v| v.parse().ok())
@@ -64,34 +73,47 @@ pub mod batch_rho_cache {
 
     /// reset when the batch structure changed; cheap no-op otherwise
     pub fn begin_pass(nbatches: usize) {
-        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let c = STATE.get_or_init(|| Mutex::new(None));
         let mut g = c.lock().unwrap();
-        if g.as_ref().map_or(true, |v| v.len() != nbatches) {
-            *g = Some(vec![f64::INFINITY; nbatches]); // INF = "unknown, do not skip"
+        if g.as_ref().map_or(true, |s| s.per_batch.len() != nbatches) {
+            *g = Some(State { per_batch: vec![f64::INFINITY; nbatches], global_max: 0.0 });
         }
     }
 
-    /// true when this batch may be skipped in the current pass
+    /// O(1) under the lock: the global maximum is maintained incrementally by
+    /// `update`, never re-scanned here. (The first version re-scanned the whole
+    /// cache on every call — with ~12k batches times every slot, spin and pass the
+    /// lock traffic alone consumed the very time the skipping was supposed to save,
+    /// which is how a working skip initially measured as "no gain".)
     pub fn should_skip(ibatch: usize) -> bool {
+        TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
         let Some(thr) = enabled_threshold() else { return false; };
-        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let c = STATE.get_or_init(|| Mutex::new(None));
         let g = c.lock().unwrap();
-        let Some(v) = g.as_ref() else { return false; };
-        let Some(&mine) = v.get(ibatch) else { return false; };
-        if !mine.is_finite() { return false; }
-        let global = v.iter().filter(|x| x.is_finite()).fold(0.0_f64, |m, x| m.max(*x));
-        global > 0.0 && mine < thr * global
+        let Some(s) = g.as_ref() else { return false; };
+        let Some(&mine) = s.per_batch.get(ibatch) else { return false; };
+        let skip = mine.is_finite() && s.global_max > 0.0 && mine < thr * s.global_max;
+        if skip { SKIP_COUNT.fetch_add(1, Ordering::Relaxed); }
+        skip
     }
 
-    /// record this batch's max density (per point, max over spins)
+    /// record this batch's max density; maintains the running global maximum
     pub fn update(ibatch: usize, batch_max: f64) {
-        let c = CACHE.get_or_init(|| Mutex::new(None));
+        let c = STATE.get_or_init(|| Mutex::new(None));
         let mut g = c.lock().unwrap();
-        if let Some(v) = g.as_mut() {
-            if ibatch < v.len() {
-                v[ibatch] = batch_max;
+        if let Some(s) = g.as_mut() {
+            if ibatch < s.per_batch.len() {
+                s.per_batch[ibatch] = batch_max;
+                if batch_max > s.global_max { s.global_max = batch_max; }
             }
         }
+    }
+
+    /// cumulative skip statistics since the last call (for the XC timing report)
+    pub fn take_stats() -> Option<(u64, u64)> {
+        let s = SKIP_COUNT.swap(0, Ordering::Relaxed);
+        let t = TOTAL_COUNT.swap(0, Ordering::Relaxed);
+        if t > 0 { Some((s, t)) } else { None }
     }
 }
 
