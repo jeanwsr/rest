@@ -110,8 +110,3 @@ name = "pyrest"
 path = "src/lib.rs"
 crate-type=["cdylib","lib"]
 
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
