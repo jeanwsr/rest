@@ -1031,6 +1031,12 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
     let naux = screen.naux;
     let nov = nocc * nvir;
     let dim = nocc * nvir;
+    // TDA roots carry `y = 0` identically.  Every `y` leg of the RPA pullback
+    // below is then exactly zero, so skip it instead of multiplying zeros: the
+    // A-block loop runs once instead of twice and the whole direct-B block
+    // (whose `fov` is a *cross* term `X^T u Y`) disappears.  Non-TDA roots are
+    // untouched (`has_y` is true for them).
+    let has_y = y.iter().any(|&v| v != 0.0);
 
     // ---- bare exchange (rank-one in X+Y) ----
     let mut z = vec![0.0f64; dim];
@@ -1063,7 +1069,9 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
     let u_ij_view = to_mat(&screen.u_ij, naux, nocc * nocc);
     let u_ia_view = to_mat(&screen.u_ia, naux, nov);
     let mut polar_a = vec![0.0f64; naux * naux];
-    for amplitude in [&x_m, &y_m] {
+    let amplitudes: [&MatrixFull<f64>; 2] = [&x_m, &y_m];
+    for amplitude in amplitudes.iter().take(if has_y { 2 } else { 1 }) {
+        let amplitude = *amplitude;
         // foo[p, i, j] = sum_ab amplitude[i,a] u_ab[p,a,b] amplitude[j,b]
         let mut t1 = MatrixFull::new([naux * nvir, nocc], 0.0);
         _dgemm_full(&u_ab_view, 'N', amplitude, 'T', &mut t1, 1.0, 0.0);
@@ -1136,6 +1144,10 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
     }
 
     // ---- direct B: fov[p,i,a] = sum_jk (X[i,k] u_ia[p,k,j] Y[j,a] + Y X) ----
+    // A pure cross term in (x, y): identically zero for a TDA root (`y = 0`).
+    // Skipping it there needs the block restructured (it *is* the cross term and
+    // its screening chain); the current TDA saving is the `y` pass of the
+    // A-block above.
     {
         let u2_view = to_mat(&screen.u_ia, naux * nocc, nvir);
         let mut s1 = MatrixFull::new([nocc, naux * nocc], 0.0);
