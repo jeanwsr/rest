@@ -119,7 +119,7 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
     // rather than relative to Δ itself — a uniformly small Δ then retains fewer and fewer
     // rows as the SCF converges, which is the whole point of the update.
     let forced = g.as_ref().map_or(false, |c| c.force_full);
-    if let Some(vk_inc) = if forced { None } else { k_spectral_increment(scf, g.as_ref()) } {
+    if let Some(vk_inc) = if forced { None } else { k_spectral_increment(scf, g.as_ref(), scaling_factor) } {
         let mut g = g;
         let c = g.as_mut().unwrap();
         c.inc_streak += 1;
@@ -138,7 +138,7 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
 
 /// Try the spectral K increment. `None` = "not applicable / disabled", the caller falls
 /// back to a full K build.
-fn k_spectral_increment(scf: &SCF, cache: Option<&Cache>) -> Option<Vec<MatrixUpper<f64>>> {
+fn k_spectral_increment(scf: &SCF, cache: Option<&Cache>, scaling_factor: f64) -> Option<Vec<MatrixUpper<f64>>> {
     if std::env::var("REST_K_INC").as_deref() != Ok("1") { return None; }
     let c = cache?;
     if c.vk.is_empty() || c.vk.iter().any(|v| v.data.is_empty()) { return None; }
@@ -182,15 +182,21 @@ fn k_spectral_increment(scf: &SCF, cache: Option<&Cache>) -> Option<Vec<MatrixUp
         let w_full = reduced_occ_weights(scf, i_spin)?;
         let scale_d = crate::ri_jk::orbital_scale(map, &w_full);
         let mut kspin = c.vk[i_spin].clone();
+        // the cached vk already carries the caller's scaling_factor (e.g. -1.0 for
+        // UKS exchange); the raw kernel output does NOT. Multiply the increments by
+        // the same factor before accumulating, otherwise the sign flips for UKS
+        // (which silently steers the SCF to a wrong solution).
         if npos > 0 {
             let wpos = crate::ri_jk::orbital_weights(&cpos);
             let kp = crate::ri_jk::get_vk_pair_screened(ri3fn, map, &cpos, &wpos, eps, scale_d);
-            kspin.data.par_iter_mut().zip(kp.data.par_iter()).for_each(|(a, b)| *a += *b);
+            kspin.data.par_iter_mut().zip(kp.data.par_iter())
+                .for_each(|(a, b)| *a += b * scaling_factor);
         }
         if nneg > 0 {
             let wneg = crate::ri_jk::orbital_weights(&cneg);
             let kn = crate::ri_jk::get_vk_pair_screened(ri3fn, map, &cneg, &wneg, eps, scale_d);
-            kspin.data.par_iter_mut().zip(kn.data.par_iter()).for_each(|(a, b)| *a -= *b);
+            kspin.data.par_iter_mut().zip(kn.data.par_iter())
+                .for_each(|(a, b)| *a -= b * scaling_factor);
         }
         out[i_spin] = kspin;
     }
