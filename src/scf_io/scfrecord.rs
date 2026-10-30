@@ -195,7 +195,14 @@ impl ScfTraceRecord {
         // oscillation, e.g. the 0.5-Ha jumps observed on system1 iterations 24-28);
         // damping switches itself off below the threshold.
         let mut damping_applied = false;
+        // NOTE: scoped to the pre-DIIS phase only. Applying density damping on top of
+        // an active DIIS extrapolation stacked three mixing mechanisms (damped density,
+        // Pulay extrapolation, oscillation-triggered Fock mixing) and destabilized
+        // open-shell metallic trajectories catastrophically (system1: energies
+        // oscillating by thousands of Ha vs a converging undamped baseline). Before
+        // DIIS engages, damping replaces the fixed linear mix parameter.
         if scf.mol.ctrl.dynamic_damping
+            && self.num_iter < start_pulay
             && (self.mixer.eq(&"linear") || self.mixer.eq(&"diis"))
         {
             let thr = scf.mol.ctrl.damping_error_threshold;

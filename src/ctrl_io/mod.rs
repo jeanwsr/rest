@@ -620,7 +620,7 @@ impl InputKeywords {
             diis_orthogonalize_error: true,
             start_diis_cycle: 1,
             start_check_oscillation: 20,
-            dynamic_damping: true,
+            dynamic_damping: false,
             damping_error_threshold: 1.0e-3,
             level_shift : None, 
             max_scf_cycle: 100,
@@ -1708,7 +1708,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.dynamic_damping = match tmp_ctrl.get("dynamic_damping").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
                 serde_json::Value::String(tmp_str) => {matches!(tmp_str.to_lowercase().as_str(), "true" | "yes" | "on" | "1")},
-                other => {true}
+                other => {false}
             };
             tmp_input.damping_error_threshold = match tmp_ctrl.get("damping_error_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
