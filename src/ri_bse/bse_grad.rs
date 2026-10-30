@@ -489,6 +489,72 @@ fn metric_norm(x: &[f64], y: &[f64], dim: usize) -> f64 {
 /// Solve the full (non-TDA) BSE eigenproblem densely through the
 /// nonsymmetric squared product `(A-B)(A+B) u = omega^2 u`.
 /// Returns the `nroots` lowest metric-normalised roots.
+/// Solve the **TDA** (Hermitian) BSE problem densely.
+///
+/// With `A` symmetric the excitation energies are simply the eigenvalues of `A`
+/// and the amplitudes are orthonormal, so this route needs no `A-B` Cholesky, no
+/// `omega = sqrt(lambda)` and no metric normalisation `sqrt(U^T V)`.  That is
+/// exactly what keeps it well defined where the full (non-TDA) problem has an
+/// indefinite `A-B` -- the case that stalls the DA1/PBE0 relaxation and that the
+/// Davidson solver answers with a per-iteration TDA fallback whose derivative
+/// the non-TDA pullback cannot represent.  The returned `y` is identically zero,
+/// which is what the downstream pullback expects for a TDA root.
+pub fn solve_bse_tda_dense(
+    a_mat: &[f64],
+    dim: usize,
+    nroots: usize,
+) -> Vec<(f64, Vec<f64>, Vec<f64>)> {
+    // `A` is symmetric by construction; symmetrise defensively against the
+    // round-off asymmetry of the `v_bare` and kernel GEMMs.
+    let mut m = to_mat(a_mat, dim, dim);
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let v = 0.5 * (m.data[i + j * dim] + m.data[j + i * dim]);
+            m.data[i + j * dim] = v;
+            m.data[j + i * dim] = v;
+        }
+    }
+    let (vecs, vals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyevd(&m, 'V');
+    // A positive `info` is a known false positive of this build's LAPACK bindings
+    // (`_dsyevd_inplace` documents it: `info = n` even for trivial inputs, with
+    // correct results), so validate the eigenvalues instead of trusting it.
+    let vecs = vecs.expect("bse_grad: dsyevd returned no eigenvectors");
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "bse_grad: the TDA problem produced non-finite eigenvalues"
+    );
+    assert!(
+        vals.windows(2).all(|w| w[0] <= w[1] + 1.0e-10),
+        "bse_grad: dsyevd returned unsorted TDA eigenvalues"
+    );
+    let mut cands: Vec<usize> = (0..dim).filter(|&k| vals[k] > 1.0e-10).collect();
+    cands.sort_by(|&a, &b| vals[a].partial_cmp(&vals[b]).unwrap_or(std::cmp::Ordering::Equal));
+    assert!(
+        cands.len() >= nroots,
+        "bse_grad: the TDA problem has only {} positive roots (need {nroots})",
+        cands.len()
+    );
+    cands
+        .into_iter()
+        .take(nroots)
+        .map(|k| {
+            let omega = vals[k];
+            let mut u = vec![0.0f64; dim];
+            let mut nrm = 0.0f64;
+            for r in 0..dim {
+                let v = vecs.data[r + k * dim];
+                u[r] = v;
+                nrm += v * v;
+            }
+            let inv = 1.0 / nrm.sqrt().max(1.0e-300);
+            for v in u.iter_mut() {
+                *v *= inv;
+            }
+            (omega, u, vec![0.0f64; dim])
+        })
+        .collect()
+}
+
 pub fn solve_bse_dense(
     a_mat: &[f64],
     b_mat: &[f64],
@@ -1745,6 +1811,12 @@ pub struct BseGradEngine<'a> {
     pub gw: &'a GwGradEngine<'a>,
     pub screen: BseScreening,
     pub kappa: f64,
+    /// Solve (and differentiate) the **TDA** problem instead of the full
+    /// particle-hole RPA one.  `A` is symmetric, so the roots are ordinary
+    /// eigenvalues and the amplitudes orthonormal (`y = 0`); the energy path's
+    /// `bse_tda` keyword selects the same approximation on its side, so the two
+    /// stages stay on one functional.
+    pub tda: bool,
     pub screening_energy: ScreeningEnergy,
     /// QP energies of every orbital (index = orbital); the active orbitals are
     /// solved by [`BseGradEngine::new_with_cutoff`], the rest are *rebuilt on
@@ -2001,10 +2073,24 @@ impl<'a> BseGradEngine<'a> {
             't' | 'T' => 0.0,
             _ => panic!("bse_grad: multi must be 's' or 't'"),
         };
+        // Same keyword the energy path uses, so both stages solve one functional.
+        let tda = scf
+            .mol
+            .ctrl
+            .quasiparticle_methods
+            .as_ref()
+            .map(|qp| qp.bse_tda)
+            .unwrap_or(false);
+        if tda {
+            println!(
+                "GW-BSE gradient: TDA (Hermitian A only) -- no A-B Cholesky, y = 0"
+            );
+        }
         BseGradEngine {
             gw,
             screen,
             kappa,
+            tda,
             screening_energy,
             qp_energies,
             qp_caches,
@@ -2061,6 +2147,15 @@ impl<'a> BseGradEngine<'a> {
         self.ensure_screening();
         let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let dim = self.screen.nocc * self.screen.nvir;
+        if self.tda {
+            // Hermitian problem: always defined, no `A-B` factorisation.
+            self.solver_used = "tda-dense";
+            self.roots = solve_bse_tda_dense(&a_mat, dim, nroots)
+                .into_iter()
+                .map(|(omega, x, y)| BseRoot { omega, x, y })
+                .collect();
+            return;
+        }
         let (pairs, used) = match solver {
             BseSolver::Dense => (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense"),
             // The Davidson path is wrapped: on an indefinite `A-B` its internal
