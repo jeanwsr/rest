@@ -9130,37 +9130,6 @@ impl<'a> GwCdGradEngine<'a> {
     }
 }
 
-/// Exchange applied to occupied coefficients for an arbitrary (also indefinite)
-/// symmetric density. Reassociate B D B Cocc as B (D (B Cocc)); forming the
-/// complete K(D) first costs O(naux * nao^3) although only nocc columns are used.
-fn exchange_density_occ(scf: &SCF, dm: &MatrixFull<f64>, cocc: &MatrixFull<f64>) -> MatrixFull<f64> {
-    let nao = cocc.size[0];
-    let no = cocc.size[1];
-    let ri = &scf.rimatr.as_ref().expect("adjoint requires rimatr").0;
-    let nt = nao * (nao + 1) / 2;
-    let parts: Vec<MatrixFull<f64>> = ri.data.par_chunks(16 * nt).map(|cols| {
-        let mut b = MatrixFull::new([nao, nao], 0.0);
-        let mut bc = MatrixFull::new([nao, no], 0.0);
-        let mut dbc = MatrixFull::new([nao, no], 0.0);
-        let mut out = MatrixFull::new([nao, no], 0.0);
-        for col in cols.chunks_exact(nt) {
-            let mut k = 0;
-            for j in 0..nao { for i in 0..=j {
-                b.data[i + j * nao] = col[k];
-                b.data[j + i * nao] = col[k];
-                k += 1;
-            }}
-            _dgemm_full(&b, 'N', cocc, 'N', &mut bc, 1.0, 0.0);
-            _dgemm_full(dm, 'N', &bc, 'N', &mut dbc, 1.0, 0.0);
-            _dgemm_full(&b, 'N', &dbc, 'N', &mut out, 1.0, 1.0);
-        }
-        out
-    }).collect();
-    let mut out = MatrixFull::new([nao, no], 0.0);
-    for part in parts { for (v, p) in out.data.iter_mut().zip(part.data) { *v += p; } }
-    out
-}
-
 // ===========================================================================
 // Adjoint ("Z-vector") evaluation of the CP-HF channel
 // ===========================================================================
@@ -9332,7 +9301,6 @@ pub struct CphfAdjoint {
     /// verification fields (MO-basis covectors, relaxed-response operator, L and Z)
     pub lam_mo: Vec<f64>,
     pub lams_mo: Vec<f64>,
-    /// Full AO response, populated only with `keep_adjoint_pieces`.
     pub vtil: Vec<f64>,
     pub l_mat: Vec<f64>,
     pub z_vec: Vec<f64>,
@@ -9425,7 +9393,6 @@ impl GwGradEngine<'_> {
             return None;
         }
 
-        let t_covectors = Instant::now();
         let nao = self.nao;
         let nmo = self.nmo;
         let nocc = self.nocc;
@@ -9519,84 +9486,115 @@ impl GwGradEngine<'_> {
         let lams_ao = to_ao(&lams);
 
         // ---- (b) Vtil = vind(Lam_ao) and L = 4 C^T Vtil C_occ ------------
-        let cocc = self.c_mo.data[..nao * nocc].to_vec();
-        let cm = to_mat(&cocc, nao, nocc);
         let lam_ao_m = to_mat(&lam_ao, nao, nao);
-        let j = crate::dft::response::compute_j_upper(self.scf, &vec![lam_ao_m.clone()])
-            .to_matrixfull().expect("adjoint: J upper");
-        let mut vbra = MatrixFull::new([nao, nocc], 0.0);
-        _dgemm_full(&j, 'N', &cm, 'N', &mut vbra, 1.0, 0.0);
-        if self.fock_hyb != 0.0 {
-            let kbra = exchange_density_occ(self.scf, &lam_ao_m, &cm);
-            for (v, k) in vbra.data.iter_mut().zip(kbra.data) { *v -= 0.5 * self.fock_hyb * k; }
+        let j_up = crate::dft::response::compute_j_upper(self.scf, &vec![lam_ao_m.clone()]);
+        let k_up = crate::dft::response::compute_k_upper(self.scf, &vec![lam_ao_m]);
+        let j_full = j_up.to_matrixfull().expect("adjoint: J upper").data;
+        let k_full = k_up.to_matrixfull().expect("adjoint: K upper").data;
+        let mut vtil = vec![0.0f64; n2];
+        for k in 0..n2 {
+            vtil[k] = j_full[k] - 0.5 * self.fock_hyb * k_full[k];
         }
-        // Both XC terms are linear in the density: fxc(Lambda) - fxc(D_bb).
-        // Combine them before the grid pass and project directly onto Cocc;
-        // the Z RHS never needs the full AO potential. Use the original SCF
-        // grid here (the Krylov operator may use a separate response grid).
-        if !is_hf && (dft_mask & 1 != 0 || (dft_mask & 4 != 0 && bb_k.is_some())) {
-            use crate::dft::numint_matmul::nimatmul::NIMatmul;
-            use crate::dft::numint_matmul::resp_rks::make_cpks_vxc_fxc;
-            use crate::dft::xceff::libxc_wrap::determine_den_type_from_list;
-            let mut density = if dft_mask & 1 != 0 { lam_ao.clone() } else { vec![0.0; n2] };
-            if dft_mask & 4 != 0 {
-                if let Some(bb) = bb_k {
-                    let mut cb = self.c_mo.clone();
-                    for (col, &w) in cb.data.chunks_mut(nao).zip(bb) {
-                        for v in col { *v *= w; }
+        // ---- DFT / hybrid references: the XC-kernel part ------------------
+        // `vtil` is the functional derivative of the energy with respect to the
+        // density, so a CP-KS reference adds the kernel's action on the adjoint
+        // density, `vtil += f_xc(Lambda_ao)` -- the exact analogue of the
+        // `f_xc(D^U)` term that the canonical route carries inside its relaxed
+        // first-order Fock (`canonical_finish`).  One grid kernel sweep.
+        // One kernel cache for both DFT terms below (the canonical route builds
+        // its own; here two sweeps share one cache).
+        let fxc_cache = if is_hf {
+            None
+        } else {
+            Some(crate::hessian::rks::prepare_fxc_cache(self.scf).expect(
+                "gw_grad: the adjoint CP-KS route needs the XC-kernel cache                  (an scf without grids cannot provide it)",
+            ))
+        };
+        if !is_hf && dft_mask & 1 != 0 {
+            let cache = fxc_cache.as_ref().expect("cache built above");
+            let fxc = crate::dft::response::compute_fxc_response_ao_cached(
+                cache,
+                &to_mat(&lam_ao, nao, nao),
+            );
+            for (v, f) in vtil.iter_mut().zip(fxc.data.iter()) {
+                *v += *f;
+            }
+        }
+        let cocc: Vec<f64> = (0..nocc)
+            .flat_map(|i| (0..nao).map(move |mu| self.c_mo[[mu, i]]))
+            .collect();
+        let mut l_mat = {
+            let vm = to_mat(&vtil, nao, nao);
+            let cm = to_mat(&cocc, nao, nocc);
+            let mut tmp = MatrixFull::new([nao, nocc], 0.0);
+            let mut out = MatrixFull::new([nmo, nocc], 0.0);
+            _dgemm_full(&vm, 'N', &cm, 'N', &mut tmp, 1.0, 0.0);
+            _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut out, 4.0, 0.0);
+            out.data
+        };
+        // ---- DFT / hybrid references: the density-response part of `b_x` --
+        // After the `(a2)` fold above, `Lambda` carries the whole orbital-rotation
+        // channel of `b_x`; what is left of the `bb` covector is the kernel
+        // response of the first-order density,
+        //   -sum_p bb[p] [C^T f_xc(D^U) C]_pp = -Tr[D^U f_xc(D_bb)]
+        //                                      = -4 sum_{p,i} (C^T X C)[p,i] U[p,i],
+        // with `D_bb = C diag(bb) C^T` and `X = f_xc(D_bb)` (the kernel is
+        // self-adjoint, so this is the same sweep as `f_xc` of a density), i.e.
+        // an extra `Vtil`-like covector `-f_xc(D_bb)` on the `Z` right-hand side.
+        // The explicit `vd1` part stays per perturbation; the caller passes it
+        // as the `b_x` argument of the perturbation contractions.
+        if !is_hf && dft_mask & 4 != 0 {
+            if let Some(bb) = bb_k {
+                let mut dbb = vec![0.0f64; n2];
+                for mu in 0..nao {
+                    for nu in 0..nao {
+                        let mut acc = 0.0;
+                        for p in 0..nmo {
+                            acc += self.c_mo[[mu, p]] * bb[p] * self.c_mo[[nu, p]];
+                        }
+                        dbb[mu + nu * nao] = acc;
                     }
-                    let mut dbb = MatrixFull::new([nao, nao], 0.0);
-                    _dgemm_full(&cb, 'N', &self.c_mo, 'T', &mut dbb, 1.0, 0.0);
-                    for (d, b) in density.iter_mut().zip(dbb.data) { *d -= b; }
+                }
+                let cache = fxc_cache.as_ref().expect("cache built above");
+                let x = crate::dft::response::compute_fxc_response_ao_cached(
+                    cache,
+                    &to_mat(&dbb, nao, nao),
+                );
+                let t = gemm_nt(&self.c_mo.data, nao, nmo, &x.data, nao, nao);
+                let xmo = gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo);
+                for i in 0..nocc {
+                    for p in 0..nmo {
+                        l_mat[p + i * nmo] -= 4.0 * xmo[p + i * nmo];
+                    }
                 }
             }
-            let device = crate::utilities::rstsr_util::device();
-            let mol = get_cint_mol(&self.scf.mol);
-            let grids = self.scf.grids.as_ref().expect("adjoint CP-KS requires grids");
-            let mut ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-            let funcs = crate::analdrv::response::rresp_interface::scf_xc_func_list(self.scf);
-            let den_type = determine_den_type_from_list(&funcs.iter().map(|(_, f)| f).collect::<Vec<_>>());
-            let coeff = self.c_mo.to_rstsr_view(&device);
-            let occ = rt::asarray((&self.scf.occupation[0], [nmo], &device));
-            let (_, fxc) = make_cpks_vxc_fxc(&funcs, &mut ni, coeff, occ.view());
-            let dm = rt::asarray((&density, [nao, nao].f(), &device));
-            let co = cm.to_rstsr_view(&device);
-            for (start, end) in ni.grid_blocks(grids.weights.len()) {
-                let mut block = ni.split_batch(start, end);
-                let rho = block.make_rho_from_dm(&[dm.view()], den_type);
-                let v = block.make_rks_fxc_pot_with_eff_bra_trans(fxc.i(start..end), rho.view(), co.view(), den_type)
-                    .into_contig(ColMajor);
-                for (dst, src) in vbra.data.iter_mut().zip(&v.raw()[v.offset()..v.offset() + nao * nocc]) { *dst += src; }
-            }
         }
-        let mut l = MatrixFull::new([nmo, nocc], 0.0);
-        _dgemm_full(&self.c_mo, 'T', &vbra, 'N', &mut l, 4.0, 0.0);
-        let l_mat = l.data;
-        // Full AO Vtil is only a diagnostic; production consumes Vtil Cocc.
-        let vtil = if self.config.keep_adjoint_pieces {
-            let mut v = j.data.clone();
-            if self.fock_hyb != 0.0 {
-                let k = crate::dft::response::compute_k_upper(self.scf, &vec![lam_ao_m.clone()])
-                    .to_matrixfull().expect("adjoint: K upper");
-                for (v, k) in v.iter_mut().zip(k.data) { *v -= 0.5 * self.fock_hyb * k; }
-            }
-            if !is_hf && dft_mask & 1 != 0 {
-                let cache = crate::hessian::rks::prepare_fxc_cache(self.scf).expect("CP-KS cache");
-                let fxc = crate::dft::response::compute_fxc_response_ao_cached(&cache, &lam_ao_m);
-                for (v, f) in v.iter_mut().zip(fxc.data) { *v += f; }
-            }
-            v
-        } else { Vec::new() };
-        let covector_time = t_covectors.elapsed().as_secs_f64();
 
         // ---- (c) one adjoint CP-HF solve -> Z, and <Z, rhs_d> -------------
+        let t_all = Instant::now();
         let mut timings = [0.0f64; 6];
-        timings[0] = covector_time;
+        timings[0] = 0.0; // (a)+(b) are timed by the caller-visible total below
         let t_setup = Instant::now();
+        let _ = t_all;
         let device = crate::utilities::rstsr_util::device();
+        let mol = get_cint_mol(&self.scf.mol);
+        let aux = get_cint_aux(&self.scf.mol);
         let mo_coeff = rt::asarray((&self.c_mo.data, [nao, nmo], &device)).into_contig(ColMajor);
-        let mo_occ = rt::asarray((&self.scf.occupation[0], [nmo], &device)).into_contig(ColMajor);
+        let mo_occ =
+            rt::asarray((&self.scf.occupation[0], [nmo], &device)).into_contig(ColMajor);
         let mo_energy = rt::asarray((&e[..], [nmo], &device)).into_contig(ColMajor);
+        let mut ovlp_obj = RHessOvlp::new(&mol, &device);
+        let mut hcore_obj = RHessHcore::new(&mol, &device);
+        let rimatr = &self
+            .scf
+            .rimatr
+            .as_ref()
+            .expect("gw_grad: adjoint CP-HF requires rimatr (use_auxbas + use_ri_symm)")
+            .0;
+        let cderi = rimatr.to_rstsr_view(&device).into_cow();
+        let j2c_decomp =
+            crate::ri_jk::get_j2c_decomp(&aux, &device, self.scf.mol.ctrl.j2c_decomp.clone());
+        let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
         config.resp.cache_budget = self.config.resp_cache_budget_mib;
@@ -9623,22 +9621,9 @@ impl GwGradEngine<'_> {
         let mut resp = rscf_resp_interface(self.scf, &config);
         timings[1] = t_setup.elapsed().as_secs_f64();
 
+        timings[0] = t_all.elapsed().as_secs_f64() - t_setup.elapsed().as_secs_f64();
         let t_rhs = Instant::now();
-        let rhs_full_opt = if fold_rhs {
-            // The folded route only needs the response operator, not nuclear
-            // skeletons or a second auxiliary-metric factorization.
-            resp.make_cpscf_preparation(mo_coeff.view(), mo_occ.view(), mo_energy.view());
-            timings[2] = t_rhs.elapsed().as_secs_f64();
-            (None, None)
-        } else {
-            let mol = get_cint_mol(&self.scf.mol);
-            let aux = get_cint_aux(&self.scf.mol);
-            let mut ovlp_obj = RHessOvlp::new(&mol, &device);
-            let mut hcore_obj = RHessHcore::new(&mol, &device);
-            let rimatr = &self.scf.rimatr.as_ref().expect("adjoint CP-HF requires rimatr").0;
-            let cderi = rimatr.to_rstsr_view(&device).into_cow();
-            let j2c_decomp = crate::ri_jk::get_j2c_decomp(&aux, &device, self.scf.mol.ctrl.j2c_decomp.clone());
-            let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
+        let rhs_full_opt = {
             let nuc_list: Vec<&mut dyn HessNucAPI> = Vec::new();
             let core_list: Vec<&mut dyn RHessCoreAPI> = vec![&mut hcore_obj];
             let el_list: Vec<&mut dyn RHessElecInteractAPI> = vec![&mut rijk_obj];
@@ -9649,11 +9634,17 @@ impl GwGradEngine<'_> {
             hess.make_response_preparation();
             timings[2] = t_rhs.elapsed().as_secs_f64();
             let t2 = Instant::now();
-            let rhs_map = hess.compute_dimless_cpscf_rhs();
-            timings[3] = t2.elapsed().as_secs_f64();
-            let f1 = rhs_map["f1mo"].to_owned();
-            let fr = f1.raw()[f1.offset()..f1.offset() + nmo * nocc * 3 * self.natm].to_vec();
-            (Some(rhs_map["rhs"].to_owned()), Some(fr))
+            if fold_rhs {
+                // only `f1mo`/`s1mo` are unavailable here; the skeleton tensor
+                // itself is never needed (the `Z` contraction is folded below)
+                (None, None)
+            } else {
+                let rhs_map = hess.compute_dimless_cpscf_rhs();
+                timings[3] = t2.elapsed().as_secs_f64();
+                let f1 = rhs_map["f1mo"].to_owned();
+                let fr = f1.raw()[f1.offset()..f1.offset() + nmo * nocc * 3 * self.natm].to_vec();
+                (Some(rhs_map["rhs"].to_owned()), Some(fr))
+            }
         };
         let (rhs_full, f1mo_ref_inner) = rhs_full_opt;
         f1mo_ref = f1mo_ref_inner;
@@ -9805,8 +9796,7 @@ impl GwGradEngine<'_> {
         // `Lam_aux,W = I^T W` (the `Z` covector's partner) rides the same pass: one sweep over the
         // integral blocks serves all four contractions, so the shell triplets are evaluated once.
         let mut lam_aux_w = vec![0.0f64; naux];
-        let need_exchange = self.fock_hyb != 0.0 || self.config.keep_adjoint_pieces;
-        let mut yt = if need_exchange { vec![0.0f64; naux * nocc * nao] } else { Vec::new() };
+        let mut yt = vec![0.0f64; naux * nocc * nao];
         {
             let cm = to_mat(&cocc, nao, nocc);
             let mut ip = MatrixFull::new([nao, nao], 0.0);
@@ -9815,7 +9805,7 @@ impl GwGradEngine<'_> {
                 lam_aux[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &lam_ao, n2, 1));
                 rho[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &dm, n2, 1));
                 lam_aux_w[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &w_dh1, n2, 1));
-                for pl in 0..if need_exchange { nb } else { 0 } {
+                for pl in 0..nb {
                     ip.data.copy_from_slice(&blk[pl * n2..(pl + 1) * n2]);
                     _dgemm_full(&ip, 'N', &cm, 'N', &mut block, 1.0, 0.0);
                     for col in 0..nao * nocc {
@@ -9825,8 +9815,8 @@ impl GwGradEngine<'_> {
             });
         }
         let c_aux = self.solve_metric(&rho);
-        let mut gt = yt;
-        if need_exchange { self.solve_metric_batch(&mut gt, nao * nocc); }
+        let mut gt = yt.clone();
+        self.solve_metric_batch(&mut gt, nao * nocc);
 
         // Folded exchange adjoint of an arbitrary AO covector `x_ao`:
         //   <x_ao, Kd> = 4 <Theta_x, dI> - 2 <Psi_x, dJ> ,
@@ -9854,27 +9844,11 @@ impl GwGradEngine<'_> {
         // that the piecewise identity stays checkable.
         let kscale = self.fock_hyb;
         let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> Vec<f64> {
-            if !need_exchange {
-                // A pure DFA has no reference exchange skeleton. Only fold
-                // the Coulomb covectors, without Y/G/Theta/Psi contractions.
-                di_cov.par_chunks_mut(n2).enumerate().for_each(|(p, di)| {
-                    let cp = c_aux[p];
-                    for mu in 0..nao { for nu in 0..=mu {
-                        let k = mu + nu * nao;
-                        let kt = nu + mu * nao;
-                        let v = di[k] + di[kt] + cp * (lam_ao[k] + lam_ao[kt])
-                            + wfac * cp * (w_dh1[k] + w_dh1[kt]);
-                        di[k] = v;
-                        di[kt] = v;
-                    }}
-                });
-                return vec![0.0; naux * naux];
-            }
             let xm = to_mat(x_theta, nao, nao);
-            let pieces: Vec<Vec<f64>> = di_cov.par_chunks_mut(n2).enumerate().map(|(p, di)| {
-                let mut gp = MatrixFull::new([nao, nocc], 0.0);
-                let mut xb = MatrixFull::new([nao, nocc], 0.0);
-                let mut th = MatrixFull::new([nao, nao], 0.0);
+            let mut gp = MatrixFull::new([nao, nocc], 0.0);
+            let mut xb = MatrixFull::new([nao, nocc], 0.0);
+            let mut th = MatrixFull::new([nao, nao], 0.0);
+            for p in 0..naux {
                 for i in 0..nocc {
                     for nu in 0..nao {
                         gp.data[nu + i * nao] = gt[p + (i * nao + nu) * naux];
@@ -9882,46 +9856,47 @@ impl GwGradEngine<'_> {
                 }
                 _dgemm_full(&xm, 'N', &gp, 'N', &mut xb, 1.0, 0.0);
                 _dgemm_full(&xb, 'N', &cm, 'T', &mut th, 1.0, 0.0);
+                if keep_pieces {
+                    theta_pieces[p * n2..(p + 1) * n2].copy_from_slice(&th.data);
+                }
                 // in-place: B_P -= 2 Theta_P, then add c_P Lam_ao (+ c_P W); the accumulated
                 // value is symmetric in (mu, nu) (`a + at` and `at + a` are the same
                 // floating-point number), so each unordered index pair is written once.
                 let cp = c_aux[p];
+                let off = p * n2;
                 for mu in 0..nao {
                     for nu in 0..=mu {
                         let k = mu + nu * nao;
                         let kt = nu + mu * nao;
-                        let a = di[k] - 2.0 * kscale * th.data[k] + cp * lam_ao[k]
+                        let a = di_cov[off + k] - 2.0 * kscale * th.data[k] + cp * lam_ao[k]
                             + wfac * cp * w_dh1[k];
-                        let at = di[kt] - 2.0 * kscale * th.data[kt] + cp * lam_ao[kt]
+                        let at = di_cov[off + kt] - 2.0 * kscale * th.data[kt] + cp * lam_ao[kt]
                             + wfac * cp * w_dh1[kt];
                         let v = a + at;
-                        di[k] = v;
-                        di[kt] = v;
+                        di_cov[off + k] = v;
+                        di_cov[off + kt] = v;
                     }
                 }
-                if keep_pieces { th.data } else { Vec::new() }
-            }).collect();
-            if keep_pieces {
-                for (dst, src) in theta_pieces.chunks_mut(n2).zip(pieces) { dst.copy_from_slice(&src); }
             }
             let xm = to_mat(x_phi, nao, nao);
             let mut acc = MatrixFull::new([naux, naux], 0.0);
+            let mut yi = MatrixFull::new([nao, naux], 0.0);
             let mut gi = MatrixFull::new([nao, naux], 0.0);
             let mut xi = MatrixFull::new([nao, naux], 0.0);
             for i in 0..nocc {
                 for p in 0..naux {
                     for nu in 0..nao {
+                        yi.data[nu + p * nao] = yt[p + (i * nao + nu) * naux];
                         gi.data[nu + p * nao] = gt[p + (i * nao + nu) * naux];
                     }
                 }
                 _dgemm_full(&xm, 'N', &gi, 'N', &mut xi, 1.0, 0.0);
                 // accumulate over occupied orbitals (beta = 1)
-                // J^-1 (Y^T X G) = G^T X G, since G = Y J^-1.
-                // Moving the metric solve onto Y avoids a dense naux-RHS
-                // solve and retaining a second naux * nao * nocc tensor.
-                _dgemm_full(&gi, 'T', &xi, 'N', &mut acc, 1.0, 1.0);
+                _dgemm_full(&yi, 'T', &xi, 'N', &mut acc, 1.0, 1.0);
             }
-            acc.data
+            let mut phi_flat = acc.data;
+            self.solve_metric_batch(&mut phi_flat, naux);
+            phi_flat
         };
         // The `Z` covector `W` rides the same contractions, and both builders
         // are linear in their covector, so a single call each suffices:

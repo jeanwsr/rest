@@ -91,11 +91,6 @@ pub fn build_rijk_response_intmd(
     nbatch_aux: usize,
     budget_bytes: f64,
 ) -> RijkRespIntmd {
-    if !do_k || budget_bytes <= 0.0 {
-        // The Coulomb response reads packed cderi directly; none of the
-        // unpacked/half-transformed exchange cache is used for a pure DFA.
-        return RijkRespIntmd::none(nbatch_aux);
-    }
     let nset = mo_coeff.len();
     assert_eq!(mo_occ.len(), nset);
     let nao = mo_coeff[0].shape()[0];
@@ -133,102 +128,15 @@ pub fn build_rijk_response_intmd(
             for s in 0..nset {
                 let bxo = (batch.reshape([nao, nao * nbatch]).t() % &mocc[s]).into_shape([nao, nbatch, nocc[s]]);
                 let oxo = (&mocc[s].t() % bxo.reshape([nao, nbatch * nocc[s]])).into_shape([nocc[s], nbatch, nocc[s]]);
-                spins[s].bxo.push(bxo.into_contig(ColMajor));
-                spins[s].oxo.push(oxo.into_contig(ColMajor));
+                spins[s].bxo.push(bxo);
+                spins[s].oxo.push(oxo);
             }
         }
         if cache_cderi {
-            cderi_batches.push(batch.into_contig(ColMajor));
+            cderi_batches.push(batch);
         }
     }
     RijkRespIntmd { nbatch_aux, cderi_batches, spins }
-}
-
-/// Single-RHS exchange response (Z vectors). Parallelize independent auxiliary
-/// batches, with direct BLAS inside each task. The general tensor path launches
-/// several threaded products per batch, although a Z solve has only one RHS.
-/// Keep the same batch partition and merge order for all worker counts.
-fn exchange_response_single(
-    cderi: TsrView,
-    mocc: TsrView,
-    bra: TsrView,
-    nbatch_aux: usize,
-    cache: Option<&RijkRespIntmd>,
-    spin: usize,
-) -> Tsr {
-    use rayon::prelude::*;
-    use rest_tensors::{MatrixFull, MatrixFullSlice};
-    use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
-    let nao = mocc.shape()[0];
-    let no = mocc.shape()[1];
-    let naux = cderi.shape()[1];
-    let nt = nao * (nao + 1) / 2;
-    let device = cderi.device().clone();
-    let cderi = cderi.to_contig(ColMajor);
-    let mocc = mocc.to_contig(ColMajor);
-    let bra = bra.to_contig(ColMajor);
-    let packed = &cderi.raw()[cderi.offset()..cderi.offset() + nt * naux];
-    let co = &mocc.raw()[mocc.offset()..mocc.offset() + nao * no];
-    let u = &bra.raw()[bra.offset()..bra.offset() + nao * no];
-    // Only slices cross the Rayon boundary; the RSTSR device stays on the caller.
-    let buffers: Vec<_> = (0..naux.div_ceil(nbatch_aux)).map(|b| {
-        fn slice(t: &Tsr) -> &[f64] { &t.raw()[t.offset()..t.offset() + t.shape().iter().product::<usize>()] }
-        let full = cache.and_then(|c| c.cderi_batches.get(b)).map(slice);
-        let sp = cache.map(|c| &c.spins[spin]);
-        let bxo = sp.and_then(|c| c.bxo.get(b)).map(slice);
-        let oxo = sp.and_then(|c| c.oxo.get(b)).map(slice);
-        (full, bxo, oxo)
-    }).collect();
-    // Bound live unpacking/intermediate scratch independently of pool size.
-    // One batch is unavoidable; additional concurrent batches share 256 MiB.
-    let scratch = 8 * nbatch_aux * (nao * nao + 2 * nao * no + 2 * no * no);
-    let wave = ((256 * 1024 * 1024) / scratch.max(1)).max(1);
-    let parts: Vec<Vec<f64>> = buffers.chunks(wave).enumerate().flat_map(|(w, buffers)| {
-        buffers.par_iter().enumerate().map(|(b, &(full, bxo, oxo))| {
-        let batch = w * wave + b;
-        let p0 = batch * nbatch_aux;
-        let nb = nbatch_aux.min(naux - p0);
-        let gemm = |a: &[f64], ar, ac, ta, b: &[f64], br, bc, tb, out: &mut MatrixFull<f64>, alpha, beta| {
-            let a = MatrixFullSlice { size: &[ar, ac], indicing: &[1, ar], data: a };
-            let b = MatrixFullSlice { size: &[br, bc], indicing: &[1, br], data: b };
-            _dgemm_full(&a, ta, &b, tb, out, alpha, beta);
-        };
-        let mut unpacked = Vec::new();
-        let full = full.unwrap_or_else(|| {
-            unpacked.resize(nao * nao * nb, 0.0);
-            for p in 0..nb {
-                let mut k = (p0 + p) * nt;
-                for j in 0..nao { for i in 0..=j {
-                    let v = packed[k]; k += 1;
-                    unpacked[p * nao * nao + i + j * nao] = v;
-                    unpacked[p * nao * nao + j + i * nao] = v;
-                }}
-            }
-            &unpacked
-        });
-        let mut b_owned = MatrixFull::new([nao * nb, if bxo.is_none() { no } else { 0 }], 0.0);
-        if bxo.is_none() {
-            gemm(full, nao, nao * nb, 'T', co, nao, no, 'N', &mut b_owned, 1.0, 0.0);
-        }
-        let bxo = bxo.unwrap_or(&b_owned.data);
-        let mut o_owned = MatrixFull::new([no, if oxo.is_none() { nb * no } else { 0 }], 0.0);
-        if oxo.is_none() {
-            gemm(co, nao, no, 'T', bxo, nao, nb * no, 'N', &mut o_owned, 1.0, 0.0);
-        }
-        let oxo = oxo.unwrap_or(&o_owned.data);
-        let mut bx = MatrixFull::new([nao * nb, no], 0.0);
-        gemm(full, nao, nao * nb, 'T', u, nao, no, 'N', &mut bx, 1.0, 0.0);
-        let mut out = MatrixFull::new([nao, no], 0.0);
-        gemm(&bx.data, nao, nb * no, 'N', oxo, no, nb * no, 'T', &mut out, -1.0, 0.0);
-        let mut ox = MatrixFull::new([no, nb * no], 0.0);
-        gemm(co, nao, no, 'T', &bx.data, nao, nb * no, 'N', &mut ox, 1.0, 0.0);
-        gemm(bxo, nao, nb * no, 'N', &ox.data, no, nb * no, 'T', &mut out, -1.0, 1.0);
-        out.data
-        }).collect::<Vec<_>>()
-    }).collect();
-    let mut out = vec![0.0; nao * no];
-    for part in parts { for (v, p) in out.iter_mut().zip(part) { *v += p; } }
-    rt::asarray((out, [nao, no, 1].f(), &device))
 }
 
 /* #endregion response kernel intermediates */
@@ -344,11 +252,6 @@ pub fn get_rijk_response_bra_separated(
                 && c.spins.iter().zip(nocc.iter()).all(|(sp, &n)| sp.nocc == n)
         });
         for s in 0..nset {
-            if nprop == 1 && nocc[s] > 0 {
-                let k = exchange_response_single(cderi.view(), mocc[s].view(), bra[s].view(), nbatch_aux, cache, s);
-                k_bras.push(k.into_shape(bra_shape_orig[s].clone()));
-                continue;
-            }
             let mocc_s = &mocc[s];
             let bra_s = &bra[s];
             let spin_cache = cache.map(|c| &c.spins[s]);

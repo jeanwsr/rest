@@ -142,102 +142,6 @@ pub fn get_rks_response_bra(
     (resp, timing)
 }
 
-/// One-RHS CP-KS response. Fuse the density and potential passes so AO*Cocc
-/// is formed once, and combine all terms multiplying AO[0] before the GEMM.
-/// Direct BLAS in fixed grid chunks avoids nested RSTSR thread-pool dispatch
-/// for the small occupied-space products of a Z-vector iteration.
-fn get_rks_response_bra_single(
-    ni: &mut NIMatmul,
-    den_type: XCDenType,
-    fxc_eff: TsrView,
-    bra: TsrView,
-    mocc: TsrView,
-) -> Tsr {
-    use rest_tensors::{MatrixFull, MatrixFullSlice};
-    use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
-    let shape = bra.shape().to_vec();
-    let nao = shape[0];
-    let no = shape[1];
-    let nv = den_type.num_nvar();
-    let nc = den_type.num_ao_comp();
-    let device = bra.device().clone();
-    let bra = bra.to_contig(ColMajor);
-    let mocc = mocc.to_contig(ColMajor);
-    let u = &bra.raw()[bra.offset()..bra.offset() + nao * no];
-    let co = &mocc.raw()[mocc.offset()..mocc.offset() + nao * no];
-    let mut result = vec![0.0; nao * no];
-    for (start, end) in ni.grid_blocks(ni.weights.len()) {
-        let mut block = ni.split_batch(start, end);
-        let nb = end - start;
-        let chunk = block.nchunk;
-        let ao_view = block.get_cached_ao(den_type.num_ao_deriv());
-        // Borrow contiguous blocks; cached whole-grid slices need one compact
-        // copy per batch, bounded by NIMatmul's existing batch policy.
-        let ao = ao_view.to_contig(ColMajor);
-        let av = &ao.raw()[ao.offset()..ao.offset() + nb * nao * nc];
-        let fview = fxc_eff.i(start..end);
-        let f = fview.to_contig(ColMajor);
-        let fv = &f.raw()[f.offset()..f.offset() + nb * nv * nv];
-        let weights = &ni.weights[start..end];
-        let parts: Vec<Vec<f64>> = (0..nb.div_ceil(chunk)).into_par_iter().map(|k| {
-            let g0 = k * chunk;
-            let ng = chunk.min(nb - g0);
-            // REST's BLAS wrapper requires packed matrices (it does not
-            // accept a leading dimension larger than the row count).
-            let a: Vec<_> = (0..nc).map(|c| {
-                let mut out = MatrixFull::new([ng, nao], 0.0);
-                for mu in 0..nao {
-                    let off = c * nb * nao + mu * nb + g0;
-                    out.data[mu * ng..(mu + 1) * ng].copy_from_slice(&av[off..off + ng]);
-                }
-                out
-            }).collect();
-            let co = MatrixFullSlice { size: &[nao, no], indicing: &[1, nao], data: co };
-            let u = MatrixFullSlice { size: &[nao, no], indicing: &[1, nao], data: u };
-            let mut o: Vec<_> = (0..nc).map(|_| MatrixFull::new([ng, no], 0.0)).collect();
-            let mut v: Vec<_> = (0..nc).map(|_| MatrixFull::new([ng, no], 0.0)).collect();
-            for c in 0..nc {
-                _dgemm_full(&a[c], 'N', &co, 'N', &mut o[c], 1.0, 0.0);
-                _dgemm_full(&a[c], 'N', &u, 'N', &mut v[c], 1.0, 0.0);
-            }
-            let mut rho = vec![0.0; ng * nv];
-            for i in 0..no { for g in 0..ng {
-                let k = g + i * ng;
-                rho[g] += o[0].data[k] * v[0].data[k];
-                if nv >= 4 {
-                    for c in 1..4 {
-                        rho[g + c * ng] += o[0].data[k] * v[c].data[k] + o[c].data[k] * v[0].data[k];
-                        if nv == 5 { rho[g + 4 * ng] += 0.5 * o[c].data[k] * v[c].data[k]; }
-                    }
-                }
-            }}
-            let mut w = vec![0.0; ng * nv];
-            for y in 0..nv { for x in 0..nv { for g in 0..ng {
-                w[g + y * ng] += weights[g0 + g] * fv[g0 + g + x * nb + y * nv * nb] * rho[g + x * ng];
-            }}}
-            let mut scr = MatrixFull::new([ng, no], 0.0);
-            for i in 0..no { for g in 0..ng {
-                let k = g + i * ng;
-                scr.data[k] = w[g] * o[0].data[k];
-                if nv >= 4 { for c in 1..4 { scr.data[k] += w[g + c * ng] * o[c].data[k]; } }
-            }}
-            let mut out = MatrixFull::new([nao, no], 0.0);
-            _dgemm_full(&a[0], 'T', &scr, 'N', &mut out, 4.0, 0.0);
-            if nv >= 4 { for c in 1..4 {
-                for i in 0..no { for g in 0..ng {
-                    let k = g + i * ng;
-                    scr.data[k] = w[g + c * ng] * o[0].data[k];
-                    if nv == 5 { scr.data[k] += 0.5 * w[g + 4 * ng] * o[c].data[k]; }
-                }}
-                _dgemm_full(&a[c], 'T', &scr, 'N', &mut out, 4.0, 1.0);
-            }}
-            out.data
-        }).collect();
-        for part in parts { for (dst, src) in result.iter_mut().zip(part) { *dst += src; } }
-    }
-    rt::asarray((result, shape, &device))
-}
-
 pub fn get_rks_response_bra_batched(
     ni: &mut NIMatmul,
     den_type: XCDenType,
@@ -246,13 +150,6 @@ pub fn get_rks_response_bra_batched(
     mocc: TsrView,
     verbose: bool,
 ) -> (Tsr, IndexMap<&'static str, f64>) {
-    if mo1_bra.shape()[2..].iter().product::<usize>() == 1
-        && matches!(den_type, XCDenType::RHO | XCDenType::SIGMA | XCDenType::TAU)
-    {
-        let t0 = std::time::Instant::now();
-        let resp = get_rks_response_bra_single(ni, den_type, fxc_eff, mo1_bra, mocc);
-        return (resp, IndexMap::from([("total", t0.elapsed().as_secs_f64())]));
-    }
     let ngrids = ni.weights.len();
     let nbatch = ni.nbatch;
     let mo1_bra_shape = mo1_bra.shape().to_vec();
