@@ -607,13 +607,18 @@ fn build_matvec_tensors(
     // `D0^-1` over the gradient's response pair space: the active occupied
     // window times *all* virtuals, dressed with the gradient's screening
     // energies (`response_matrix` takes a compact `[occ | vir]` energy vector).
-    let mut eps_compact = Vec::with_capacity(nocc + nvir_full);
-    eps_compact.extend_from_slice(&eps_screen[occ_start..occ_start + nocc]);
+    // The response space is the **untruncated** occupied manifold times all
+    // virtuals (`screen.screen_nocc`), not the active transition window: that is
+    // how `BseScreening` builds `D0` and how the spectrum path builds it.
+    let screen_occ_start = screen.screen_occ_start;
+    let screen_nocc = screen.screen_nocc;
+    let mut eps_compact = Vec::with_capacity(screen_nocc + nvir_full);
+    eps_compact.extend_from_slice(&eps_screen[screen_occ_start..screen_occ_start + screen_nocc]);
     eps_compact.extend_from_slice(&eps_screen[vir_start..vir_start + nvir_full]);
     let ri_ov_full = crate::ri_bse::get_submatrix_window(
-        scf, 'O', 'V', occ_range.clone(), vir_full_range.clone(), 'Y');
+        scf, 'O', 'V', screen_occ_start..vir_start, vir_full_range.clone(), 'Y');
     let response = crate::ri_gw::response_matrix(
-        &eps_compact, nocc, nvir_full, &ri_ov_full, 0.0, 'R', 0.0,
+        &eps_compact, screen_nocc, nvir_full, &ri_ov_full, 0.0, 'R', 0.0,
     );
     drop(ri_ov_full);
     let inverse_dielectric = crate::ri_gw::inverse_dielectric_matrix(response, 'R');
@@ -1232,6 +1237,17 @@ pub struct KernelVjpCompact {
     /// spans them (the screening chain contributes for every virtual), so the
     /// square layout width is `nocc + nvir_full`.
     pub nvir_full: usize,
+    /// Screening-response covector of the **core** occupied orbitals, i.e. the
+    /// orbitals below the active window that the untruncated RPA response still
+    /// contains (`occ_start - screen_occ_start` of them): layout
+    /// `ovbar_core[i + a*ncore + P*ncore*nvir_full]` for the orbital pair
+    /// `(screen_occ_start+i, vir_start+a)`.  Empty when the window starts at the
+    /// first occupied orbital.
+    pub ovbar_core: Vec<f64>,
+    /// occupied orbitals in `ovbar_core` and the orbital its row `0` is
+    /// (see [`BseScreening::screen_occ_start`]).
+    pub ncore: usize,
+    pub screen_occ_start: usize,
     /// bare-exchange J covector `-kappa vz vz^T` (symmetric), `naux^2`
     pub jbar_ex: Vec<f64>,
     pub polar_a: Vec<f64>,
@@ -1320,6 +1336,7 @@ impl KernelVjpCompact {
         let (os, vs) = (self.occ_start, self.vir_start);
         let n_oo = nocc * nocc;
         let ncv = nocc * nvir_full;
+        let ncv_core = self.ncore * nvir_full;
         for p in 0..naux {
             // (o,o)
             for j in 0..nocc {
@@ -1345,6 +1362,13 @@ impl KernelVjpCompact {
                     let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
                     qbar[p + ((os + i) + ga * nmo) * naux] += v;
                     qbar[p + (ga + (os + i) * nmo) * naux] += v;
+                }
+                // core occupied orbitals of the screening response
+                for i in 0..self.ncore {
+                    let gi = self.screen_occ_start + i;
+                    let v = 0.5 * self.ovbar_core[i + a * self.ncore + p * ncv_core];
+                    qbar[p + (gi + ga * nmo) * naux] += v;
+                    qbar[p + (ga + gi * nmo) * naux] += v;
                 }
             }
         }
@@ -1372,6 +1396,7 @@ impl KernelVjpCompact {
         let (os, vs) = (self.occ_start, self.vir_start);
         let n_oo = nocc * nocc;
         let ncv = nocc * nvir_full;
+        let ncv_core = self.ncore * nvir_full;
         for p in 0..naux {
             // (o,o): `add_into_full_pair` adds `theta_ij` to both the `(i,j)`
             // and the `(j,i)` entry, and its loop visits both orderings, so the
@@ -1400,6 +1425,12 @@ impl KernelVjpCompact {
                 for i in 0..nocc {
                     let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
                     qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, os + i, ga) * naux + p] += v;
+                }
+                // core occupied orbitals of the screening response
+                for i in 0..self.ncore {
+                    let gi = self.screen_occ_start + i;
+                    let v = 0.5 * self.ovbar_core[i + a * self.ncore + p * ncv_core];
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, gi, ga) * naux + p] += v;
                 }
             }
         }
@@ -1452,6 +1483,8 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
     let mut theta = vec![0.0f64; naux * ncols];
     let ncv = nocc * nvir_full;
     let mut ovbar = vec![0.0f64; naux * ncv];
+    let ncore = screen.occ_start - screen.screen_occ_start;
+    let mut ovbar_core = vec![0.0f64; naux * ncore * nvir_full];
 
     // ---- direct A and B blocks (BLAS-3) ----
     let x_m = to_mat(x, nocc, nvir);
@@ -1593,16 +1626,26 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
         let (qbar_bov_a, ebar_a) = chain_from_dbar_compact(screen, &polar_a);
         let (qbar_bov_b, ebar_b) = chain_from_dbar_compact(screen, &polar_b);
         // The chain gives one (i,a) covector per FULL-space virtual; only the
-        // diagonal blocks are restricted to the active transition space.
-        for c in 0..nocc * nvir_full {
-            let i = c % nocc;
-            let a = c / nocc;
+        // diagonal blocks are restricted to the active transition space.  Its
+        // occupied index runs over the **screening** space (`screen_nocc`, which
+        // includes the core orbitals below the active window), so every column is
+        // routed either into the active block (`ovbar`) or into the core block
+        // (`ovbar_core`).
+        let snocc = screen.screen_nocc;
+        let ncv_core = ncore * nvir_full;
+        for c in 0..snocc * nvir_full {
+            let i_screen = c % snocc;
+            let a = c / snocc;
+            let is_core = i_screen < ncore;
             for p in 0..naux {
                 // the full-pair buffer stores 0.5*bov on each of the two
                 // symmetric entries, so the pair sum is bov
-                let slot = i + a * nocc + p * ncv;
-                ovbar[slot] += qbar_bov_a[c * naux + p];
-                ovbar[slot] += qbar_bov_b[c * naux + p];
+                let v = qbar_bov_a[c * naux + p] + qbar_bov_b[c * naux + p];
+                if is_core {
+                    ovbar_core[i_screen + a * ncore + p * ncv_core] += v;
+                } else {
+                    ovbar[i_screen - ncore + a * nocc + p * ncv] += v;
+                }
             }
         }
         for c in 0..nov {
@@ -1628,6 +1671,9 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
             vir_start: screen.vir_start,
             nvir,
             nvir_full,
+            ovbar_core,
+            ncore,
+            screen_occ_start: screen.screen_occ_start,
             jbar_ex,
             polar_a,
             polar_b,
