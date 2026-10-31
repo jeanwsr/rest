@@ -930,6 +930,83 @@ fn dipole_components(dipole_matrix:&tensors::MatrixFull<f64>, xy:&[f64]) -> [f64
     mu
 }
 
+/// Per-atom populations of the **excitation density**
+/// `ΔP = Σ_ia (X_ia² − Y_ia²)(φ_a φ_a − φ_i φ_i)`.
+///
+/// This is what distinguishes a charge-transfer root from a local one in a
+/// molecule with no point-group symmetry: a CT root drains the donor and fills
+/// the acceptor, an intra-donor root does not.  It is invariant under the sign
+/// of the eigenvector (only `X²`, `Y²` enter) and under rotations inside the
+/// occupied/virtual spaces, and it is local in the AO basis, so unlike `top`
+/// (indexed by MO order) it survives a re-converged SCF.  The atom sum is zero
+/// for every root.
+fn excitation_density_atoms(
+    scf_data:&SCF,
+    screen:&ri_bse::bse_grad::BseScreening,
+    xy:&[f64],
+) -> Vec<f64> {
+    let mol = &scf_data.mol;
+    let nao = mol.num_basis;
+    let (nocc, nvir) = (screen.nocc, screen.nvir);
+    let dim = nocc * nvir;
+    let ev = &scf_data.eigenvectors[0];
+    let s = scf_data.ovlp.to_matrixfull().unwrap();
+    let w: Vec<f64> = (0..dim).map(|k| xy[k].powi(2) - xy[dim + k].powi(2)).collect();
+    let mut wv = vec![0.0f64; nvir * nvir];
+    for a in 0..nvir {
+        for b in 0..nvir {
+            let mut acc = 0.0;
+            for i in 0..nocc {
+                acc += w[i + a * nocc] * w[i + b * nocc];
+            }
+            wv[a * nvir + b] = acc;
+        }
+    }
+    let mut wo = vec![0.0f64; nocc * nocc];
+    for i in 0..nocc {
+        for j in 0..nocc {
+            let mut acc = 0.0;
+            for a in 0..nvir {
+                acc += w[i + a * nocc] * w[j + a * nocc];
+            }
+            wo[i * nocc + j] = acc;
+        }
+    }
+    let mut q = vec![0.0f64; nao];
+    for (block, is_vir) in [(screen.vir_start, true), (screen.occ_start, false)] {
+        let n = if is_vir { nvir } else { nocc };
+        let wm = if is_vir { &wv } else { &wo };
+        let mut g = vec![0.0f64; n * nao];
+        for a in 0..n {
+            for nu in 0..nao {
+                let c = ev[[nu, block + a]];
+                if c == 0.0 { continue; }
+                for mu in 0..nao {
+                    g[a * nao + mu] += c * s[[nu, mu]];
+                }
+            }
+        }
+        for mu in 0..nao {
+            let mut acc = 0.0;
+            for a in 0..n {
+                let mut t = 0.0;
+                for b in 0..n {
+                    t += wm[a * n + b] * ev[[mu, block + b]];
+                }
+                acc += t * g[a * nao + mu];
+            }
+            q[mu] += if is_vir { acc } else { -acc };
+        }
+    }
+    let mut out = vec![0.0f64; mol.basis4elem.len()];
+    for (iat, b4e) in mol.basis4elem.iter().enumerate() {
+        let lo = b4e.global_index.0.min(nao);
+        let hi = (b4e.global_index.0 + b4e.global_index.1).min(nao);
+        out[iat] = q[lo..hi].iter().sum();
+    }
+    out
+}
+
 /// Stage-1 root dump (`bse_roots_only`), written as JSON.
 ///
 /// Every root is described by quantities that are **invariant under a change of
@@ -976,10 +1053,14 @@ fn save_bse_roots(scf_data:&SCF, bse:&ri_bse::bse_grad::BseGradEngine, path:&str
                     nocc - 1 - i, a, wi
                 )
             }).collect();
+            let dpop = excitation_density_atoms(scf_data, &bse.screen, &xy);
+            let dpop_json: Vec<String> = dpop.iter().map(|v| format!("{v:.6}")).collect();
             out.push_str(&format!(
                 "    {{\"index\": {k}, \"omega_ha\": {:.12}, \"omega_ev\": {:.6}, \
-                 \"mu2\": {:.6}, \"mu\": [{:.6}, {:.6}, {:.6}], \"dim\": {dim}, \"top\": [{}]}}",
-                r.omega, r.omega * 27.211386245988, mu2, mu[0], mu[1], mu[2], top.join(", ")
+                 \"mu2\": {:.6}, \"mu\": [{:.6}, {:.6}, {:.6}], \"dim\": {dim}, \"top\": [{}], \
+                 \"dpop\": [{}]}}",
+                r.omega, r.omega * 27.211386245988, mu2, mu[0], mu[1], mu[2],
+                top.join(", "), dpop_json.join(", ")
             ));
         }
         out.push_str(if k + 1 == bse.roots.len() { "\n" } else { ",\n" });
