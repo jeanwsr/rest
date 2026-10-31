@@ -166,7 +166,7 @@ impl MPIData {
         // the Universe alive and hand out a valid MPIOperator. Leaking the
         // handle instead (std::mem::forget) left MPI in a half-initialised
         // state that segfaults.
-        if size >= 1 {
+        if size >= 2 {
             (
                 Some(MPIOperator {
                 universe,

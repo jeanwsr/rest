@@ -6289,19 +6289,29 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // the SCF and builds its own pattern and plan.
     // ------------------------------------------------------------------
     #[cfg(feature = "pexsi")]
-    let mut pexsi_driver: Option<pexsi_solver::PexsiSolver> =
-        if pexsi_solver::PexsiSolver::is_enabled(scf_data) {
+    let mut pexsi_driver: Option<pexsi_solver::PexsiSolver> = {
+        if !pexsi_solver::PexsiSolver::is_enabled(scf_data) {
+            // PEXSI not requested — nothing to say.
+            None
+        } else if mpi_operator.is_none() {
+            warn!(
+                "PEXSI requires more than one MPI rank; \
+                 falling back to diagonalization."
+            );
+            None
+        } else {
             match pexsi_solver::PexsiSolver::new(scf_data, mpi_operator) {
                 Ok(driver) => Some(driver),
                 Err(e) => {
-                    warn!("PEXSI not used for this run, falling back to diagonalisation: {e}");
+                    warn!(
+                        "PEXSI initialization failed ({e}); \
+                         falling back to diagonalization."
+                    );
                     None
                 }
             }
-        } else {
-            None
-     };
-
+        }
+    };
     // The pole expansion IS the SCF, so the energy has to take the
     // density-matrix route: under PEXSI there are no current eigenvectors to
     // contract against, and the orbital route would silently use stale ones.
