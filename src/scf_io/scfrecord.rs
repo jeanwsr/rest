@@ -399,11 +399,19 @@ impl ScfTraceRecord {
                      - self.energy_records[self.energy_records.len()-2]).abs()
                 } else { f64::INFINITY };
                 let in_fine_convergence = energy_change_recent < 1.0e-3;
+                // absolute error norm guard: even when the energy temporarily
+                // plateaus in a wrong basin (measured: -6649.91 for 2 iterations,
+                // ΔE=4e-4 < 1e-3), an error norm of O(1) means we are nowhere near
+                // any self-consistent solution — shrinking is inappropriate.
+                // Only shrink when the error norm itself indicates proximity to
+                // convergence (G16 convergence-tail error norms are ~1e-4..1e-6).
+                let near_convergence = cur_norm < 1.0e-3;
                 let stagnation_threshold = 4 + self.diis_shrink_count;
                 if self.diis_stagnation_count >= stagnation_threshold
                     && self.error_vector.len() > 2
                     && self.num_iter > 5
                     && in_fine_convergence
+                    && near_convergence
                 {
                     // progressive: keep half → keep quarter → keep 2
                     let keep = match self.diis_shrink_count {
