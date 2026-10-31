@@ -527,45 +527,38 @@ fn tda_matvec_free(
         _dgemm_full(&via, 'N', x, 'N', &mut t, 1.0, 0.0);
         _dgemm_full(&qov, 'T', &t, 'N', &mut y, kappa, 1.0);
     }
-    let mut qblk = vec![0.0f64; nocc * nocc];
-    let mut vblk = vec![0.0f64; nvir * nvir];
-    let mut mblk = vec![0.0f64; dim];
-    let mut gblk = vec![0.0f64; dim];
-    let mut xs = vec![0.0f64; dim];
-    let mut u = vec![0.0f64; dim];
-    let mut s = vec![0.0f64; nvir * nvir];
-    let mut t = vec![0.0f64; dim];
-    let mut t2 = vec![0.0f64; dim];
+    // NOTE: `to_mat` *copies* (`MatrixFull::from_vec(v.to_vec())`), so every
+    // output buffer has to be a real `MatrixFull`; handing it `to_mat(&mut buf)`
+    // would write into a temporary.
+    let mut qblk = MatrixFull::new([nocc, nocc], 0.0);
+    let mut vblk = MatrixFull::new([nvir, nvir], 0.0);
+    let mut mblk = MatrixFull::new([nocc, nvir], 0.0);
+    let mut gblk = MatrixFull::new([nocc, nvir], 0.0);
+    let mut u = MatrixFull::new([nocc, nvir], 0.0);
+    let mut s = MatrixFull::new([nvir, nvir], 0.0);
+    let mut t = MatrixFull::new([nocc, nvir], 0.0);
+    let mut t2 = MatrixFull::new([nocc, nvir], 0.0);
     for p in 0..naux {
         for c in 0..nocc * nocc {
-            qblk[c] = screen.qoo[p + c * naux];
+            qblk.data[c] = screen.qoo[p + c * naux];
         }
         for c in 0..nvir * nvir {
-            vblk[c] = screen.u_ab[p + c * naux];
+            vblk.data[c] = screen.u_ab[p + c * naux];
         }
         for c in 0..dim {
-            mblk[c] = screen.u_ia[p + c * naux];
-            gblk[c] = screen.qov[p + c * naux];
+            mblk.data[c] = screen.u_ia[p + c * naux];
+            gblk.data[c] = screen.qov[p + c * naux];
         }
         for col in 0..ncol {
+            let xm = to_mat(&x.data[col * dim..(col + 1) * dim], nocc, nvir);
+            // W_A: u = q[X], t = u * v^T
+            _dgemm_full(&qblk, 'N', &xm, 'N', &mut u, 1.0, 0.0);
+            _dgemm_full(&u, 'N', &vblk, 'T', &mut t, 1.0, 0.0);
+            // W_B: s = m^T [X], t2 = g * s^T
+            _dgemm_full(&mblk, 'T', &xm, 'N', &mut s, 1.0, 0.0);
+            _dgemm_full(&gblk, 'N', &s, 'T', &mut t2, 1.0, 0.0);
             for c in 0..dim {
-                xs[c] = x.data[c + col * dim];
-            }
-            let q = to_mat(&qblk, nocc, nocc);
-            let xm = to_mat(&xs, nocc, nvir);
-            let mut um = to_mat(&mut u, nocc, nvir);
-            _dgemm_full(&q, 'N', &xm, 'N', &mut um, 1.0, 0.0);
-            let v = to_mat(&vblk, nvir, nvir);
-            let mut tm = to_mat(&mut t, nocc, nvir);
-            _dgemm_full(&to_mat(&u, nocc, nvir), 'N', &v, 'T', &mut tm, 1.0, 0.0);
-            let mt = to_mat(&mblk, nocc, nvir);
-            let mut sm = to_mat(&mut s, nvir, nvir);
-            _dgemm_full(&mt, 'T', &xm, 'N', &mut sm, 1.0, 0.0);
-            let gt = to_mat(&gblk, nocc, nvir);
-            let mut t2m = to_mat(&mut t2, nocc, nvir);
-            _dgemm_full(&gt, 'N', &to_mat(&s, nvir, nvir), 'T', &mut t2m, 1.0, 0.0);
-            for c in 0..dim {
-                y.data[c + col * dim] -= t[c] + t2[c];
+                y.data[c + col * dim] -= t.data[c] + t2.data[c];
             }
         }
     }
