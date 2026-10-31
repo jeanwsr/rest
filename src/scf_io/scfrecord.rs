@@ -37,6 +37,12 @@ pub struct ScfTraceRecord {
     /// target_vector. This allows clearing DIIS history (when transitioning
     /// from EDIIS to DIIS) without losing the EDIIS B-matrix data.
     pub ediis_fock: Vec<[MatrixFull<f64>;2]>,
+    /// Norm of the DIIS error vector at each iteration (for stagnation detection).
+    pub diis_error_norm_history: Vec<f64>,
+    /// Number of consecutive iterations the DIIS error has not decreased (stagnation).
+    pub diis_stagnation_count: usize,
+    /// How many times the subspace has been shrunk since the last progress.
+    pub diis_shrink_count: usize,
     /// Flag set when prepare_next_input applied density-matrix extrapolation
     /// (EDIIS/ADIIS) for HF: D_mixed is the next density, skip generate_density_matrix.
     pub extrapolated_density: bool,
@@ -79,6 +85,9 @@ impl ScfTraceRecord {
             ediis_density: Vec::<[MatrixFull<f64>;2]>::new(),
             ediis_energy: Vec::<f64>::new(),
             ediis_fock: Vec::<[MatrixFull<f64>;2]>::new(),
+            diis_error_norm_history: Vec::<f64>::new(),
+            diis_stagnation_count: 0,
+            diis_shrink_count: 0,
             extrapolated_density: false,
             needs_fock_rebuild: false,
             prev_density_extrapolated: false,
@@ -350,6 +359,57 @@ impl ScfTraceRecord {
             self.error_vector.push(cur_error_vec);
             self.target_vector.push(cur_target);
 
+            // ---- Gaussian-style DIIS subspace shrinking on stagnation ----------
+            // When the DIIS residual norm stops decreasing for several consecutive
+            // iterations, the accumulated history contains redundant or conflicting
+            // directions: the pseudo-inverse stays well-conditioned but the
+            // extrapolation no longer makes progress. Dropping the oldest vectors
+            // (keeping the most recent ones) changes the extrapolation landscape and
+            // can break through the plateau. Observed in practice: this is what
+            // mature SCF codes do when NSaved collapses from 20 to a handful.
+            {
+                let cur_norm: f64 = self.error_vector.last().unwrap()
+                    .iter().map(|x| x * x).sum::<f64>().sqrt();
+                let hist = &mut self.diis_error_norm_history;
+                hist.push(cur_norm);
+                if hist.len() >= 2 {
+                    let prev = hist[hist.len() - 2];
+                    // stagnation: current error not meaningfully smaller than previous
+                    if cur_norm > prev * 0.95 {
+                        self.diis_stagnation_count += 1;
+                    } else {
+                        self.diis_stagnation_count = 0;
+                        self.diis_shrink_count = 0;
+                    }
+                }
+                // shrink when stagnant for enough iterations; require more evidence
+                // at later stages (shrinking too eagerly in the early descent phase
+                // destroys useful history)
+                let stagnation_threshold = 4 + self.diis_shrink_count;
+                if self.diis_stagnation_count >= stagnation_threshold
+                    && self.error_vector.len() > 2
+                    && self.num_iter > 5
+                {
+                    // progressive: keep half → keep quarter → keep 2
+                    let keep = match self.diis_shrink_count {
+                        0 => self.error_vector.len() / 2,
+                        1 => self.error_vector.len() / 4,
+                        _ => 2,
+                    };
+                    let keep = keep.max(2).min(self.error_vector.len() - 1);
+                    let drop = self.error_vector.len() - keep;
+                    if drop > 0 {
+                        self.error_vector.drain(0..drop);
+                        self.target_vector.drain(0..drop);
+                        self.diis_shrink_count += 1;
+                        self.diis_stagnation_count = 0;
+                        warn!(
+                            "DIIS stagnation detected (error norm {:.3e} not decreasing):                              shrinking subspace from {} to {} vectors (shrink #{})",
+                            cur_norm, keep + drop, keep, self.diis_shrink_count
+                        );
+                    }
+                }
+            }
 
             // solve the DIIS against the error vector
             if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len(), self.diis_pinv_threshold) {
