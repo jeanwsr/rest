@@ -36,6 +36,13 @@ struct Cache {
 const REUSE_TOL_FACTOR: f64 = 3.0;
 const MAX_STALE: u32 = 4;
 
+/// J reuse tolerance multiplier, configurable via REST_J_REUSE_TOL.
+fn j_reuse_tol_factor() -> f64 {
+    std::env::var("REST_J_REUSE_TOL").ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REUSE_TOL_FACTOR)
+}
+
 fn cache() -> &'static Mutex<Option<Cache>> {
     static C: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(None))
@@ -60,7 +67,7 @@ fn dm_delta(scf: &SCF, c: &Cache) -> Option<f64> {
 
 pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
-    let tol = REUSE_TOL_FACTOR * scf.mol.ctrl.scf_acc_rho;
+    let tol = j_reuse_tol_factor() * scf.mol.ctrl.scf_acc_rho;
     if let Some(c) = g.as_mut() {
         // Once the density itself has reached the convergence criterion
         // (max|ΔD| < scf_acc_rho) the SCF is about to declare convergence: force a full

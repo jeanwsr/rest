@@ -6512,7 +6512,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             let timecost = (dt1_2.timestamp_millis()-dt1_1.timestamp_millis()) as f64 /1000.0;
             println!("diagonalize_hamiltonian: {:10.2}s", timecost);
             let timecost = (dt1_3.timestamp_millis()-dt1_2.timestamp_millis()) as f64 /1000.0;
-            println!("generate_density_matrix: {:10.2}s", timecost);
+            println!("occupation+dm+pcm+homo: {:10.2}s", timecost);
             let timecost = (dt1_4.timestamp_millis()-dt1_3.timestamp_millis()) as f64 /1000.0;
             println!("check_scf_convergence:   {:10.2}s", timecost);
             let timecost = (dt1_5.timestamp_millis()-dt1_4.timestamp_millis()) as f64 /1000.0;
