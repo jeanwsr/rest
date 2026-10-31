@@ -385,10 +385,25 @@ impl ScfTraceRecord {
                 // shrink when stagnant for enough iterations; require more evidence
                 // at later stages (shrinking too eagerly in the early descent phase
                 // destroys useful history)
+                //
+                // CRITICAL GUARD: only shrink in the fine-convergence regime, where
+                // the per-iteration energy change is already small. During the basin
+                // search (energy changes of Ha-scale per iteration) the accumulated
+                // history is exactly what enables the eventual jump to the correct
+                // solution; destroying it with a shrink traps the SCF in the wrong
+                // basin (measured on system1: without this guard the shrink fires at
+                // iteration 8 and prevents the -6649→-6659 basin jump that the
+                // baseline makes at iteration 23).
+                let energy_change_recent = if self.energy_records.len() >= 2 {
+                    (self.energy_records[self.energy_records.len()-1]
+                     - self.energy_records[self.energy_records.len()-2]).abs()
+                } else { f64::INFINITY };
+                let in_fine_convergence = energy_change_recent < 1.0e-3;
                 let stagnation_threshold = 4 + self.diis_shrink_count;
                 if self.diis_stagnation_count >= stagnation_threshold
                     && self.error_vector.len() > 2
                     && self.num_iter > 5
+                    && in_fine_convergence
                 {
                     // progressive: keep half → keep quarter → keep 2
                     let keep = match self.diis_shrink_count {
