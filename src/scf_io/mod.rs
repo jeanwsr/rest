@@ -6327,7 +6327,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         scf_data.diagonalize_hamiltonian(mpi_operator);
         let dt1_2 = time::Local::now();
+        let _dbg_t0 = std::time::Instant::now();
         scf_data.generate_occupation();
+        let _dbg_t_occ = _dbg_t0.elapsed();
         if let Some(st) = &scf_data.mol.ctrl.smear {
             let mut sigma = scf_data.mol.ctrl.smear_sigma.unwrap();
             if scf_data.mol.ctrl.smear_anneal {
@@ -6351,7 +6353,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             guess_mix_applied = true;
         }
 
+        let _dbg_t1 = std::time::Instant::now();
         scf_data.generate_density_matrix();
+        let _dbg_t_dm = _dbg_t1.elapsed();
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
@@ -6363,6 +6367,13 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             scf_data.print_homo_lumo_gap()
         };
         let dt1_3 = time::Local::now();
+        if std::env::var("REST_DM_DIAG").is_ok() && scf_data.mol.ctrl.print_level > 1 {
+            println!("[dm-step] occupation={:.2}s density_matrix={:.2}s pcm={:.2}s homo_lumo+total_dt13={:.2}s",
+                _dbg_t_occ.as_secs_f64(),
+                _dbg_t_dm.as_secs_f64(),
+                (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64/1000.0,
+                (dt1_3.timestamp_millis()-dt_solv1.timestamp_millis()) as f64/1000.0);
+        }
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         // ---- fresh-Fock validation gate ------------------------------------------------
         // With the incremental Fock active, the criteria can pass while the cached J/K
