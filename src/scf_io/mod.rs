@@ -6374,6 +6374,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         scf_data.diagonalize_hamiltonian(mpi_operator);
         let dt1_2 = time::Local::now();
+        let _dbg_raw_t0 = std::time::Instant::now();  // raw Instant for cross-check
         let _dbg_t0 = std::time::Instant::now();
         scf_data.generate_occupation();
         let _dbg_t_occ = _dbg_t0.elapsed();
@@ -6415,11 +6416,14 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         };
         let dt1_3 = time::Local::now();
         if std::env::var("REST_DM_DIAG").is_ok() && scf_data.mol.ctrl.print_level > 1 {
-            println!("[dm-step] occupation={:.2}s density_matrix={:.2}s pcm={:.2}s homo_lumo+total_dt13={:.2}s",
+            println!("[dm-step] occupation={:.2}s density_matrix={:.2}s pcm={:.2}s homo_lumo={:.2}s | raw_total={:.2}s ts_dt13={:.2}s diff={:.2}s",
                 _dbg_t_occ.as_secs_f64(),
                 _dbg_t_dm.as_secs_f64(),
                 (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64/1000.0,
-                (dt1_3.timestamp_millis()-dt_solv1.timestamp_millis()) as f64/1000.0);
+                (dt1_3.timestamp_millis()-dt_solv1.timestamp_millis()) as f64/1000.0,
+                _dbg_raw_t0.elapsed().as_secs_f64(),
+                (dt1_3.timestamp_millis()-dt1_2.timestamp_millis()) as f64/1000.0,
+                _dbg_raw_t0.elapsed().as_secs_f64() - (dt1_3.timestamp_millis()-dt1_2.timestamp_millis()) as f64/1000.0);
         }
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         // ---- fresh-Fock validation gate ------------------------------------------------
