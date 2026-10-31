@@ -193,12 +193,16 @@ fn solve_columns(a: &MatrixFull<f64>, rhs: &[f64], naux: usize, ncol: usize) -> 
 
 /// Static screening data `W(0)` with the solved blocks (raw RI representation).
 ///
-/// The BSE transition space may be restricted to the lowest `nvir` virtual
-/// orbitals (`bse_cutoff_energy` approximation): the stored `qov`, `qvv`,
-/// `v_ia`, `u_ab` and `u_ia` blocks are in the *active* layout (virtual index
-/// counted inside the active window), while `gap_full`/`qov_full` keep the
-/// full-space response entering `D0 = J - Q0` (its derivative chains over all
-/// occupied-virtual pairs, not only the active ones).
+/// The BSE **transition space** may be restricted to an active window (the
+/// `bse_cutoff_energy` / `gradient_bse_nvir` approximation): the stored `qov`,
+/// `qvv`, `v_ia`, `u_ab` and `u_ia` blocks are in the *active* layout (indices
+/// counted inside the active window).
+///
+/// The **screening response** `D0 = J - Q0` is a different space: it runs over
+/// every occupied-virtual pair of the untruncated mean-field reference
+/// (`qov_full`/`gap_full`, `screen_nocc * nvir_full` columns), exactly like the
+/// BSE spectrum path.  Truncating the transition space must not change `W`, nor
+/// its derivative chain.
 pub struct BseScreening {
     /// **active** occupied orbitals (`occ_start .. occ_start + nocc`).  Deep
     /// core orbitals below the `bse_cutoff_energy` window are not in the
@@ -215,14 +219,26 @@ pub struct BseScreening {
     pub nvir: usize,
     /// all virtual orbitals of the mean-field reference
     pub nvir_full: usize,
+    /// first occupied orbital of the **screening response** (`mol.start_mo`, i.e.
+    /// 0 unless a frozen core is excluded from the correlation treatment)
+    pub screen_occ_start: usize,
+    /// occupied orbitals entering the screening response.  This is the **full**
+    /// occupied manifold of the mean-field reference, NOT the active transition
+    /// window: the RPA response (and hence `D0`, `W` and its derivative chain) is
+    /// built from every occupied-virtual pair of the untruncated space, exactly
+    /// as the BSE spectrum path does (`ri_bse::construct_inverse_dielectric` uses
+    /// `get_occupation_parameters(..., 'Y')`).  A truncated transition space only
+    /// selects *which rows/columns of A/B are kept*; it must not change the
+    /// screening.
+    pub screen_nocc: usize,
     pub naux: usize,
     /// active screening gaps de_ia = eps_a - eps_i (nov, ia = i + a*nocc)
     pub gap: Vec<f64>,
-    /// full-space screening gaps [naux-independent, nocc*nvir_full]
+    /// screening gaps over the untruncated space [screen_nocc*nvir_full]
     pub gap_full: Vec<f64>,
     /// active q_ia [naux, nov]
     pub qov: Vec<f64>,
-    /// full-space q_ia [naux, nocc*nvir_full] (D0 response sum)
+    /// screening q_ia over the untruncated space [naux, screen_nocc*nvir_full]
     pub qov_full: Vec<f64>,
     /// q_ij [naux, nocc^2]
     pub qoo: Vec<f64>,
@@ -248,7 +264,7 @@ impl BseScreening {
         nmo: usize,
         eps_screen: &[f64],
     ) -> BseScreening {
-        Self::build_from_parts_cutoff(q, j_mat, 0, nocc, nocc, nmo, nmo - nocc, eps_screen)
+        Self::build_from_parts_cutoff(q, j_mat, 0, nocc, nocc, nmo, nmo - nocc, eps_screen, 0)
     }
 
     /// Build the static screening with the BSE transition space restricted to
@@ -256,10 +272,13 @@ impl BseScreening {
     /// `nvir_act` lowest virtual orbitals starting at `vir_start` (the
     /// mean-field `nocc`, i.e. the HOMO+1).
     ///
-    /// The static RPA response `Q0` (and hence `D0` and its derivative chain)
-    /// runs over every occupied-virtual pair of the *active* space; only the
-    /// deep core orbitals below the `bse_cutoff_energy` window are left out of
-    /// it as well, which is the approximation that window makes.
+    /// The transition space (`occ_start`, `nocc`, `nvir_act`) only decides which
+    /// blocks are kept.  The static RPA response `Q0` -- hence `D0`, `W` and the
+    /// whole `D0` derivative chain -- runs over **every** occupied-virtual pair of
+    /// the untruncated mean-field space: occupied `screen_occ_start .. vir_start`
+    /// times all virtuals `vir_start .. nmo`.  The `bse_cutoff_energy` window is a
+    /// transition-space truncation and must not change the screening (the BSE
+    /// spectrum path builds the same full-space response).
     pub fn build_from_parts_cutoff(
         q: &[f64],
         j_mat: &MatrixFull<f64>,
@@ -269,6 +288,7 @@ impl BseScreening {
         nmo: usize,
         nvir_act: usize,
         eps_screen: &[f64],
+        screen_occ_start: usize,
     ) -> BseScreening {
         let naux = j_mat.size()[0];
         let nvir_full = nmo - vir_start;
@@ -276,18 +296,30 @@ impl BseScreening {
         assert!(nvir_act >= 1 && nvir_act <= nvir_full, "bse_grad: invalid active virtual count");
         let pair = |p: usize, q_mo: usize| p + q_mo * nmo;
 
-        let nov_full = nocc * nvir_full;
+        // screening (response) space: every occupied orbital of the reference
+        let screen_nocc = vir_start - screen_occ_start;
+        assert!(screen_nocc >= nocc && occ_start >= screen_occ_start,
+            "bse_grad: the screening response must span the whole occupied manifold");
+        let screen_off = occ_start - screen_occ_start;
+        let nov_full = screen_nocc * nvir_full;
         let nov = nocc * nvir_act;
         let mut qov_full = vec![0.0f64; naux * nov_full];
         for a in vir_start..nmo {
-            for i in 0..nocc {
-                let src = pair(occ_start + i, a) * naux;
-                let dst = (i + (a - vir_start) * nocc) * naux;
+            for i in 0..screen_nocc {
+                let src = pair(screen_occ_start + i, a) * naux;
+                let dst = (i + (a - vir_start) * screen_nocc) * naux;
                 qov_full[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
             }
         }
+        // active transition block (column `i + a*nocc`, `i` counted inside the window)
         let mut qov = vec![0.0f64; naux * nov];
-        qov.copy_from_slice(&qov_full[..naux * nov]);
+        for a in 0..nvir_act {
+            for i in 0..nocc {
+                let src = ((screen_off + i) + a * screen_nocc) * naux;
+                let dst = (i + a * nocc) * naux;
+                qov[dst..dst + naux].copy_from_slice(&qov_full[src..src + naux]);
+            }
+        }
         let mut qoo = vec![0.0f64; naux * nocc * nocc];
         for j in 0..nocc {
             for i in 0..nocc {
@@ -307,12 +339,14 @@ impl BseScreening {
         let mut gap_full = vec![0.0f64; nov_full];
         let mut gap = vec![0.0f64; nov];
         for a in vir_start..nmo {
+            for i in 0..screen_nocc {
+                let g = eps_screen[a] - eps_screen[screen_occ_start + i];
+                gap_full[i + (a - vir_start) * screen_nocc] = g;
+            }
+        }
+        for a in 0..nvir_act {
             for i in 0..nocc {
-                let g = eps_screen[a] - eps_screen[occ_start + i];
-                gap_full[i + (a - vir_start) * nocc] = g;
-                if a - vir_start < nvir_act {
-                    gap[i + (a - vir_start) * nocc] = g;
-                }
+                gap[i + a * nocc] = gap_full[(screen_off + i) + a * screen_nocc];
             }
         }
         if gap_full.iter().any(|&g| g <= 0.0) {
@@ -343,6 +377,8 @@ impl BseScreening {
             vir_start,
             nvir: nvir_act,
             nvir_full,
+            screen_occ_start,
+            screen_nocc,
             naux,
             gap,
             gap_full,
@@ -1610,7 +1646,7 @@ pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f6
 /// `dOmega/deps_a += bar_gap`.  Only the ACTIVE virtual columns are returned
 /// (inactive ones have no compact column); their `bar_gap` still enters `ebar`.
 pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>, Vec<f64>) {
-    let nocc = screen.nocc;
+    let nocc = screen.screen_nocc;
     let nvir = screen.nvir;
     let naux = screen.naux;
     let nov_full = nocc * screen.nvir_full;
@@ -1618,7 +1654,7 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
     // response of the inactive virtuals still enters `dOmega` through the
     // `eps1` channel even though those orbitals carry no amplitude weight.
     let nmo = screen.vir_start + screen.nvir_full;
-    let (os, vs) = (screen.occ_start, screen.vir_start);
+    let (os, vs) = (screen.screen_occ_start, screen.vir_start);
     let mut qbar_bov = vec![0.0f64; naux * nocc * screen.nvir_full];
     let mut ebar = vec![0.0f64; nmo];
     let dbar_m = to_mat(dbar, naux, naux);
@@ -1686,7 +1722,7 @@ fn chain_from_dbar(
     q_pair_layout: impl Fn(usize, usize) -> usize,
     nmo: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    let nocc = screen.nocc;
+    let nocc = screen.screen_nocc;
     let naux = screen.naux;
     let nov = nocc * screen.nvir_full;
     let mut qbar_bov = vec![0.0f64; naux * nmo * nmo];
@@ -1696,7 +1732,7 @@ fn chain_from_dbar(
     // column-split across the pool, as in `chain_from_dbar_compact`
     let q_times = gemm_nn_cols_par(&dbar_m, &screen.qov_full, naux, nov, -1.0);
     for c in 0..nov {
-        let i = screen.occ_start + c % nocc;
+        let i = screen.screen_occ_start + c % nocc;
         let a = screen.vir_start + c / nocc;
         let inv_gap = 1.0 / screen.gap_full[c];
         let col = q_pair_layout(i, a) * naux;
@@ -2434,6 +2470,7 @@ impl<'a> BseGradEngine<'a> {
         let screen = gw.with_q(|q| {
             BseScreening::build_from_parts_cutoff(
                 q, &gw.j_mat, occ_start, nocc_act, vir_start, gw.nmo, nvir_act, &eps_screen,
+                scf.mol.start_mo,
             )
         });
         let kappa = match multi {
@@ -2489,6 +2526,7 @@ impl<'a> BseGradEngine<'a> {
         self.screen = self.gw.with_q(|q| {
             BseScreening::build_from_parts_cutoff(
                 q, &self.gw.j_mat, occ_start, nocc, vir_start, nmo, nvir_act, &self.eps_screen,
+                self.gw.scf.mol.start_mo,
             )
         });
     }
@@ -2506,6 +2544,7 @@ impl<'a> BseGradEngine<'a> {
         self.screen = self.gw.with_q(|q| {
             BseScreening::build_from_parts_cutoff(
                 q, &self.gw.j_mat, occ_start, nocc, vir_start, nmo, nvir_act, &eps,
+                self.gw.scf.mol.start_mo,
             )
         });
     }
@@ -3537,6 +3576,8 @@ mod layout_tests {
             vir_start: nocc,
             nvir,
             nvir_full,
+            screen_occ_start: 0,
+            screen_nocc: nocc,
             naux,
             gap: (0..nov).map(|_| 0.5 + rnd(&mut seed)).collect(),
             gap_full: (0..nov_full).map(|_| 0.4 + rnd(&mut seed)).collect(),
@@ -3589,6 +3630,8 @@ mod layout_tests {
             vir_start: nocc,
             nvir,
             nvir_full,
+            screen_occ_start: 0,
+            screen_nocc: nocc,
             naux,
             gap: (0..nov).map(|_| 0.5 + rnd(&mut seed)).collect(),
             gap_full: (0..nocc * nvir_full).map(|_| 0.4 + rnd(&mut seed)).collect(),
