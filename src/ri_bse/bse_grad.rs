@@ -489,6 +489,129 @@ fn metric_norm(x: &[f64], y: &[f64], dim: usize) -> f64 {
 /// Solve the full (non-TDA) BSE eigenproblem densely through the
 /// nonsymmetric squared product `(A-B)(A+B) u = omega^2 u`.
 /// Returns the `nroots` lowest metric-normalised roots.
+/// Matrix-free `A X` for the TDA BSE Hamiltonian.
+///
+/// Reproduces the `A` of [`build_bse_matrices`] exactly,
+///
+/// ```text
+/// A[ia,jb] = gap_ia delta - kappa (qov^T v_ia)[ia,jb] - w_a[(i,j),(a,b)] - w_b[(i,b),(j,a)]
+/// ```
+///
+/// without ever forming a `dim^2` object: the Coulomb term is two GEMMs against
+/// the `naux x dim` tensors, and each kernel block is a per-auxiliary-basis pair
+/// of small GEMMs (`nocc^2 nvir` and `nvir^2 nocc` flops per `P` and column).
+/// Extra memory is `O(naux * dim)` instead of `O(dim^2)`.
+fn tda_matvec_free(
+    screen: &BseScreening,
+    qp_energies: &[f64],
+    kappa: f64,
+    x: &MatrixFull<f64>,
+) -> MatrixFull<f64> {
+    let (nocc, nvir, naux) = (screen.nocc, screen.nvir, screen.naux);
+    let dim = nocc * nvir;
+    let ncol = x.size[1];
+    let mut y = MatrixFull::new([dim, ncol], 0.0);
+    for c in 0..ncol {
+        for ia in 0..dim {
+            let i = ia % nocc;
+            let a = ia / nocc;
+            let g = qp_energies[screen.vir_start + a] - qp_energies[screen.occ_start + i];
+            y.data[ia + c * dim] = g * x.data[ia + c * dim];
+        }
+    }
+    {
+        let qov = to_mat(&screen.qov, naux, dim);
+        let via = to_mat(&screen.v_ia, naux, dim);
+        let mut t = MatrixFull::new([naux, ncol], 0.0);
+        // t = v_ia * X  (naux x ncol), then Y += kappa * qov^T t
+        _dgemm_full(&via, 'N', x, 'N', &mut t, 1.0, 0.0);
+        _dgemm_full(&qov, 'T', &t, 'N', &mut y, kappa, 1.0);
+    }
+    let mut qblk = vec![0.0f64; nocc * nocc];
+    let mut vblk = vec![0.0f64; nvir * nvir];
+    let mut mblk = vec![0.0f64; dim];
+    let mut gblk = vec![0.0f64; dim];
+    let mut xs = vec![0.0f64; dim];
+    let mut u = vec![0.0f64; dim];
+    let mut s = vec![0.0f64; nvir * nvir];
+    let mut t = vec![0.0f64; dim];
+    let mut t2 = vec![0.0f64; dim];
+    for p in 0..naux {
+        for c in 0..nocc * nocc {
+            qblk[c] = screen.qoo[p + c * naux];
+        }
+        for c in 0..nvir * nvir {
+            vblk[c] = screen.u_ab[p + c * naux];
+        }
+        for c in 0..dim {
+            mblk[c] = screen.u_ia[p + c * naux];
+            gblk[c] = screen.qov[p + c * naux];
+        }
+        for col in 0..ncol {
+            for c in 0..dim {
+                xs[c] = x.data[c + col * dim];
+            }
+            let q = to_mat(&qblk, nocc, nocc);
+            let xm = to_mat(&xs, nocc, nvir);
+            let mut um = to_mat(&mut u, nocc, nvir);
+            _dgemm_full(&q, 'N', &xm, 'N', &mut um, 1.0, 0.0);
+            let v = to_mat(&vblk, nvir, nvir);
+            let mut tm = to_mat(&mut t, nocc, nvir);
+            _dgemm_full(&to_mat(&u, nocc, nvir), 'N', &v, 'T', &mut tm, 1.0, 0.0);
+            let mt = to_mat(&mblk, nocc, nvir);
+            let mut sm = to_mat(&mut s, nvir, nvir);
+            _dgemm_full(&mt, 'T', &xm, 'N', &mut sm, 1.0, 0.0);
+            let gt = to_mat(&gblk, nocc, nvir);
+            let mut t2m = to_mat(&mut t2, nocc, nvir);
+            _dgemm_full(&gt, 'N', &to_mat(&s, nvir, nvir), 'T', &mut t2m, 1.0, 0.0);
+            for c in 0..dim {
+                y.data[c + col * dim] -= t[c] + t2[c];
+            }
+        }
+    }
+    y
+}
+
+/// Solve the TDA BSE problem with the matrix-free Davidson solver.
+///
+/// Returns `None` if the solver does not deliver `nroots` roots, so the caller
+/// can fall back to the dense Hermitian route.
+pub fn solve_bse_tda_davidson(
+    screen: &BseScreening,
+    qp_energies: &[f64],
+    kappa: f64,
+    nroots: usize,
+    config: &crate::solvers::davidson::DavidsonConfig,
+) -> Option<Vec<(f64, Vec<f64>, Vec<f64>)>> {
+    let (nocc, nvir) = (screen.nocc, screen.nvir);
+    let dim = nocc * nvir;
+    let diag: Vec<f64> = (0..dim)
+        .map(|c| {
+            let i = c % nocc;
+            let a = c / nocc;
+            qp_energies[screen.vir_start + a] - qp_energies[screen.occ_start + i]
+        })
+        .collect();
+    let nrun = (nroots + 2).min(dim);
+    let guess = crate::solvers::davidson::generate_initial_guess(&diag, nrun);
+    let mut mv = |z: &MatrixFull<f64>| tda_matvec_free(screen, qp_energies, kappa, z);
+    let mut pairs = crate::solvers::davidson::davidson_solver_batched(
+        &mut mv, nrun, &diag, guess, config,
+    );
+    pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    if pairs.len() < nroots {
+        eprintln!(
+            "[bse_grad] matrix-free TDA Davidson returned only {} of {} roots (dim={dim}); \
+             falling back to the dense TDA solver",
+            pairs.len(),
+            nroots
+        );
+        return None;
+    }
+    pairs.truncate(nroots);
+    Some(pairs.into_iter().map(|(omega, x)| (omega, x, vec![0.0f64; dim])).collect())
+}
+
 /// Solve the **TDA** (Hermitian) BSE problem densely.
 ///
 /// With `A` symmetric the excitation energies are simply the eigenvalues of `A`
@@ -2157,10 +2280,29 @@ impl<'a> BseGradEngine<'a> {
     /// Solve for the lowest `nroots` excitation energies.
     pub fn solve(&mut self, nroots: usize, solver: BseSolver, config: &DavidsonConfig) {
         self.ensure_screening();
-        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let dim = self.screen.nocc * self.screen.nvir;
         if self.tda {
-            // Hermitian problem: always defined, no `A-B` factorisation.
+            // Hermitian problem: no `A-B` factorisation.  Large spaces go through
+            // the **matrix-free** Davidson, which never materialises `dim^2`; the
+            // dense `dsyevd` stays for small spaces and as the fallback.
+            if matches!(solver, BseSolver::Davidson) && dim > 128 {
+                if let Some(pairs) =
+                    solve_bse_tda_davidson(&self.screen, &self.qp_energies, self.kappa, nroots, config)
+                {
+                    self.solver_used = "tda-davidson-free";
+                    self.roots = pairs
+                        .into_iter()
+                        .map(|(omega, x, y)| BseRoot { omega, x, y })
+                        .collect();
+                    return;
+                }
+                eprintln!(
+                    "[bse_grad] matrix-free TDA Davidson did not deliver {nroots} roots \
+                     (dim={dim}); using the dense TDA solver"
+                );
+            }
+            let (a_mat, _b_mat) =
+                build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
             self.solver_used = "tda-dense";
             self.roots = solve_bse_tda_dense(&a_mat, dim, nroots)
                 .into_iter()
@@ -2168,6 +2310,7 @@ impl<'a> BseGradEngine<'a> {
                 .collect();
             return;
         }
+        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let (pairs, used) = match solver {
             BseSolver::Dense => (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense"),
             // The Davidson path is wrapped: on an indefinite `A-B` its internal
