@@ -688,6 +688,19 @@ fn report_solver_check(
             num / den
         );
     }
+    // 1b. the lowest eigenvalues of the dense A itself: a truncated static kernel
+    // can make the TDA Hamiltonian indefinite, and that is what the positive-root
+    // filter of both routes is for.
+    {
+        let (_, vals, _) = _dsyevd(&to_mat(&a_mat, dim, dim), 'N');
+        let n_nonpos = vals.iter().filter(|v| **v <= 1.0e-10).count();
+        let n_show = vals.len().min(6);
+        eprintln!(
+            "[bse_grad check] lowest eigenvalues of A: {}  ({} non-positive of {dim})",
+            vals[..n_show].iter().map(|v| format!("{v:+.6}")).collect::<Vec<_>>().join(" "),
+            n_nonpos
+        );
+    }
     // 2. root-by-root comparison with the dense solver.  Both equations are
     // checked for both routes: a vector that satisfies only one of them is not a
     // BSE eigenpair (the dense route's inverse-iteration refinement can drift to
