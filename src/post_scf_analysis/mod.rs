@@ -776,7 +776,14 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     ri_bse::bse_grad::BseSolver::Davidson
                 };
                 let mut dcfg = crate::solvers::davidson::DavidsonConfig::default();
-                dcfg.max_subspace = 200;
+                // `collect_sol_num` is `min(subspace, add_dim)` on every
+                // non-restart iteration, so a default `add_dim = 2` silently
+                // collects two Ritz pairs no matter how many roots were asked
+                // for ("only 2 trial vectors for 7 roots").  Size the expansion
+                // and the restart window from the number of roots instead.
+                dcfg.add_dim = dcfg.add_dim.max(nroots + 2);
+                dcfg.restart_dim = dcfg.restart_dim.max(nroots + 2);
+                dcfg.max_subspace = dcfg.max_subspace.max(12 * (nroots + 2)).max(200);
                 dcfg.max_iter = 400;
                 bse.solve(nroots, solver, &dcfg);
                 for (k, om) in bse.excitation_energies().iter().enumerate() {
@@ -804,18 +811,34 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     );
                     return bse_output;
                 }
+                // `gradient_only_state`: solve `nroots` roots (the spectrum the
+                // card asked for) but assemble the gradient of `gradient_state`
+                // alone.  Each extra assembled root costs a full fold + adjoint
+                // solve; an optimiser reads one.
+                let only = qp_ctrl.gradient_only_state
+                    && qp_ctrl.gradient_state < bse.roots.len();
+                if only {
+                    bse.set_grad_roots(Some(vec![qp_ctrl.gradient_state]));
+                }
                 bse.analytic_gradients()
             };
             let state = qp_ctrl.gradient_state;
+            // with `gradient_only_state` the returned vector holds that root alone;
+            // without it, every solved root was assembled and `grads[state]` is it.
+            let g_state = if qp_ctrl.gradient_only_state && grads.len() == 1 {
+                grads[0].clone()
+            } else {
+                grads[state].clone()
+            };
             println!(
                 "BSE analytic gradient requested for root {state} (omega = {:.12} Ha = {:.6} eV)",
                 omegas[state], omegas[state] * 27.211386245988
             );
-            report_analytic_gradient(scf_data, &format!("BSE_ROOT{state}"), &grads[state]);
+            report_analytic_gradient(scf_data, &format!("BSE_ROOT{state}"), &g_state);
             report_state_and_total_gradient(
                 scf_data,
                 &format!("BSE_ROOT{state}"),
-                &grads[state].clone(),
+                &g_state,
             );
         }
     }else{

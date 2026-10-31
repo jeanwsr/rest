@@ -39,6 +39,11 @@ pub struct QuasiParticle {
     pub davidson_max_iter:usize,
     pub davidson_add_dimensions:usize,
     pub bse_tda:bool,
+    /// Assemble the analytic gradient of **only** `gradient_state`, although
+    /// `gradient_nroots` roots are solved.  The gradient of every solved root
+    /// otherwise costs a full fold + adjoint solve each (~120 s per extra root
+    /// on DA1), and an optimiser reads one of them.
+    pub gradient_only_state:bool,
     pub print_nto:bool,
     /// BSE switch / spin channel.
     ///
@@ -786,6 +791,7 @@ impl Default for QuasiParticle {
             davidson_add_dimensions:6,
             davidson_max_iter:100,
             bse_tda:false,
+            gradient_only_state:false,
             print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
@@ -997,6 +1003,7 @@ impl QuasiParticle {
         table.insert("davidson_add_dimensions".to_string(), toml::Value::Integer(self.davidson_add_dimensions as i64));
         table.insert("davidson_max_iter".to_string(), toml::Value::Integer(self.davidson_max_iter as i64));
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
+        table.insert("gradient_only_state".to_string(), toml::Value::Boolean(self.gradient_only_state));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
         table.insert("bse_cutoff_energy".to_string(), toml::Value::Float(self.bse_cutoff_energy));
         table.insert("bse_active_occ_start".to_string(), toml::Value::Integer(self.bse_active_occ_start));
@@ -1319,6 +1326,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.gradient_only_state = match tmp_ctrl.get("gradient_only_state").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };

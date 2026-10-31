@@ -8705,6 +8705,31 @@ impl<'a> GwCdGradEngine<'a> {
         let t_a = Instant::now();
         for (j, cache) in caches.iter().enumerate() {
             let n = cache.target;
+            // `g_ni = J^-1 q_ni` and `sum_i g_ni g_ni^T` do not depend on the BSE
+            // state `k`, so they are built once per cache instead of once per
+            // `(k, i)`.  The rank-1 sum is one GEMM (`G G^T`): the scalar form
+            // wrote the whole `naux^2` buffer once per occupied orbital with
+            // stride-`naux` stores -- the pattern that was already removed from
+            // `qp_pullback_chunk` (see the note there), but had been left here.
+            // `g_ni` also goes through the Cholesky factor
+            // (`solve_metric_batch`) rather than two `S = J^-1/2` GEMMs, which
+            // halves the flops of this loop and stops allocating per pair.
+            let exch = (1.0 - base.fock_hyb).abs() > 1.0e-14;
+            let (gmat, gg) = if exch {
+                let na = naux;
+                let mut gm = MatrixFull::new([na, nocc], 0.0);
+                for i in 0..nocc {
+                    let qni = base.with_q(|q| base.gather_pair(q, n, i));
+                    let mut g = qni;
+                    base.solve_metric_batch(&mut g, 1);
+                    gm.data[i * na..(i + 1) * na].copy_from_slice(&g);
+                }
+                let mut g2 = MatrixFull::new([na, na], 0.0);
+                _dgemm_full(&gm, 'N', &gm, 'T', &mut g2, 1.0, 0.0);
+                (Some(gm), Some(g2))
+            } else {
+                (None, None)
+            };
             for k in 0..nk {
                 let c = weights[k][j] * cache.z_factor;
                 if c == 0.0 {
@@ -8732,21 +8757,18 @@ impl<'a> GwCdGradEngine<'a> {
                 // then already sits in `e_n`).  Mirrors the LR pullback
                 // (`qp_pullback_chunk`); Omitting it made every DFT reference's
                 // full-CD gradient wrong by the exchange-derivative term.
-                if (1.0 - base.fock_hyb).abs() > 1.0e-14 {
+                if let (Some(gm), Some(g2)) = (gmat.as_ref(), gg.as_ref()) {
                     let na = naux;
                     let ex_scale = c * (1.0 - base.fock_hyb);
                     for i in 0..nocc {
-                        let qni = base.with_q(|q| base.gather_pair(q, n, i));
-                        let g_ni = base.metric_solve(&qni, 1);
                         let col_i = self.pair_col(n, i) * na;
+                        let g_ni = &gm.data[i * na..(i + 1) * na];
                         for p in 0..na {
                             bq[k][col_i + p] -= 2.0 * ex_scale * g_ni[p];
                         }
-                        for p in 0..na {
-                            for q in 0..na {
-                                bj[k][p + q * na] += ex_scale * g_ni[p] * g_ni[q];
-                            }
-                        }
+                    }
+                    for (d, s) in bj[k].iter_mut().zip(g2.data.iter()) {
+                        *d += ex_scale * s;
                     }
                 }
                 if !do_static {
