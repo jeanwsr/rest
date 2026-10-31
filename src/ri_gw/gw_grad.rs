@@ -9405,6 +9405,12 @@ impl GwGradEngine<'_> {
         let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
         let dft_mask = dft_debug_mask();
 
+        // Timer for the whole covector assembly, sections (a)/(a2)/(b).  It must
+        // start *here*: the reported `timings[0]` used to be measured from a
+        // point after this work, so "[gw_grad timing] adjoint: covectors" always
+        // printed 0.00 s and hid the largest single piece of the adjoint.
+        let t_covectors = Instant::now();
+
         // ---- (a) MO covectors Lambda, Lambda_s ---------------------------
         let mut lam = vec![0.0f64; nmo * nmo];
         let mut lams = vec![0.0f64; nmo * nmo];
@@ -9621,7 +9627,7 @@ impl GwGradEngine<'_> {
         let mut resp = rscf_resp_interface(self.scf, &config);
         timings[1] = t_setup.elapsed().as_secs_f64();
 
-        timings[0] = t_all.elapsed().as_secs_f64() - t_setup.elapsed().as_secs_f64();
+        timings[0] = t_covectors.elapsed().as_secs_f64();
         let t_rhs = Instant::now();
         let rhs_full_opt = {
             let nuc_list: Vec<&mut dyn HessNucAPI> = Vec::new();
