@@ -783,20 +783,54 @@ pub fn solve_bse_tda_davidson(
     let energy_diag = crate::ri_bse::construct_energy_diag_for_a_window(
         &qp_energies.to_vec(), screen.occ_start, nocc, screen.vir_start, nvir,
     );
-    let guess = generate_initial_guess(&energy_diag, nroots);
     let mut a = |z: &Vec<f64>| {
         matvec::a_block_matvec_window(
             &qp_ctrl, &t.energies, nocc, nvir, spin, &t.ri_vv, &t.ri_ov, &t.ri_oo_tilde, z,
         )
     };
-    let mut pairs = tda_davidson_solver(&mut a, nroots, &energy_diag, guess, config);
-    pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    if pairs.len() < nroots {
-        eprintln!(
-            "[bse_grad] matrix-free TDA Davidson returned {} of {nroots} roots (dim={dim})",
-            pairs.len()
+    // A truncated TDA Hamiltonian can be **indefinite** (the screened kernel
+    // `-W` of a long alkene makes `A` negative at strong coupling), and the
+    // Davidson returns the algebraically lowest Ritz values, so a negative
+    // eigenvalue would be reported as "root 0" -- the dense route drops them
+    // (`_dsyevd` eigenvalues `> 1e-10`).  Ask for as many extra roots as there
+    // are non-positive ones and keep the lowest **positive** roots, exactly what
+    // `solve_bse_tda_dense` does.
+    let mut nreq = nroots;
+    let mut pairs;
+    let mut n_dropped = 0usize;
+    loop {
+        let guess = generate_initial_guess(&energy_diag, nreq);
+        let mut p = tda_davidson_solver(&mut a, nreq, &energy_diag, guess, config);
+        p.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        if p.len() != nreq {
+            eprintln!(
+                "[bse_grad] matrix-free TDA Davidson returned {} of {nreq} roots (dim={dim})",
+                p.len()
+            );
+            return None;
+        }
+        let before = p.len();
+        p.retain(|(omega, _)| *omega > 1.0e-10);
+        n_dropped = before - p.len();
+        if p.len() >= nroots {
+            pairs = p;
+            break;
+        }
+        if nreq >= dim {
+            eprintln!(
+                "[bse_grad] matrix-free TDA Davidson found only {} positive roots of {nroots} \
+                 requested (dim={dim}); is the BSE kernel stable?",
+                p.len()
+            );
+            return None;
+        }
+        nreq = (nreq + n_dropped.max(1) + 2).min(dim);
+    }
+    if n_dropped > 0 {
+        println!(
+            "[bse_grad] TDA Davidson: {n_dropped} non-positive eigenvalue(s) of A discarded \
+             (indefinite truncated kernel); the lowest {nroots} positive roots are kept"
         );
-        return None;
     }
     pairs.truncate(nroots);
     // Reject unconverged Ritz pairs: the pullback would differentiate a vector
