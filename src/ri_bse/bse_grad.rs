@@ -56,9 +56,10 @@ use rest_tensors::matrix::matrix_blas_lapack::_dsyevd;
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix::BasicMatrix;
 
+use crate::ri_bse::matvec;
 use crate::ri_cphf::CPHFSolverPySCF;
 use crate::solvers::davidson::{
-    generate_initial_guess, lr_davidson_solver_batched, DavidsonConfig,
+    generate_initial_guess, lr_davidson_solver, tda_davidson_solver, DavidsonConfig,
 };
 
 use std::time::Instant;
@@ -486,123 +487,418 @@ fn metric_norm(x: &[f64], y: &[f64], dim: usize) -> f64 {
     m.sqrt()
 }
 
-/// Solve the full (non-TDA) BSE eigenproblem densely through the
-/// nonsymmetric squared product `(A-B)(A+B) u = omega^2 u`.
-/// Returns the `nroots` lowest metric-normalised roots.
-/// Matrix-free `A X` for the TDA BSE Hamiltonian.
+// ---------------------------------------------------------------------------
+// matrix-free BSE solvers (the ones the BSE spectrum path uses)
+// ---------------------------------------------------------------------------
+
+/// The RI blocks consumed by [`crate::ri_bse::matvec`], in **exactly** the
+/// layout the BSE spectrum path builds them in (`ri_bse::bse_both_spins`).
 ///
-/// Reproduces the `A` of [`build_bse_matrices`] exactly,
-///
-/// ```text
-/// A[ia,jb] = gap_ia delta - kappa (qov^T v_ia)[ia,jb] - w_a[(i,j),(a,b)] - w_b[(i,b),(j,a)]
-/// ```
-///
-/// without ever forming a `dim^2` object: the Coulomb term is two GEMMs against
-/// the `naux x dim` tensors, and each kernel block is a per-auxiliary-basis pair
-/// of small GEMMs (`nocc^2 nvir` and `nvir^2 nocc` flops per `P` and column).
-/// Extra memory is `O(naux * dim)` instead of `O(dim^2)`.
-fn tda_matvec_free(
-    screen: &BseScreening,
-    qp_energies: &[f64],
-    kappa: f64,
-    x: &MatrixFull<f64>,
-) -> MatrixFull<f64> {
-    let (nocc, nvir, naux) = (screen.nocc, screen.nvir, screen.naux);
-    let dim = nocc * nvir;
-    let ncol = x.size[1];
-    let mut y = MatrixFull::new([dim, ncol], 0.0);
-    for c in 0..ncol {
-        for ia in 0..dim {
-            let i = ia % nocc;
-            let a = ia / nocc;
-            let g = qp_energies[screen.vir_start + a] - qp_energies[screen.occ_start + i];
-            y.data[ia + c * dim] = g * x.data[ia + c * dim];
-        }
-    }
-    {
-        let qov = to_mat(&screen.qov, naux, dim);
-        let via = to_mat(&screen.v_ia, naux, dim);
-        let mut t = MatrixFull::new([naux, ncol], 0.0);
-        // t = v_ia * X  (naux x ncol), then Y += kappa * qov^T t
-        _dgemm_full(&via, 'N', x, 'N', &mut t, 1.0, 0.0);
-        _dgemm_full(&qov, 'T', &t, 'N', &mut y, kappa, 1.0);
-    }
-    // NOTE: `to_mat` *copies* (`MatrixFull::from_vec(v.to_vec())`), so every
-    // output buffer has to be a real `MatrixFull`; handing it `to_mat(&mut buf)`
-    // would write into a temporary.
-    let mut qblk = MatrixFull::new([nocc, nocc], 0.0);
-    let mut vblk = MatrixFull::new([nvir, nvir], 0.0);
-    let mut mblk = MatrixFull::new([nocc, nvir], 0.0);
-    let mut gblk = MatrixFull::new([nocc, nvir], 0.0);
-    let mut u = MatrixFull::new([nocc, nvir], 0.0);
-    let mut s = MatrixFull::new([nvir, nvir], 0.0);
-    let mut t = MatrixFull::new([nocc, nvir], 0.0);
-    let mut t2 = MatrixFull::new([nocc, nvir], 0.0);
-    for p in 0..naux {
-        for c in 0..nocc * nocc {
-            qblk.data[c] = screen.qoo[p + c * naux];
-        }
-        for c in 0..nvir * nvir {
-            vblk.data[c] = screen.u_ab[p + c * naux];
-        }
-        for c in 0..dim {
-            mblk.data[c] = screen.u_ia[p + c * naux];
-            gblk.data[c] = screen.qov[p + c * naux];
-        }
-        for col in 0..ncol {
-            let xm = to_mat(&x.data[col * dim..(col + 1) * dim], nocc, nvir);
-            // W_A: u = q[X], t = u * v^T
-            _dgemm_full(&qblk, 'N', &xm, 'N', &mut u, 1.0, 0.0);
-            _dgemm_full(&u, 'N', &vblk, 'T', &mut t, 1.0, 0.0);
-            // W_B: s = m^T [X], t2 = g * s^T
-            _dgemm_full(&mblk, 'T', &xm, 'N', &mut s, 1.0, 0.0);
-            _dgemm_full(&gblk, 'N', &s, 'T', &mut t2, 1.0, 0.0);
-            for c in 0..dim {
-                y.data[c + col * dim] -= t.data[c] + t2.data[c];
-            }
-        }
-    }
-    y
+/// The gradient used to carry its own Davidson implementation and its own
+/// matvec, expressed in the screening layout of [`BseScreening`].  That was a
+/// second operator with its own algebra; the solvers below apply the *same*
+/// operator the spectrum path applies, so a gradient card and a spectrum card
+/// with the same keywords solve the same eigenvalue problem by construction.
+struct BseMatvecTensors {
+    /// `[naux*nvir, nvir]` virtual-virtual block (`q_vv`, reshaped)
+    ri_vv: MatrixFull<f64>,
+    /// `[naux, nocc*nvir]` occupied-virtual block (`q_ov`)
+    ri_ov: MatrixFull<f64>,
+    /// `[nocc*naux, nocc]` `D^-1 q_oo`, transposed into the A-block layout
+    ri_oo_tilde: MatrixFull<f64>,
+    /// `[naux*nocc, nvir]` `q_ov` reshaped for the B-block contraction
+    ri_ov_b: MatrixFull<f64>,
+    /// `[naux*nocc, nvir]` `D^-1 q_ov` reshaped for the B-block contraction
+    ri_ov_tilde: MatrixFull<f64>,
+    /// compact orbital energies `[nocc | nvir]` of the transition window
+    energies: Vec<f64>,
 }
 
-/// Solve the TDA BSE problem with the matrix-free Davidson solver.
+impl BseMatvecTensors {
+    fn bytes(&self) -> usize {
+        8 * (self.ri_vv.data.len()
+            + self.ri_ov.data.len()
+            + self.ri_oo_tilde.data.len()
+            + self.ri_ov_b.data.len()
+            + self.ri_ov_tilde.data.len()
+            + self.energies.len())
+    }
+}
+
+/// Build the spectrum path's RI blocks for **this gradient's** transition
+/// window and screening energies.
 ///
-/// Returns `None` if the solver does not deliver `nroots` roots, so the caller
-/// can fall back to the dense Hermitian route.
-pub fn solve_bse_tda_davidson(
+/// Returns `None` (and the caller keeps the dense solver) when the window the
+/// spectrum path would build from the card's `bse_cutoff_energy` /
+/// `bse_active_occ_start` / `bse_active_vir_end` keywords is not the window this
+/// gradient actually differentiates — for example when the card pins a fixed
+/// *count* of virtuals through `gradient_bse_nvir`.  Solving a different
+/// operator than the one the pullback differentiates would silently produce
+/// wrong gradients, so the mismatch is a fallback, never a silent substitution.
+fn build_matvec_tensors(
+    scf: &SCF,
+    screen: &BseScreening,
+    qp_energies: &[f64],
+    eps_screen: &[f64],
+) -> Option<BseMatvecTensors> {
+    let (occ_start, nocc, vir_start, nvir) =
+        (screen.occ_start, screen.nocc, screen.vir_start, screen.nvir);
+    let nvir_full = screen.nvir_full;
+    let naux = screen.naux;
+
+    // The scripted (non-gradient) BSE path applies `bse_exchange_rescaling` to
+    // the kernel blocks; the dense gradient matrices do not.  They coincide at
+    // the default value, otherwise the two operators differ and this route must
+    // not be taken.
+    let rescaling = scf.mol.ctrl.quasiparticle_methods.as_ref()
+        .map(|qp| qp.bse_exchange_rescaling).unwrap_or(1.0);
+    if (rescaling - 1.0).abs() > 1.0e-12 {
+        eprintln!(
+            "[bse_grad] matrix-free BSE Davidson: bse_exchange_rescaling = {rescaling} is applied \
+             by the spectrum path but not by the gradient's dense BSE matrices; this card keeps \
+             the dense solver"
+        );
+        return None;
+    }
+
+    // Every block is sliced over **this gradient's** window, so the operator
+    // below is the one the pullback differentiates no matter how the card's
+    // `bse_cutoff_energy` / `gradient_bse_nvir` keywords compare.
+    let occ_range = occ_start..vir_start;
+    let vir_range = vir_start..vir_start + nvir;
+    let vir_full_range = vir_start..vir_start + nvir_full;
+
+    // `D0^-1` over the gradient's response pair space: the active occupied
+    // window times *all* virtuals, dressed with the gradient's screening
+    // energies (`response_matrix` takes a compact `[occ | vir]` energy vector).
+    let mut eps_compact = Vec::with_capacity(nocc + nvir_full);
+    eps_compact.extend_from_slice(&eps_screen[occ_start..occ_start + nocc]);
+    eps_compact.extend_from_slice(&eps_screen[vir_start..vir_start + nvir_full]);
+    let ri_ov_full = crate::ri_bse::get_submatrix_window(
+        scf, 'O', 'V', occ_range.clone(), vir_full_range.clone(), 'Y');
+    let response = crate::ri_gw::response_matrix(
+        &eps_compact, nocc, nvir_full, &ri_ov_full, 0.0, 'R', 0.0,
+    );
+    drop(ri_ov_full);
+    let inverse_dielectric = crate::ri_gw::inverse_dielectric_matrix(response, 'R');
+    assert_eq!(
+        inverse_dielectric.size[0], naux,
+        "bse_grad: the inverse dielectric of the response space has {} auxiliary functions, \
+         the screening was built with a different auxiliary space",
+        inverse_dielectric.size[0]
+    );
+
+    let ri_ov = crate::ri_bse::get_submatrix_window(
+        scf, 'O', 'V', occ_range.clone(), vir_range.clone(), 'N');
+    let ri_oo = crate::ri_bse::get_submatrix_window(
+        scf, 'O', 'O', occ_range.clone(), occ_range, 'N');
+    let mut ri_vv = crate::ri_bse::get_submatrix_window(
+        scf, 'V', 'V', vir_range.clone(), vir_range.clone(), 'N');
+    let mut ri_oo_tilde = MatrixFull::new(ri_oo.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
+    drop(ri_oo);
+    ri_oo_tilde.reshape([naux * nocc, nocc]);
+    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
+    ri_oo_tilde.reshape([nocc * naux, nocc]);
+    ri_vv.reshape([naux * nvir, nvir]);
+    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    drop(inverse_dielectric);
+    ri_ov_tilde.reshape([naux * nocc, nvir]);
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([naux * nocc, nvir]);
+    assert_eq!(
+        (ri_ov.data.len(), ri_vv.data.len(), ri_oo_tilde.data.len()),
+        (naux * nocc * nvir, naux * nvir * nvir, naux * nocc * nocc),
+        "bse_grad: unexpected RI block sizes for the matrix-free BSE solver"
+    );
+
+    // The A-block diagonal is the QP gap of the transition window, i.e. the
+    // energies the *gradient* differentiates (not the screening energies).
+    let mut energies = Vec::with_capacity(nocc + nvir);
+    energies.extend_from_slice(&qp_energies[occ_start..occ_start + nocc]);
+    energies.extend_from_slice(&qp_energies[vir_start..vir_start + nvir]);
+
+    let t = BseMatvecTensors {
+        ri_vv,
+        ri_ov,
+        ri_oo_tilde,
+        ri_ov_b,
+        ri_ov_tilde,
+        energies,
+    };
+    if grad_timing() {
+        eprintln!(
+            "[bse_mat timing] matrix-free RI blocks {:.1} MB",
+            t.bytes() as f64 / 1048576.0
+        );
+    }
+    Some(t)
+}
+
+/// `true` when the caller asked for the dense solver even where the matrix-free
+/// one is available (`REST_BSE_FORCE_DENSE=1`).  Validation switch: running one
+/// card twice must give the same `BSE_ROOT<n>` gradient.
+fn force_dense_solver() -> bool {
+    std::env::var("REST_BSE_FORCE_DENSE").map_or(false, |v| v != "0")
+}
+
+/// `true` when `REST_BSE_SOLVER_CHECK=1`: after a matrix-free solve, solve the
+/// same card densely and print how far the two operators and their roots are
+/// apart.  This is the equivalence proof between "the gradient's Davidson" and
+/// the dense route; it costs one extra `dim^2` diagonalisation.
+fn solver_check_requested() -> bool {
+    std::env::var("REST_BSE_SOLVER_CHECK").map_or(false, |v| v != "0")
+}
+
+/// Compare a matrix-free solve with the dense one on the same card
+/// (see [`solver_check_requested`]).
+fn report_solver_check(
     screen: &BseScreening,
     qp_energies: &[f64],
     kappa: f64,
+    roots: &[(f64, Vec<f64>, Vec<f64>)],
+    matvec_a: &dyn Fn(&Vec<f64>) -> Vec<f64>,
+    matvec_b: Option<&dyn Fn(&Vec<f64>) -> Vec<f64>>,
+) {
+    let dim = screen.nocc * screen.nvir;
+    let (a_mat, b_mat) = build_bse_matrices(screen, qp_energies, kappa);
+    // 1. operator identity on a deterministic pseudo-random vector
+    let mut z = vec![0.0f64; dim];
+    let mut state = 0x2545f4914f6cdd1du64;
+    for v in z.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *v = ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+    }
+    let az = gemm_nn(&a_mat, dim, dim, &z, dim, 1);
+    let mz = matvec_a(&z);
+    let num = az.iter().zip(mz.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+    let den = az.iter().map(|a| a.abs()).fold(0.0f64, f64::max).max(1.0e-300);
+    eprintln!(
+        "[bse_grad check] |A_dense z - a_block_matvec_window(z)| / |A_dense z| = {:.3e}",
+        num / den
+    );
+    if let Some(bmv) = matvec_b {
+        let bz = gemm_nn(&b_mat, dim, dim, &z, dim, 1);
+        let mzb = bmv(&z);
+        let num = bz.iter().zip(mzb.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        let den = bz.iter().map(|a| a.abs()).fold(0.0f64, f64::max).max(1.0e-300);
+        eprintln!(
+            "[bse_grad check] |B_dense z - b_block_matvec_window(z)| / |B_dense z| = {:.3e}",
+            num / den
+        );
+    }
+    // 2. root-by-root comparison with the dense solver.  Both equations are
+    // checked for both routes: a vector that satisfies only one of them is not a
+    // BSE eigenpair (the dense route's inverse-iteration refinement can drift to
+    // a neighbouring eigenvector of the squared problem when two roots are
+    // nearly degenerate).
+    let dense = if matvec_b.is_some() {
+        solve_bse_dense(&a_mat, &b_mat, dim, roots.len().max(1))
+    } else {
+        solve_bse_tda_dense(&a_mat, dim, roots.len())
+    };
+    let residuals = |omega: f64, x: &[f64], y: &[f64]| -> (f64, f64) {
+        let ax = gemm_nn(&a_mat, dim, dim, x, dim, 1);
+        let by = gemm_nn(&b_mat, dim, dim, y, dim, 1);
+        let bx = gemm_nn(&b_mat, dim, dim, x, dim, 1);
+        let ay = gemm_nn(&a_mat, dim, dim, y, dim, 1);
+        let r1 = (0..dim).map(|r| (ax[r] + by[r] - omega * x[r]).abs()).fold(0.0f64, f64::max);
+        let r2 = (0..dim).map(|r| (bx[r] + ay[r] + omega * y[r]).abs()).fold(0.0f64, f64::max);
+        (r1, r2)
+    };
+    for (k, (omega, x, y)) in roots.iter().enumerate() {
+        let (r1, r2) = residuals(*omega, x, y);
+        let (od, dw, ov, dr1, dr2) = match dense.get(k) {
+            Some((od, xd, yd)) => {
+                let (p, q) = residuals(*od, xd, yd);
+                let ov = (0..dim).map(|r| x[r] * xd[r] - y[r] * yd[r]).sum::<f64>();
+                (*od, (od - omega).abs(), ov, p, q)
+            }
+            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+        };
+        eprintln!(
+            "[bse_grad check] root {k}: omega_dav = {omega:.10}  omega_dense = {od:.10}  \
+             |d_omega| = {dw:.3e}  metric overlap = {ov:+.6}"
+        );
+        eprintln!(
+            "[bse_grad check]          residual A: dav {r1:.2e} dense {dr1:.2e}   \
+             residual B: dav {r2:.2e} dense {dr2:.2e}"
+        );
+    }
+}
+/// Residual of the matrix-free BSE equations for one root,
+/// `(|r1| + |r2|) / max(1, omega)` with
+/// `r1 = A X + B Y - omega X` and `r2 = B X + A Y + omega Y`
+/// (`r2` is empty for a TDA root, where `B = Y = 0`).
+fn matvec_residual(
+    omega: f64,
+    x: &[f64],
+    y: &[f64],
+    matvec_a: impl Fn(&Vec<f64>) -> Vec<f64>,
+    matvec_b: Option<&dyn Fn(&Vec<f64>) -> Vec<f64>>,
+) -> f64 {
+    let dim = x.len();
+    let xv = x.to_vec();
+    let ax = matvec_a(&xv);
+    let mut r1: Vec<f64> = ax.iter().zip(x).map(|(v, xi)| v - omega * xi).collect();
+    let mut r2: Vec<f64> = Vec::new();
+    if let Some(b) = matvec_b {
+        let yv = y.to_vec();
+        let by = b(&yv);
+        let bx = b(&xv);
+        let ay = matvec_a(&yv);
+        for k in 0..dim {
+            r1[k] += by[k];
+        }
+        r2 = (0..dim).map(|k| bx[k] + ay[k] + omega * y[k]).collect();
+    }
+    let n1 = r1.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let n2 = r2.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (n1 + n2) / 1.0f64.max(omega.abs())
+}
+
+/// Solve the **TDA** BSE problem with the matrix-free Davidson solver of the
+/// BSE spectrum path ([`crate::ri_bse::matvec::a_block_matvec_window`] +
+/// [`crate::solvers::davidson::tda_davidson_solver`]).
+///
+/// `y` is identically zero, as the TDA pullback expects.  Returns `None` when
+/// the tensor build is not applicable or the solver does not deliver `nroots`
+/// converged roots, so the caller can fall back to the dense route.
+pub fn solve_bse_tda_davidson(
+    scf: &SCF,
+    screen: &BseScreening,
+    qp_energies: &[f64],
+    eps_screen: &[f64],
+    kappa: f64,
     nroots: usize,
-    config: &crate::solvers::davidson::DavidsonConfig,
+    config: &DavidsonConfig,
 ) -> Option<Vec<(f64, Vec<f64>, Vec<f64>)>> {
+    let t = build_matvec_tensors(scf, screen, qp_energies, eps_screen)?;
     let (nocc, nvir) = (screen.nocc, screen.nvir);
     let dim = nocc * nvir;
-    let diag: Vec<f64> = (0..dim)
-        .map(|c| {
-            let i = c % nocc;
-            let a = c / nocc;
-            qp_energies[screen.vir_start + a] - qp_energies[screen.occ_start + i]
-        })
-        .collect();
-    let nrun = (nroots + 2).min(dim);
-    let guess = crate::solvers::davidson::generate_initial_guess(&diag, nrun);
-    let mut mv = |z: &MatrixFull<f64>| tda_matvec_free(screen, qp_energies, kappa, z);
-    let mut pairs = crate::solvers::davidson::davidson_solver_batched(
-        &mut mv, nrun, &diag, guess, config,
+    let qp_ctrl = scf.mol.ctrl.quasiparticle_methods.clone()
+        .expect("bse_grad: the BSE solver needs the quasiparticle control block");
+    let spin = if kappa == 0.0 { 'T' } else { 'S' };
+    let energy_diag = crate::ri_bse::construct_energy_diag_for_a_window(
+        &qp_energies.to_vec(), screen.occ_start, nocc, screen.vir_start, nvir,
     );
+    let guess = generate_initial_guess(&energy_diag, nroots);
+    let mut a = |z: &Vec<f64>| {
+        matvec::a_block_matvec_window(
+            &qp_ctrl, &t.energies, nocc, nvir, spin, &t.ri_vv, &t.ri_ov, &t.ri_oo_tilde, z,
+        )
+    };
+    let mut pairs = tda_davidson_solver(&mut a, nroots, &energy_diag, guess, config);
     pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
     if pairs.len() < nroots {
         eprintln!(
-            "[bse_grad] matrix-free TDA Davidson returned only {} of {} roots (dim={dim}); \
-             falling back to the dense TDA solver",
-            pairs.len(),
-            nroots
+            "[bse_grad] matrix-free TDA Davidson returned {} of {nroots} roots (dim={dim})",
+            pairs.len()
         );
         return None;
     }
     pairs.truncate(nroots);
-    Some(pairs.into_iter().map(|(omega, x)| (omega, x, vec![0.0f64; dim])).collect())
+    // Reject unconverged Ritz pairs: the pullback would differentiate a vector
+    // that is not the eigenvector the gradient formula assumes.  The bar is the
+    // solver's own convergence test (`|r| <= sqrt(tol)`), so this only catches a
+    // `max_iter` exit, not a root the solver legitimately converged.
+    let bar = config.tol.sqrt().max(1.0e-9);
+    for (omega, x) in &pairs {
+        let res = matvec_residual(*omega, x, &vec![0.0f64; dim], &a, None);
+        if !(res.is_finite() && res < bar) {
+            eprintln!(
+                "[bse_grad] matrix-free TDA Davidson root omega={omega:.10} failed the residual \
+                 check ({res:.3e}); increase davidson_max_iter / davidson_converge_threshold"
+            );
+            return None;
+        }
+    }
+    let out: Vec<(f64, Vec<f64>, Vec<f64>)> =
+        pairs.into_iter().map(|(o, x)| (o, x, vec![0.0f64; dim])).collect();
+    if solver_check_requested() {
+        report_solver_check(screen, qp_energies, kappa, &out, &a, None);
+    }
+    Some(out)
+}
+
+/// Solve the **full** (non-TDA) BSE problem with REST's Casida Davidson solver
+/// ([`crate::solvers::davidson::lr_davidson_solver`]) applied to the matrix-free
+/// A/B blocks of the spectrum path.
+///
+/// The returned `(omega, X, Y)` are metric-normalised (`X^T X - Y^T Y = 1`),
+/// which is the convention the gradient pullback uses.
+pub fn solve_bse_lr_davidson(
+    scf: &SCF,
+    screen: &BseScreening,
+    qp_energies: &[f64],
+    eps_screen: &[f64],
+    kappa: f64,
+    nroots: usize,
+    config: &DavidsonConfig,
+) -> Option<Vec<(f64, Vec<f64>, Vec<f64>)>> {
+    let t = build_matvec_tensors(scf, screen, qp_energies, eps_screen)?;
+    let (nocc, nvir) = (screen.nocc, screen.nvir);
+    let dim = nocc * nvir;
+    let qp_ctrl = scf.mol.ctrl.quasiparticle_methods.clone()
+        .expect("bse_grad: the BSE solver needs the quasiparticle control block");
+    let spin = if kappa == 0.0 { 'T' } else { 'S' };
+    let energy_diag = crate::ri_bse::construct_energy_diag_for_a_window(
+        &qp_energies.to_vec(), screen.occ_start, nocc, screen.vir_start, nvir,
+    );
+    let guess = generate_initial_guess(&energy_diag, nroots);
+    let mut a = |z: &Vec<f64>| {
+        matvec::a_block_matvec_window(
+            &qp_ctrl, &t.energies, nocc, nvir, spin, &t.ri_vv, &t.ri_ov, &t.ri_oo_tilde, z,
+        )
+    };
+    let mut b = |z: &Vec<f64>| {
+        matvec::b_block_matvec_window(
+            nocc, nvir, spin, &t.ri_ov, &t.ri_ov_b, &t.ri_ov_tilde, z,
+        )
+    };
+    let mut pairs = lr_davidson_solver(&mut a, &mut b, nroots, &energy_diag, guess, config);
+    pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    if pairs.len() < nroots {
+        eprintln!(
+            "[bse_grad] matrix-free Casida Davidson returned {} of {nroots} roots (dim={dim})",
+            pairs.len()
+        );
+        return None;
+    }
+    let mut out = Vec::with_capacity(nroots);
+    for (omega, vec) in pairs.into_iter().take(nroots) {
+        if vec.len() < 2 * dim {
+            return None;
+        }
+        let mut x = vec[..dim].to_vec();
+        let mut y = vec[dim..2 * dim].to_vec();
+        let nrm = metric_norm(&x, &y, dim);
+        if !(nrm.is_finite() && nrm > 1.0e-12) {
+            eprintln!(
+                "[bse_grad] matrix-free Casida Davidson root omega={omega:.10} has a non-positive \
+                 metric norm ({nrm:.3e})"
+            );
+            return None;
+        }
+        for r in 0..dim {
+            x[r] /= nrm;
+            y[r] /= nrm;
+        }
+        let res = matvec_residual(omega, &x, &y, &a, Some(&b));
+        if !(res.is_finite() && res < config.tol.sqrt().max(1.0e-9)) {
+            eprintln!(
+                "[bse_grad] matrix-free Casida Davidson root omega={omega:.10} failed the residual \
+                 check ({res:.3e}); increase davidson_max_iter / davidson_converge_threshold"
+            );
+            return None;
+        }
+        out.push((omega, x, y));
+    }
+    if solver_check_requested() {
+        report_solver_check(screen, qp_energies, kappa, &out, &a, Some(&b));
+    }
+    Some(out)
 }
 
 /// Solve the **TDA** (Hermitian) BSE problem densely.
@@ -779,109 +1075,6 @@ fn identity(dim: usize) -> Vec<f64> {
     e
 }
 
-/// Solve the BSE with REST's Davidson solver (Casida form).
-///
-/// Following the standard Davidson practice, the solver is asked for a few
-/// more roots than requested and only the lowest `nroots` are kept; each
-/// returned root is verified against the original BSE equations.
-pub fn solve_bse_davidson(
-    a_mat: &[f64],
-    b_mat: &[f64],
-    dim: usize,
-    nroots: usize,
-    config: &DavidsonConfig,
-) -> Option<Vec<(f64, Vec<f64>, Vec<f64>)>> {
-    let mut failed = false;
-    let nrun = (nroots + 2).min(dim);
-    // The solver applies `A`/`B` to the **whole subspace block** every
-    // iteration, so the matvec must be a gemm: the per-vector closure API
-    // (`lr_davidson_solver`) expands into one gemv per subspace column, i.e.
-    // `2 * m` reads of the full `dim^2` matrix per iteration (m up to
-    // `max_subspace`), which dominated the solve.
-    let a_m = to_mat(a_mat, dim, dim);
-    let b_m = to_mat(b_mat, dim, dim);
-    let mut a_mv = |z: &MatrixFull<f64>| -> MatrixFull<f64> {
-        let mut out = MatrixFull::new([dim, z.size()[1]], 0.0);
-        _dgemm_full(&a_m, 'N', z, 'N', &mut out, 1.0, 0.0);
-        out
-    };
-    let mut b_mv = |z: &MatrixFull<f64>| -> MatrixFull<f64> {
-        let mut out = MatrixFull::new([dim, z.size()[1]], 0.0);
-        _dgemm_full(&b_m, 'N', z, 'N', &mut out, 1.0, 0.0);
-        out
-    };
-    let diag: Vec<f64> = (0..dim).map(|k| a_mat[k + k * dim]).collect();
-    let guess = generate_initial_guess(&diag, nrun);
-    let mut pairs = lr_davidson_solver_batched(&mut a_mv, &mut b_mv, nrun, &diag, guess, config);
-    pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    if pairs.len() < nroots {
-        eprintln!(
-            "[bse_grad] Davidson returned only {} of {} requested roots (dim={}); increase \
-             max_subspace/max_iter, or use the dense solver",
-            pairs.len(),
-            nroots,
-            dim
-        );
-        return None;
-    }
-
-    let out: Vec<(f64, Vec<f64>, Vec<f64>)> = pairs
-        .into_iter()
-        .take(nroots)
-        .map(|(omega, vec)| {
-            let mut x = vec[..dim].to_vec();
-            let mut y = vec[dim..2 * dim].to_vec();
-            let nrm = metric_norm(&x, &y, dim);
-            for r in 0..dim {
-                x[r] /= nrm;
-                y[r] /= nrm;
-            }
-            // verify the original equations: A X + B Y = omega X, B X + A Y = -omega Y
-            let (r1, r2) = bse_residual(a_mat, b_mat, dim, omega, &x, &y);
-            let scale = 1.0f64.max(omega.abs());
-            let res = (r1.iter().map(|v| v * v).sum::<f64>().sqrt()
-                + r2.iter().map(|v| v * v).sum::<f64>().sqrt())
-                / scale;
-            if res >= 1.0e-6 {
-                eprintln!(
-                    "[bse_grad] Davidson root omega={:.10} failed the BSE residual check ({:.3e}); \
-                     increase eigen_tol/max_subspace or use the dense solver",
-                    omega, res
-                );
-                failed = true;
-            }
-            (omega, x, y)
-        })
-        .collect();
-    if failed {
-        return None;
-    }
-    Some(out)
-}
-
-/// Residuals of the original non-Hermitian BSE equations for one root.
-fn bse_residual(
-    a_mat: &[f64],
-    b_mat: &[f64],
-    dim: usize,
-    omega: f64,
-    x: &[f64],
-    y: &[f64],
-) -> (Vec<f64>, Vec<f64>) {
-    let ax = gemm_nn(a_mat, dim, dim, x, dim, 1);
-    let by = gemm_nn(b_mat, dim, dim, y, dim, 1);
-    let bx = gemm_nn(b_mat, dim, dim, x, dim, 1);
-    let ay = gemm_nn(a_mat, dim, dim, y, dim, 1);
-    let r1 = (0..dim)
-        .map(|r| ax[r] + by[r] - omega * x[r])
-        .collect::<Vec<_>>();
-    let r2 = (0..dim)
-        .map(|r| bx[r] + ay[r] + omega * y[r])
-        .collect::<Vec<_>>();
-    (r1, r2)
-}
-
-// ---------------------------------------------------------------------------
 // kernel VJP and amplitude weights
 // ---------------------------------------------------------------------------
 
@@ -2274,28 +2467,46 @@ impl<'a> BseGradEngine<'a> {
     pub fn solve(&mut self, nroots: usize, solver: BseSolver, config: &DavidsonConfig) {
         self.ensure_screening();
         let dim = self.screen.nocc * self.screen.nvir;
-        if self.tda {
-            // Hermitian problem: no `A-B` factorisation.  Large spaces go through
-            // the **matrix-free** Davidson, which never materialises `dim^2`; the
-            // dense `dsyevd` stays for small spaces and as the fallback.
-            if matches!(solver, BseSolver::Davidson) && dim > 128 {
-                if let Some(pairs) =
-                    solve_bse_tda_davidson(&self.screen, &self.qp_energies, self.kappa, nroots, config)
-                {
-                    self.solver_used = "tda-davidson-free";
-                    self.roots = pairs
-                        .into_iter()
-                        .map(|(omega, x, y)| BseRoot { omega, x, y })
-                        .collect();
-                    return;
+        let dense_only = force_dense_solver();
+        if matches!(solver, BseSolver::Davidson) && dim > 128 && !dense_only {
+            // REST's own matrix-free BSE Davidson: the *same* `a_block_matvec` /
+            // `b_block_matvec` and `tda_davidson_solver` / `lr_davidson_solver`
+            // that the BSE spectrum path uses, applied to the RI blocks of this
+            // gradient's transition window (see [`build_matvec_tensors`]).  A
+            // TDA card solves the Hermitian `A` (`y = 0`, no `A-B`
+            // factorisation); a full card solves the Casida form.  Both are
+            // wrapped: the Casida route factorises `A-B` with a Cholesky, which
+            // is indefinite on some references, and a failed attempt must
+            // degrade to the dense route instead of aborting the job.
+            let solved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if self.tda {
+                    solve_bse_tda_davidson(
+                        self.gw.scf, &self.screen, &self.qp_energies, &self.eps_screen,
+                        self.kappa, nroots, config,
+                    )
+                } else {
+                    solve_bse_lr_davidson(
+                        self.gw.scf, &self.screen, &self.qp_energies, &self.eps_screen,
+                        self.kappa, nroots, config,
+                    )
                 }
-                eprintln!(
-                    "[bse_grad] matrix-free TDA Davidson did not deliver {nroots} roots \
-                     (dim={dim}); using the dense TDA solver"
-                );
+            }))
+            .unwrap_or(None);
+            if let Some(pairs) = solved {
+                self.solver_used = if self.tda { "tda-davidson" } else { "davidson" };
+                self.roots = pairs
+                    .into_iter()
+                    .map(|(omega, x, y)| BseRoot { omega, x, y })
+                    .collect();
+                return;
             }
-            let (a_mat, _b_mat) =
-                build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
+            eprintln!(
+                "[bse_grad] matrix-free BSE Davidson did not deliver {nroots} roots (dim={dim}); \
+                 using the dense solver"
+            );
+        }
+        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
+        if self.tda {
             self.solver_used = "tda-dense";
             self.roots = solve_bse_tda_dense(&a_mat, dim, nroots)
                 .into_iter()
@@ -2303,32 +2514,8 @@ impl<'a> BseGradEngine<'a> {
                 .collect();
             return;
         }
-        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
-        let (pairs, used) = match solver {
-            BseSolver::Dense => (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense"),
-            // The Davidson path is wrapped: on an indefinite `A-B` its internal
-            // Cholesky/`_dinverse`/`_dgeev` calls can still panic (LAPACK argument or
-            // definiteness errors that its own `catch_unwind` does not cover), and a
-            // failed attempt must degrade to the dense route rather than abort the
-            // job.
-            BseSolver::Davidson => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || solve_bse_davidson(&a_mat, &b_mat, dim, nroots, config),
-            ))
-            .unwrap_or(None)
-            {
-                Some(p) => (p, "davidson"),
-                None => {
-                    eprintln!(
-                        "[bse_grad] Davidson did not deliver {nroots} roots (dim={dim}); falling \
-                         back to the dense solver, which reduces to the dim-dimensional \
-                         P = (A-B)(A+B) problem instead of the 2-block form"
-                    );
-                    (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense")
-                }
-            },
-        };
-        self.solver_used = used;
-        self.roots = pairs
+        self.solver_used = "dense";
+        self.roots = solve_bse_dense(&a_mat, &b_mat, dim, nroots)
             .into_iter()
             .map(|(omega, x, y)| BseRoot { omega, x, y })
             .collect();

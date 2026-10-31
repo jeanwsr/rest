@@ -21,7 +21,11 @@ pub fn diagonal_elements_contribution(scf_data:&SCF,vec:&Vec<f64>)->Vec<f64>{
 }
 
 /// Standalone version of diagonal_elements_contribution (no SCF needed).
-pub fn diagonal_contribution_standalone(vec: &[f64], qp_energies: &Vec<f64>,
+///
+/// `qp_energies` is the **compact** energy vector of the transition window
+/// (`i` → occupied orbital `occ_start+i`, `occ_size+a` → virtual `vir_start+a`),
+/// not the full MO energy vector.
+pub fn diagonal_contribution_standalone(vec: &[f64], qp_energies: &[f64],
     occ_size: usize, vir_size: usize) -> Vec<f64> {
     let mut prod_vec = vec![0.0; occ_size * vir_size];
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i, a)| {
@@ -398,49 +402,82 @@ pub fn b_block_matvec_unrestricted(
     result
 }
 
-pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    matvec_trace::trace("a_block_matvec");
-    let start=Instant::now();
-    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
-    let mut result=diagonal_elements_contribution(scf_data,z_vec);
-    let duration1=start.elapsed();
-    if scf_data.mol.ctrl.print_level>1{
-        println!("对角元操作耗时: {:?}", duration1);   
-    }
-    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    result=w_contribution_a_block_dgemm(scf_data,ri_vv,z_vec,ri_oo_tilde,&qp_ctrl).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
-    let duration2=start.elapsed();
-    if scf_data.mol.ctrl.print_level>1{
-        println!("W操作耗时: {:?}", duration2-duration1); 
-    }
-    if xlet=='S'{
-        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
-        let duration3=start.elapsed();
-        if scf_data.mol.ctrl.print_level>1{
-            println!("库仑操作耗时: {:?}", duration3-duration2);
-        }
-    }
-    if xlet=='R'{
-        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|v_i+z_i).collect();
-        let duration3=start.elapsed();
-        if scf_data.mol.ctrl.print_level>1{
-            println!("库仑操作耗时: {:?}", duration3-duration2);
-        }
+/// Spin letter of the BSE channel selected in `qp_ctrl`:
+/// `'S'` singlet (bare-exchange weight 2), `'T'` triplet (no bare exchange),
+/// `'R'` unrestricted (weight 1).
+pub fn bse_spin_letter(qp_ctrl:&QuasiParticle)->char{
+    if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'}
+}
+
+/// A-block matvec over an **explicit transition window** — the single
+/// implementation of the TDA BSE Hamiltonian.
+///
+/// [`a_block_matvec`] calls this with the window implied by
+/// `get_occupation_parameters(scf,'N')`; the analytic-gradient solvers call it
+/// directly with the window of the engine they differentiate, so both stages
+/// are guaranteed to apply the *same* operator.
+///
+/// `energies` is the compact orbital-energy vector `[occ_size | vir_size]`, and
+/// `spin` is the letter returned by [`bse_spin_letter`].
+pub fn a_block_matvec_window(
+    qp_ctrl:&QuasiParticle,
+    energies:&[f64],
+    occ_size:usize,
+    vir_size:usize,
+    spin:char,
+    ri_vv:&MatrixFull<f64>,
+    ri_ov:&MatrixFull<f64>,
+    ri_oo_tilde:&MatrixFull<f64>,
+    z_vec:&Vec<f64>,
+)->Vec<f64>{
+    matvec_trace::trace("a_block_matvec_window");
+    let result=diagonal_contribution_standalone(z_vec,energies,occ_size,vir_size);
+    let w=w_contribution_a_block_dgemm_standalone(ri_vv,z_vec,ri_oo_tilde,qp_ctrl,occ_size,vir_size);
+    let mut result:Vec<f64>=result.iter().zip(w.iter()).map(|(z_i,w_i)|z_i-w_i).collect();
+    if spin=='S'||spin=='R'{
+        let kappa=if spin=='S'{2.0}else{1.0};
+        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|kappa*v_i+z_i).collect();
     }
     result
 }
-pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    matvec_trace::trace("b_block_matvec");
-    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
-    let mut result=vec![0.0;z_vec.len()];
-    let mut ri_ov_tilde_old=ri_ov_tilde.clone();
-    ri_ov_tilde_old.reshape(ri_ov_a.size);
-    result=w_contribution_b_block_dgemm(scf_data,ri_ov_b,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
-    if xlet=='S'{
-        result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
-    }
-    if xlet=='R'{
-        result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|v_i+z_i).collect();
+
+pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+    let (start_mo,_num_state,occ_size,vir_size,_homo,lumo)=get_occupation_parameters(scf_data,'N');
+    // compact `[occ | vir]` energies, exactly the gaps `diagonal_elements_contribution` builds
+    let qp=&scf_data.gwqp.0;
+    let mut energies=Vec::with_capacity(occ_size+vir_size);
+    energies.extend_from_slice(&qp[start_mo..start_mo+occ_size]);
+    energies.extend_from_slice(&qp[lumo..lumo+vir_size]);
+    a_block_matvec_window(qp_ctrl,&energies,occ_size,vir_size,bse_spin_letter(qp_ctrl),
+        ri_vv,ri_ov,ri_oo_tilde,z_vec)
+}
+
+/// B-block matvec over an explicit transition window (the single implementation;
+/// [`b_block_matvec`] is the SCF-window wrapper).
+///
+/// `ri_ov_a` is the raw `q_ov` block `[naux, nov]`, while `ri_ov_b` and
+/// `ri_ov_tilde` are the `[naux*occ, vir]` reshapes the B-block contraction needs
+/// (see [`w_contribution_b_block_dgemm_standalone`]).
+pub fn b_block_matvec_window(
+    occ_size:usize,
+    vir_size:usize,
+    spin:char,
+    ri_ov_a:&MatrixFull<f64>,
+    ri_ov_b:&MatrixFull<f64>,
+    ri_ov_tilde:&MatrixFull<f64>,
+    z_vec:&Vec<f64>,
+)->Vec<f64>{
+    matvec_trace::trace("b_block_matvec_window");
+    let w=w_contribution_b_block_dgemm_standalone(ri_ov_b,z_vec,ri_ov_tilde,occ_size,vir_size);
+    let mut result:Vec<f64>=w.iter().map(|w_i|-w_i).collect();
+    if spin=='S'||spin=='R'{
+        let kappa=if spin=='S'{2.0}else{1.0};
+        result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|kappa*v_i+z_i).collect();
     }
     result
+}
+
+pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+    let (_start_mo,_num_state,occ_size,vir_size,_homo,_lumo)=get_occupation_parameters(scf_data,'N');
+    b_block_matvec_window(occ_size,vir_size,bse_spin_letter(qp_ctrl),ri_ov_a,ri_ov_b,ri_ov_tilde,z_vec)
 }

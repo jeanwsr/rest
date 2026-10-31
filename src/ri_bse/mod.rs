@@ -332,39 +332,32 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     }
     BseOutput { first_excitation: None, excitation_energies: Vec::new() }
 }
-pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
-    let mut vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)>=Vec::new();
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
-    let range_oo=(start_mo..homo+1, start_mo..homo+1);
-    let range_vv=(lumo..num_state, lumo..num_state);
-    let range_ov=(start_mo..homo+1, lumo..num_state);
-    let range_ff=(start_mo..num_state,start_mo..num_state);
-
+/// Three-centre MO integrals of one orbital block, `[naux, na*nb]`.
+///
+/// `range_a`/`range_b` are the two orbital ranges of the block; the column index
+/// of the returned matrix is `a + b*na` (first range fastest), the layout every
+/// `ri_bse` contraction assumes.
+///
+/// This is the single implementation behind [`get_submatrix`]: the latter only
+/// decides *which* ranges the card's keywords select, while callers that need a
+/// different window (the analytic BSE gradient, which may pin its active space
+/// independently of `bse_cutoff_energy`) pass the ranges explicitly.
+pub fn get_submatrix_window(
+    scf_data:&SCF,
+    choice_a:char,
+    choice_b:char,
+    range_a:Range<usize>,
+    range_b:Range<usize>,
+    response_or_not:char,
+)->MatrixFull<f64>{
+    assert!(!range_a.is_empty() && !range_b.is_empty(),
+        "get_submatrix_window: empty orbital range ({choice_a}{choice_b})");
     // Check if BSE-specific RI integrals are available
     let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
-
-    if choice_a=='F'&&choice_b=='F'{
-        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1);
-    }else if choice_a=='O'&&choice_b=='O'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_oo.0, range_oo.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0, range_oo.1)
-        };
-    }else if choice_a=='V'&&choice_b=='V'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_vv.0, range_vv.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0, range_vv.1)
-        };
-    }else if choice_a=='O'&&choice_b=='V'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_ov.0, range_ov.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0, range_ov.1)
-        };
-    }else {
-        panic!("invalid choice of ri subspace!")
+    let vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)> = if use_bse_integrals {
+        scf_data.generate_ri3mo_bse(range_a.clone(), range_b.clone())
+    } else {
+        scf_data.generate_ri3mo_rayon_for_multiple_times(range_a.clone(), range_b.clone())
     };
 
     let auxbas_type = if use_bse_integrals { "BSE-specific" } else { "Regular" };
@@ -373,6 +366,23 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
 
     let matrix:MatrixFull<f64>=vector.into_iter().next().unwrap().0.into_matfull_i_jk();
     matrix
+}
+
+pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
+    let (start_mo,num_state,_occ_size,_vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
+    let range_ff=(start_mo..num_state,start_mo..num_state);
+    let ranges = if choice_a=='F'&&choice_b=='F'{
+        range_ff
+    }else if choice_a=='O'&&choice_b=='O'{
+        (start_mo..homo+1, start_mo..homo+1)
+    }else if choice_a=='V'&&choice_b=='V'{
+        (lumo..num_state, lumo..num_state)
+    }else if choice_a=='O'&&choice_b=='V'{
+        (start_mo..homo+1, lumo..num_state)
+    }else {
+        panic!("invalid choice of ri subspace!")
+    };
+    get_submatrix_window(scf_data, choice_a, choice_b, ranges.0, ranges.1, response_or_not)
 }
 pub fn get_submatrix_spin(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char,spin:usize)->MatrixFull<f64>{
     let op = get_occ_params_per_spin(scf_data, response_or_not)[spin];
