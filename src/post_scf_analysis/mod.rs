@@ -718,6 +718,46 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     let w = qp_ctrl.bse_cutoff_energy;
                     (e[homo], e[lumo], w > 0.0 && w < 1.0e5)
                 };
+                // Pinned active space (`bse_active_occ_start` /
+                // `bse_active_vir_end`, written by the relaxation drivers): the
+                // *index* window is what the reference spectrum uses
+                // (`ri_gw::bse_active_bounds`), so the gradient has to use it too.
+                // An energy window lets single orbitals drift in and out with the
+                // nuclei -- on DA1/PBEh the transition space oscillated between 46
+                // and 47 virtuals from one geometry to the next, which makes
+                // `Omega(R)` discontinuous by ~1e-3 Ha and leaves the analytic
+                // gradient inconsistent with the energy: the L-BFGS line search
+                // then measures a *linear* uphill `dE(s)` at s = 0.012..0.047 A
+                // (dE = +2.8e-4..+3.6e-3 Ha) although the gradient predicts
+                // descent, and stops at |g| = 0.18.
+                //
+                // The pin becomes two cutoffs halfway between the last excluded
+                // and the first included orbital, i.e. far from any crossing, so
+                // that `new_with_window` reproduces the pinned indices exactly.
+                let pinned_window = qp_ctrl.bse_active_occ_start >= 0
+                    && qp_ctrl.bse_active_vir_end > 0;
+                let (cutoff, occ_cutoff) = if pinned_window {
+                    let e = &scf_data.eigenvalues[0];
+                    let lo = qp_ctrl.bse_active_occ_start as usize;
+                    let hi = qp_ctrl.bse_active_vir_end as usize;
+                    let occ_cut = if lo > 0 && lo < e.len() {
+                        0.5 * (e[lo - 1] + e[lo])
+                    } else {
+                        f64::NEG_INFINITY
+                    };
+                    let vir_cut = if hi < e.len() {
+                        0.5 * (e[hi - 1] + e[hi])
+                    } else {
+                        f64::INFINITY
+                    };
+                    if std::env::var("REST_BSE_PIN_DEBUG").is_ok() {
+                        eprintln!(
+                            "[bse pin] occ_start = {lo}, vir_end = {hi} -> occ_cutoff \
+                             {occ_cut:.6} Ha, vir_cutoff {vir_cut:.6} Ha"
+                        );
+                    }
+                    (vir_cut, occ_cut)
+                } else {
                 let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
                     // Fixed *count*: the cutoff sits halfway between the n-th and
                     // the (n+1)-th virtual at this geometry, so the transition
@@ -746,6 +786,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     e_homo - qp_ctrl.bse_cutoff_energy
                 } else {
                     f64::NEG_INFINITY
+                };
+                (cutoff, occ_cutoff)
                 };
                 let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_window(
                     scf_data, &gw, multi, screen, cutoff, occ_cutoff);
