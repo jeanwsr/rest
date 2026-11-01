@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+
+#==================================================================
+# 0): Prerequisite libraries for REST: 
+#   - These libraries must be installed and accessable during
+#     compilation and excution of the REST package. 
+#   - For Detailed information, refer to the `README.rst` file
+#==================================================================
+# 1): set the current folder as REST_HOME
+#==================================================================
+REST_HOME=`pwd`
+REST_EXT_DIR=$REST_HOME/lib
+[ ! -d $REST_EXT_DIR ] && mkdir -p $REST_EXT_DIR
+REST_EXT_INC=$REST_HOME/include
+[ ! -d $REST_EXT_INC ] && mkdir -p $REST_EXT_INC
+REST_CINT_DIR=$REST_EXT_DIR
+REST_BLAS_DIR=$REST_EXT_DIR
+
+#==================================================================
+# parse the input arguements and initialize some parameters
+#==================================================================
+repository="gitee"
+local_path=""
+active="y"
+REST_FORTRAN_COMPILER="gfortran"
+while getopts r:p:ef:h option
+do
+  case "${option}"
+    in
+    r) repository=${OPTARG};;
+    p) local_path=${OPTARG};;
+    e) 
+      echo "DONOT add enviroments to bashrc"
+      active="n"
+      ;;
+	f) REST_FORTRAN_COMPILER=${OPTARG};;
+    h) 
+      echo "Usage: $(basename $0) [OPTION...] [OPTARG]"
+      echo "Configure the complitation and simulation environment for the REST package on Linux OS."
+      echo ""
+      echo "OPTION:"
+      echo " -h         print the help information"
+      echo " -r OPTARG  set the repository. The default OPTARG: github"
+      echo "              local:    local repositories"
+      echo "              github:   repositories on github"
+      echo " -p OPTARG  provide the path to the local repositories"
+      echo "            It is not necessary for the repositories on github"
+      echo " -e         DONOT add enviroments to bashrc"
+      echo "            This script will NOT modify your bashrc file. Use it only if you understand its implications"    
+      echo " -f OPTARG  set the compiler for the Fortran code. The default OPTARG: gfortran"
+      echo " "
+      echo " Example:"
+      echo " 0) ./Config"
+      echo "     : use the repositories on gitee by default"
+      echo " 2) ./Config -r gitee -f fortran"
+      echo "     : use the repositories on gitee by default, and it is not necessary to declare the repository path with '-p' "
+      echo " 1) ./Config -r github -f fortran"
+      echo "     : use the repositories on github and it is not necessary to declare the repository path with '-p'. "
+	  echo "       WARNING: due to the network connetction issue, the github repository will not be updated timely."
+      echo " 3) ./Config -r local -p userid_@local_server:/path-to-the-repositories"
+      echo "     : The configure script will then clone the rest, rest_tensors, rest_libcints via:"
+      echo "          userid_@local_server:/path-to-the-repositories/rest.mirror"
+      echo "          userid_@local_server:/path-to-the-repositories/rest_tensors.mirror"
+      echo "          userid_@local_server:/path-to-the-repositories/rest_libcints.mirror"
+      echo "          userid_@local_server:/path-to-the-repositories/rest_regression.mirror"
+      echo ""
+      echo "================================  IMPORTANT ISSUE   =================================================="
+      echo "! External libraries for REST:"
+      echo "!  - These libraries are required and should be placed in the `$REST_EXT_DIR` directory."
+      echo "!  - For detailed information about the required libraries, please refer to the `README.rts` file."
+      echo "======================================================================================================"
+      echo ""
+      echo "Enjoy the electronic-structure calculations using the REST package!"
+      echo ""
+      exit
+      ;;
+    ?)
+      echo "script usage: $(basename $0) [-h] [-e] [-r] [OPTARG] [-p] [OPTARG]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ $repository = "gitee" ]; then
+  export rest_repo_path="https://gitee.com/restgroup/rest.git"
+  export rest_tensors_repo_path="https://gitee.com/restgroup/rest_tensors.git"
+  export rest_libcint_repo_path="https://gitee.com/restgroup/rest_libcint.git"
+  export rest_regress_repo_path="https://gitee.com/restgroup/rest_regression.git"
+  echo $repository
+elif [ $repository = "github" ]; then
+  export rest_repo_path="git@github.com:igor-1982/rest.git"
+  export rest_tensors_repo_path="git@github.com:igor-1982/rest_tensors.git"
+  export rest_libcint_repo_path="git@github.com:igor-1982/rest_libcint.git"
+  export rest_regress_repo_path="git@github.com:igor-1982/rest_regression.git"
+  echo $repository
+elif [ $repository = "local" ]; then
+  export rest_repo_path="${local_path}/rest.mirror"
+  export rest_tensors_repo_path="${local_path}/rest_tensors.mirror"
+  export rest_libcint_repo_path="${local_path}/rest_libcint.mirror"
+  export rest_regress_repo_path="${local_path}/rest_regression.mirror"
+  echo $repository
+else
+  echo "Invalid repository is used: $repository"
+  exit
+fi
+
+#==================================================================
+# Clone the source codes from repositories
+#==================================================================
+[ ! -d rest ] && git clone $rest_repo_path rest
+[ ! -d rest_tensors ] && git clone $rest_tensors_repo_path rest_tensors
+[ ! -d rest_libcint ] && git clone $rest_libcint_repo_path rest_libcint
+[ ! -d rest_regression ] && git clone $rest_regress_repo_path rest_regression
+
+# untar the basis sets in the json format from BSE
+if [ -f rest/basis_sets-json.tar.bz2 ]; then
+  tar -xjf rest/basis_sets-json.tar.bz2
+  mv basis_sets-json.tar.bz2 rest/bse_pool
+fi
+
+if ! command -v $REST_FORTRAN_COMPILER &> /dev/null
+then
+  echo "The fortran compiler $REST_FORTRAN_COMPILER could not be found. Please use an available fortran compiler"
+  exit
+else
+  echo "The fortran compiler $REST_FORTRAN_COMPILER is available"
+fi
+
+#============================================================================
+# Appending the environment variables to `$HOME/.bash_profile`
+#============================================================================
+if [ $active = "y" ]; then
+  if [ ! -f $HOME/.bash_profile ]; then 
+    echo 'export REST_FORTRAN_COMPILER="'$REST_FORTRAN_COMPILER'"' > $HOME/.bash_profile
+  else
+    echo 'export REST_FORTRAN_COMPILER="'$REST_FORTRAN_COMPILER'"' >> $HOME/.bash_profile
+  fi
+  echo 'export REST_HOME="'$REST_HOME'"' >> $HOME/.bash_profile
+  echo 'export REST_EXT_DIR="'$REST_EXT_DIR'"' >> $HOME/.bash_profile
+  echo 'export REST_EXT_INC="'$REST_EXT_INC'"' >> $HOME/.bash_profile
+  echo 'export REST_CINT_DIR="'$REST_CINT_DIR'"' >> $HOME/.bash_profile
+  echo 'export LD_LIBRARY_PATH="$REST_EXT_DIR:$LD_LIBRARY_PATH"' >> $HOME/.bash_profile
+  echo 'export HDF5_DIR="'$REST_HOME'"' >> $HOME/.bash_profile
+  echo "! Environment variables have been appended to $HOME/.bash_profile"
+  echo "! Activating them by running 'source \$HOME/.bash_profile'"
+else
+  echo "! Note: Please activate the following environments manually..."
+  echo "-----------------------------------"
+  echo 'REST_FORTRAN_COMPILER="'$REST_FORTRAN_COMPILER'"'
+  echo 'REST_HOME="'$REST_HOME'"' 
+  echo 'REST_EXT_DIR="'$REST_EXT_DIR'"' 
+  echo 'REST_EXT_INC="'$REST_EXT_INC'"' 
+  echo 'REST_CINT_DIR="'$REST_CINT_DIR'"' 
+  echo 'export HDF5_DIR="'$REST_HOME'"'
+  echo 'LD_LIBRARY_PATH="$REST_EXT_DIR:$LD_LIBRARY_PATH"' 
+  echo "-----------------------------------"
+fi
+
+echo "================================  IMPORTANT ISSUE   =================================================="
+echo "! External libraries for REST:"
+echo "!  - These libraries are required and should be placed in the folder of $REST_EXT_DIR."
+echo "!  - For detailed information about the required libraries, please refer to 'README.rts'."
+echo "======================================================================================================"
+
+
+#echo "! After running 'source \$HOME/.bash_profile', please execute the following commands in your terminal..."
+#echo "! Note: After activating enviroments, please run the following commands in your terminal..."
+#echo 'export RUSTDOCFLAGS="--html-in-header $REST_HOME/rest/katex.html"'
+#echo 'export RUSTFLAGS="-L $REST_XC_DIR -lxc -L $REST_EXT_DIR -lrest2fch -C target-cpu=native"'
+

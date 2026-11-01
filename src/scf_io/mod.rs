@@ -6181,17 +6181,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
 
         // dm = wC*C^{T}
         let _t_dm = std::time::Instant::now();
-        let _blas_threads = tensors::matrix_blas_lapack::omp_get_num_threads_wrapper();
-        let _blas_cpu_num = unsafe { 
-            extern "C" { fn openblas_get_num_threads() -> i32; }
-            openblas_get_num_threads() 
-        };
         _dgemm_full(&weight_eigv,'N',eigv_s, 'T',dm_s, 1.0, 0.0);
-        if std::env::var("REST_DM_DIAG").is_ok() {
-            println!("[dm-diag] spin {} dgemm {:.2}s | omp_max_threads={} blas_cpu_number={} | m={} n={} k={}",
-                i_spin, _t_dm.elapsed().as_secs_f64(), _blas_threads, _blas_cpu_num,
-                num_basis, num_basis, num_state);
-        }
         //dm_s.lapack_dgemm(&mut weight_eigv, eigv_s, 'N', 'T', 1.0, 0.0);
         //dm_s.formated_output(5, "full");
     });
