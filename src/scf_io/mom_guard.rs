@@ -47,7 +47,14 @@
 
 use super::*;
 use crate::constants::EV;
-use crate::ctrl_io::{JobType, MomGapCheck, MomGuard};
+use crate::ctrl_io::{JobType, MomS0Check, MomGuard};
+
+/// Abort when the tracked orbital's overlap with its reference drops below this
+/// cosine. Not a keyword: a healthy run sits at 0.98-1.00 and a broken reference
+/// drops to exactly 0.00 (both measured), so there is nothing to tune -- it only
+/// separates "works" from "the reference is gone". The value is printed in every
+/// state-check line, so a user sees how far from it they are.
+const MOM_OVERLAP_ABORT: f64 = 0.2;
 
 /// What one geometry step's state check produced (for the log and the json).
 #[derive(Clone, Debug)]
@@ -171,7 +178,7 @@ impl SCF {
     pub fn mom_ground_state_energy(&self, mpi_operator: &Option<MPIOperator>) -> Option<f64> {
         let mut mol = self.mol.clone();
         mol.ctrl.force_state_occupation.clear();
-        mol.ctrl.mom_gap_check = MomGapCheck::Off;
+        mol.ctrl.mom_s0_check = MomS0Check::Off;
         mol.ctrl.mom_guard = MomGuard::Warn;
         mol.ctrl.initial_guess = String::from("sad");
         mol.ctrl.external_init_guess = None;
@@ -251,7 +258,7 @@ impl SCF {
         };
 
         // --- L2: S0 SCF at the same geometry (opt-in) -------------------------
-        if self.mol.ctrl.mom_gap_check == MomGapCheck::Each {
+        if self.mol.ctrl.mom_s0_check == MomS0Check::Each {
             report.e_gs = self.mom_ground_state_energy(mpi_operator);
         }
 
@@ -273,41 +280,25 @@ impl SCF {
         // "hole+particle", "all four ends") ended with |dE_fo| = 0 while the state
         // was still +2.30 eV above S0 and descending toward the planar S1 minimum.
         // The question "is this still an excited state" is therefore answered by L2
-        // (the gap to the independently relaxed S0), never by dE_fo.
-        let d_e_abs = d_e_ev.abs();
-        if d_e_ev.is_finite() && !report.aufbau_equal && d_e_abs < self.mol.ctrl.mom_gap_warn {
-            warns.push(format!(
-                "small MOM-ground separation in the same orbitals (|dE| = {:.4} eV < warn threshold {:.4} eV, dE = {:+.4} eV): the two determinants are close, watch the dE(MOM - S0) column",
-                d_e_abs, self.mol.ctrl.mom_gap_warn, d_e_ev
-            ));
-        }
+        // (the gap to the independently relaxed S0), never by dE_fo. dE_fo is
+        // printed in the state-check line every step, so it needs no threshold.
 
         // L2: the only criterion that answers "is the state I am following still an
         // excited state". It costs one S0 SCF per step, hence opt-in
-        // (`mom_gap_check`); when it is off, the guard can still catch a lost
+        // (`mom_s0_check`); when it is off, the guard can still catch a lost
         // *reference* (overlap) but not a state that became the ground state.
         if let Some(gap) = report.d_e_gs_ev() {
-            if gap < self.mol.ctrl.mom_gap_abort {
+            if gap < self.mol.ctrl.mom_s0_gap_abort {
                 abort_reason = Some(format!(
                     "the MOM state is not above the ground state any more (E(MOM) - E(S0) = {:+.4} eV < {:+.4} eV): either the excitation has vanished (the determinant became the ground state) or the two states have crossed",
-                    gap, self.mol.ctrl.mom_gap_abort
-                ));
-            } else if gap < self.mol.ctrl.mom_gap_warn {
-                warns.push(format!(
-                    "E(MOM) - E(S0) = {:+.4} eV (< warn threshold {:+.4} eV): approaching a degeneracy with the ground state",
-                    gap, self.mol.ctrl.mom_gap_warn
+                    gap, self.mol.ctrl.mom_s0_gap_abort
                 ));
             }
         }
-        if report.overlap < self.mol.ctrl.mom_overlap_abort {
+        if report.overlap < MOM_OVERLAP_ABORT {
             abort_reason = Some(format!(
-                "the tracked orbital overlaps its reference by only {:.4} (< abort threshold {:.4}): the reference no longer identifies it",
-                report.overlap, self.mol.ctrl.mom_overlap_abort
-            ));
-        } else if report.overlap < self.mol.ctrl.mom_overlap_warn {
-            warns.push(format!(
-                "the tracked orbital overlaps its reference by only {:.4} (< warn threshold {:.4})",
-                report.overlap, self.mol.ctrl.mom_overlap_warn
+                "the tracked orbital overlaps its reference by only {:.4} (< {:.1}): the reference no longer identifies it",
+                report.overlap, MOM_OVERLAP_ABORT
             ));
         }
         if report.s2_ref > 0.1 {
@@ -411,18 +402,18 @@ impl SCF {
         Some(report)
     }
 
-    /// The `mom_gap_check = "last"` hook: report the adiabatic MOM-S0 gap at the
+    /// The `mom_s0_check = "last"` hook: report the adiabatic MOM-S0 gap at the
     /// geometry the optimization ended on.
     pub fn mom_final_gap_report(&mut self, mpi_operator: &Option<MPIOperator>) {
         if self.mol.ctrl.force_state_occupation.is_empty() {
             return;
         }
-        if self.mol.ctrl.mom_gap_check != MomGapCheck::Last {
+        if self.mol.ctrl.mom_s0_check != MomS0Check::Last {
             return;
         }
         if self.mol.ctrl.print_level >= 1 {
             println!("");
-            println!("[MOM] final gap check at the last geometry (mom_gap_check = \"last\")");
+            println!("[MOM] final gap check at the last geometry (mom_s0_check = \"last\")");
         }
         let e_mom = self.scf_energy;
         if let Some(e_s0) = self.mom_ground_state_energy(mpi_operator) {

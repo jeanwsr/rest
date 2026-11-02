@@ -228,7 +228,7 @@ impl Default for MomGuard {
 }
 
 /// When to run the extra S0 SCF that turns the guard's frozen-orbital gap into a
-/// real adiabatic gap (keyword `[ctrl] mom_gap_check`, default `"off"`).
+/// real adiabatic gap (keyword `[ctrl] mom_s0_check`, default `"off"`).
 ///
 /// - `Off`: no extra SCF.
 /// - `Each`: one restricted S0 SCF per geometry step (costs about one SCF per
@@ -237,15 +237,15 @@ impl Default for MomGuard {
 /// - `Last`: one S0 SCF at the geometry the optimization ended on (cheap, gives
 ///   the adiabatic gap of the final structure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum MomGapCheck {
+pub enum MomS0Check {
     Off,
     Each,
     Last,
 }
 
-impl Default for MomGapCheck {
+impl Default for MomS0Check {
     fn default() -> Self {
-        MomGapCheck::Off
+        MomS0Check::Off
     }
 }
 
@@ -591,20 +591,15 @@ pub struct InputKeywords {
     /// Whether a failed MOM state check aborts or only warns (`mom_guard`,
     /// default `enforce`). See [`MomGuard`].
     pub mom_guard: MomGuard,
-    /// When to run the extra S0 SCF for a real adiabatic gap (`mom_gap_check`,
-    /// default `off`). See [`MomGapCheck`].
-    pub mom_gap_check: MomGapCheck,
-    /// Lower bound of the tracked-orbital overlap before the guard warns (`Ha`
-    /// free quantity: a cosine, default 0.5).
-    pub mom_overlap_warn: f64,
-    /// Lower bound of the tracked-orbital overlap before the guard aborts
-    /// (default 0.2).
-    pub mom_overlap_abort: f64,
-    /// Warn when the MOM determinant is within this distance (eV) of the
-    /// ground-state determinant built from the same orbitals (default 0.2).
-    pub mom_gap_warn: f64,
-    /// Abort when that distance is below this value (eV, default 0.05).
-    pub mom_gap_abort: f64,
+    /// When to run the extra S0 SCF for a real adiabatic gap (`mom_s0_check`,
+    /// default `off`). See [`MomS0Check`].
+    pub mom_s0_check: MomS0Check,
+    /// Abort when `E(MOM) - E(S0)` drops below this value (eV, default 0.05).
+    /// The only tunable guard threshold, and the only criterion that can tell
+    /// "the state is no longer an excited state". Needs `mom_s0_check = "each"`.
+    /// (The second criterion, the tracked-orbital overlap, has no keyword: it is
+    /// a fixed 0.2 cosine, see `scf_io::mom_guard`.)
+    pub mom_s0_gap_abort: f64,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
     /// Maximum memory available to **this MPI process** in MB, `None` if no limit.
@@ -841,11 +836,8 @@ impl InputKeywords {
             force_state_occupation: Vec::new(),
             mom_strategy: MomStrategy::Step,
             mom_guard: MomGuard::Enforce,
-            mom_gap_check: MomGapCheck::Off,
-            mom_overlap_warn: 0.5,
-            mom_overlap_abort: 0.2,
-            mom_gap_warn: 0.2,
-            mom_gap_abort: 0.05,
+            mom_s0_check: MomS0Check::Off,
+            mom_s0_gap_abort: 0.05,
             rpa_de_excitation_parameters: None,
             max_memory: None,
             max_memory_backup: None,
@@ -2159,7 +2151,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => panic!("ERROR: mom_strategy must be a string, got {:?}", other),
             };
 
-            // mom_guard / mom_gap_check: the state guard's action, and whether it
+            // mom_guard / mom_s0_check: the state guard's action, and whether it
             // also runs an S0 SCF per step or at the final geometry
             // (docs/dscf_s1_geomopt_plan.md, A3).
             tmp_input.mom_guard = match tmp_ctrl.get("mom_guard").unwrap_or(&serde_json::Value::Null) {
@@ -2175,36 +2167,21 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Null => MomGuard::Enforce,
                 other => panic!("ERROR: mom_guard must be a string, got {:?}", other),
             };
-            tmp_input.mom_gap_check = match tmp_ctrl.get("mom_gap_check").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.mom_s0_check = match tmp_ctrl.get("mom_s0_check").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_gap) => match tmp_gap.to_lowercase().as_str() {
-                    "off" => MomGapCheck::Off,
-                    "each" | "step" => MomGapCheck::Each,
-                    "last" | "final" => MomGapCheck::Last,
+                    "off" => MomS0Check::Off,
+                    "each" | "step" => MomS0Check::Each,
+                    "last" | "final" => MomS0Check::Last,
                     other => panic!(
-                        "ERROR: unknown mom_gap_check \"{}\". Valid values: \"off\" (default), \
+                        "ERROR: unknown mom_s0_check \"{}\". Valid values: \"off\" (default), \
                          \"each\" (one S0 SCF per geometry step), \"last\" (one at the final geometry).",
                         other
                     ),
                 },
-                serde_json::Value::Null => MomGapCheck::Off,
-                other => panic!("ERROR: mom_gap_check must be a string, got {:?}", other),
+                serde_json::Value::Null => MomS0Check::Off,
+                other => panic!("ERROR: mom_s0_check must be a string, got {:?}", other),
             };
-            tmp_input.mom_overlap_warn = match tmp_ctrl.get("mom_overlap_warn").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(0.5),
-                serde_json::Value::String(tmp_str) => tmp_str.parse().unwrap_or(0.5),
-                other => 0.5,
-            };
-            tmp_input.mom_overlap_abort = match tmp_ctrl.get("mom_overlap_abort").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(0.2),
-                serde_json::Value::String(tmp_str) => tmp_str.parse().unwrap_or(0.2),
-                other => 0.2,
-            };
-            tmp_input.mom_gap_warn = match tmp_ctrl.get("mom_gap_warn").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(0.2),
-                serde_json::Value::String(tmp_str) => tmp_str.parse().unwrap_or(0.2),
-                other => 0.2,
-            };
-            tmp_input.mom_gap_abort = match tmp_ctrl.get("mom_gap_abort").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.mom_s0_gap_abort = match tmp_ctrl.get("mom_s0_gap_abort").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(0.05),
                 serde_json::Value::String(tmp_str) => tmp_str.parse().unwrap_or(0.05),
                 other => 0.05,

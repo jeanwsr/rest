@@ -280,24 +280,28 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
 
     let basis_diff = loaded_nbasis != mol_target.num_basis || loaded_nmo != mol_target.num_state;
 
-    // A *large* geometry difference is not a reason to re-express the guess: the
-    // atom-centred basis functions keep their identity when the nuclei move, so
-    // the coefficients are directly reusable, while the projection goes through a
-    // cross overlap between the two geometries that is far from the identity and
-    // can be numerically ill-conditioned. Observed consequence (an ethylene S1
-    // optimization started from a 45 deg twisted geometry, reference chkfile taken
-    // planar): the projected MOs degenerated, a MOM reference orbital built from
-    // them had ~zero overlap with every current orbital, the occupation fell back
-    // to the Aufbau filling and the "excited state" optimization silently ran on
-    // the ground state. Warn instead of letting the user find out that way.
+    // A large geometry difference means the guess gets re-expressed through a cross
+    // overlap between two displaced basis sets. Two things are worth knowing:
+    //   * by default `proj_mo` projects only the occupied block and ZERO-PADS the
+    //     rest, so every *virtual* orbital of the reference is lost. That is fatal
+    //     for a maximum-overlap (`force_state_occupation`) run, whose particle
+    //     orbital is a virtual: the reference column becomes a zero vector and the
+    //     state collapses into the Aufbau filling without a single error line.
+    //     MOM jobs therefore project the full spectrum (see
+    //     `initial_guess_from_hdf5chk`), which is why this is a warning now and
+    //     not a failure.
+    //   * the projected virtuals are only column-normalized, not mutually
+    //     orthonormal, and their quality degrades with the displacement.
+    // Either way, a chkfile written at (or near) the starting geometry is the safe
+    // choice; say so rather than let the user discover it through a collapsed state.
     if geom_diff && geom_shift > 0.2 && !basis_diff {
         warn!(
-            "the initial guess is taken from a chkfile written at a different geometry \
-             (largest atom displacement {:.3} bohr = {:.3} Angstrom). It will be re-expressed in the \
-             target basis, which is reliable only for small distortions; for a large one the \
-             projected orbitals can degenerate. Prefer a reference written at (or near) the \
-             starting geometry -- this matters especially for maximum-overlap (force_state_occupation) \
-             runs, where a degenerate reference makes the state collapse.",
+            "the initial guess comes from a chkfile written at a different geometry \
+             (largest atom displacement {:.3} bohr = {:.3} Angstrom); it will be re-expressed \
+             through a cross overlap between the two geometries. For a large displacement the \
+             projected orbitals degrade, and outside the projected block they are zero-padded \
+             (maximum-overlap / force_state_occupation runs project the full spectrum for that \
+             reason). Prefer a chkfile written at (or near) the starting geometry.",
             geom_shift, geom_shift * 0.52917721067
         );
     }
