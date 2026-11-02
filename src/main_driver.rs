@@ -380,6 +380,10 @@ pub fn main_driver() -> anyhow::Result<()> {
                     }
                     geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark, &mpi_operator)
                         .map_err(|e| anyhow::anyhow!("Geometry optimization (geometric_pyo3 engine) failed: {}", e))?;
+                    // MOM (`mom_gap_check = "last"`): one S0 SCF at the geometry the
+                    // optimization ended on, for the adiabatic gap of the final
+                    // structure (the per-step variant runs inside the state guard).
+                    scf_data.mom_final_gap_report(&mpi_operator);
                     println!("Geometry after relaxation [Ang]:");
                     println!("{}", scf_data.mol.geom.formated_geometry());
                     time_mark.count("geom_opt");
@@ -766,6 +770,28 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     }
 
     //==================================================================
+    // MOM (`force_state_occupation`): is this still the state that was asked
+    // for? The guard compares the current determinant with the ground-state
+    // determinant built from the same orbitals (one extra Fock build), with the
+    // spin signature of the first converged step and with the tracked-orbital
+    // overlap (`SCF::mom_state_check`, docs/dscf_s1_geomopt_plan.md A3). It runs
+    // BEFORE the reference commit: a state that fails the check must not become
+    // the reference of the following steps.
+    //==================================================================
+    scf_data.mom_state_check(mpi_operator);
+
+    //==================================================================
+    // MOM: roll the maximum-overlap reference forward to this geometry step's
+    // converged orbitals, so that the next step of a geometry optimization
+    // compares against its own predecessor instead of against the first
+    // (Franck-Condon) geometry.
+    // No-op unless `[ctrl] mom_strategy = "step"` (the default) and an
+    // occupation constraint is present; nothing is committed when the SCF
+    // did not converge. See `SCF::mom_commit_reference`.
+    //==================================================================
+    scf_data.mom_commit_reference();
+
+    //==================================================================
     // Store the open-shell singlet energies (E_mix / K_ab / E_T / E_S)
     // so that the chkfile and the total-energy collection see the
     // spin-purified ROKS total energy E_S = 2 E_mix - E_T
@@ -919,6 +945,23 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     // branch (would differentiate E_mix, not E_S) would give wrong results.
     if scf_data.mol.ctrl.oss_roks {
         panic!("ERROR: rohf-oss: forces / geometry optimization are not yet supported for oss_roks (planned for Phase 2, Step 5)");
+    }
+
+    // A force / geometry-optimization step of a MOM state must not differentiate
+    // a state the SCF did not settle on: which determinant is being computed is
+    // decided by the overlap selection inside the SCF, so a non-converged step
+    // can belong to a *different* determinant than the previous one, and the
+    // optimizer would receive a discontinuous energy and a meaningless gradient.
+    // Fail closed instead of continuing silently.
+    if !scf_data.mol.ctrl.force_state_occupation.is_empty() && !scf_data.scf_converged {
+        panic!(
+            "ERROR: the SCF of this force / geometry-optimization step with force_state_occupation \
+             (MOM) did not converge (or the iteration was skipped with [ctrl] noiter), so the \
+             electronic state of this geometry is not defined and its gradient cannot be used. \
+             Either make the step converge -- raise [ctrl] max_scf_cycle, check scf_acc_rho / \
+             scf_acc_etot, add [ctrl] mix_param damping, or reduce the geometry step via \
+             [geometric_pyo3] tmax -- or verify the state by hand at this geometry first."
+        );
     }
 
     time_mark.count_start("force");

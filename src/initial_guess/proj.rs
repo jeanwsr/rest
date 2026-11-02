@@ -232,13 +232,18 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
         }
 
     let mut geom_diff = true;
+    let mut geom_shift: f64 = 0.0;
     if let Some(ref sgeom) = source_geom {
         if sgeom.unit == mol_target.geom.unit
             && sgeom.position.size() == mol_target.geom.position.size()
         {
-            geom_diff = sgeom.position.iter()
-                .zip(mol_target.geom.position.iter())
-                .any(|(s, t)| (s - t).abs() > GEOM_TOL);
+            for (s, t) in sgeom.position.iter().zip(mol_target.geom.position.iter()) {
+                let d = (s - t).abs();
+                if d > geom_shift {
+                    geom_shift = d;
+                }
+            }
+            geom_diff = geom_shift > GEOM_TOL;
         }
     } else {
         geom_diff = false;
@@ -246,7 +251,11 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
             let s_ptr = source_atm[i][ATM_ENV] as usize;
             let t_ptr = mol_target.cint_atm[i][ATM_ENV] as usize;
             for d in 0..3 {
-                if (source_env[s_ptr + d] - mol_target.cint_env[t_ptr + d]).abs() > GEOM_TOL {
+                let diff = (source_env[s_ptr + d] - mol_target.cint_env[t_ptr + d]).abs();
+                if diff > geom_shift {
+                    geom_shift = diff;
+                }
+                if diff > GEOM_TOL {
                     geom_diff = true;
                     break;
                 }
@@ -270,6 +279,28 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     mol_source.num_elec = src_ne;
 
     let basis_diff = loaded_nbasis != mol_target.num_basis || loaded_nmo != mol_target.num_state;
+
+    // A *large* geometry difference is not a reason to re-express the guess: the
+    // atom-centred basis functions keep their identity when the nuclei move, so
+    // the coefficients are directly reusable, while the projection goes through a
+    // cross overlap between the two geometries that is far from the identity and
+    // can be numerically ill-conditioned. Observed consequence (an ethylene S1
+    // optimization started from a 45 deg twisted geometry, reference chkfile taken
+    // planar): the projected MOs degenerated, a MOM reference orbital built from
+    // them had ~zero overlap with every current orbital, the occupation fell back
+    // to the Aufbau filling and the "excited state" optimization silently ran on
+    // the ground state. Warn instead of letting the user find out that way.
+    if geom_diff && geom_shift > 0.2 && !basis_diff {
+        warn!(
+            "the initial guess is taken from a chkfile written at a different geometry \
+             (largest atom displacement {:.3} bohr = {:.3} Angstrom). It will be re-expressed in the \
+             target basis, which is reliable only for small distortions; for a large one the \
+             projected orbitals can degenerate. Prefer a reference written at (or near) the \
+             starting geometry -- this matters especially for maximum-overlap (force_state_occupation) \
+             runs, where a degenerate reference makes the state collapse.",
+            geom_shift, geom_shift * 0.52917721067
+        );
+    }
 
     if basis_diff || geom_diff {
         return GuessAction::Project(mol_source);

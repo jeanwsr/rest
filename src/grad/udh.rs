@@ -42,7 +42,8 @@ use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
 use crate::grad::rhf::{
-    generator_deriv_hcore, get_dme0, get_grad_dao_ovlp, pack_triu_tilde, RIHFGradientFlagsBuilder,
+    generator_deriv_hcore, get_dme0, get_grad_dao_ovlp, occupation_is_aufbau, occupation_summary,
+    pack_triu_tilde, RIHFGradientFlagsBuilder,
 };
 use crate::grad::traits::GradAPI;
 use crate::grad::uhf::RIUHFGradient;
@@ -94,6 +95,21 @@ impl<'a> UDHGradient<'a> {
         assert!(mol_obj.ctrl.spin_polarization, "UDHGradient supports only unrestricted (spin-polarization = true) references.");
         assert!(matches!(scf_data.scftype, SCFType::UHF), "UDHGradient supports only UHF references.");
         assert!(mol_obj.start_mo == 0, "UDHGradient does not support frozen core (start_mo).");
+        // A Delta-SCF / MOM occupation breaks the contiguous `0..nocc` /
+        // `nocc..nmo` split the PT2 pair spaces are built from; refuse it
+        // instead of returning a silently wrong correlation gradient.
+        for spin in 0..2 {
+            assert!(
+                occupation_is_aufbau(&scf_data.occupation[spin]),
+                "The DH (PT2-family) analytic gradient does not support a non-Aufbau occupation \
+                 (MOM / force_state_occupation) in spin channel {}: {}. The PT2 occupied/virtual \
+                 spaces are built from the contiguous 0..nocc / nocc..nmo split. Either optimize \
+                 the geometry with the SCF functional (a non-PT2 `xc`), or drop \
+                 force_state_occupation.",
+                spin,
+                occupation_summary(&scf_data.occupation[spin])
+            );
+        }
         assert!(self.mpi_operator.is_none(), "UDHGradient is not MPI-parallelized yet.");
         assert!(
             scf_data.mol.xc_data.omega().is_none(),
