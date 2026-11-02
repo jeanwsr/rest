@@ -300,7 +300,22 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             scf_data.eigenvalues = eigenvalues;
             scf_data.eigenvectors = eigenvectors;
             if let Some(occupation) = is_occupation {
-                scf_data.occupation = occupation;
+                // For the restricted open-shell singlet, derive the
+                // open-shell orbital indices (a: alpha-only, b: beta-only)
+                // from the occupation pattern of the imported wavefunction
+                // when they are not given explicitly (see
+                // `derive_oss_pair_from_occupation`).
+                if scf_data.mol.ctrl.oss_roks && scf_data.mol.ctrl.oss_pair.is_none() {
+                    derive_oss_pair_from_occupation(scf_data, &occupation);
+                }
+                if scf_data.mol.ctrl.oss_roks {
+                    // Explicit `oss_pair` (or the pair just derived above):
+                    // build the OSS occupation alpha = c + {a}, beta = c + {b}
+                    // from the imported orbitals, ignoring the file occupation.
+                    scf_data.generate_occupation();
+                } else {
+                    scf_data.occupation = occupation;
+                }
                 // let (homo, lumo) = scf_io::util::get_homo_lumo_from_occ_integer(&scf_data.occupation, &scf_data.scftype);
                 // scf_data.homo = homo;
                 // scf_data.lumo = lumo;
@@ -312,6 +327,89 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             // println!("occ {:?}", scf_data.occupation);
             scf_data.generate_density_matrix();
         }
+
+
+/// Derive the open-shell orbital pair `(a, b)` of the restricted open-shell
+/// singlet from the occupation pattern of an imported wavefunction, and fix
+/// it in `ctrl.oss_pair` (fixed-index scheme, shared by every SCF iteration).
+///
+/// `a` (alpha-only occupied) already indexes the common (alpha) orbital set.
+/// The beta open-shell orbital `j` belongs to the independently sorted beta
+/// channel of a UHF/MOM file, so it is mapped onto the common space by the
+/// maximum overlap `<psi_beta_j|S|psi_alpha_i>`; a single-channel (ROHF)
+/// import shares one orbital set and the index is exact.
+fn derive_oss_pair_from_occupation(scf_data: &mut SCF, occupation: &[Vec<f64>; 2]) {
+    let num_state = scf_data.mol.num_state;
+    // per-spin occupations are required to identify the
+    // open-shell pattern; a single-channel (RHF) guess file
+    // only stores the total occupation and cannot serve this
+    if occupation[0].len() != num_state || occupation[1].len() != num_state {
+        panic!("ERROR: rohf-oss requires per-spin occupations in the imported wavefunction (UHF/MOM or ROHF guess file); a single-channel (RHF) guess file cannot identify the open-shell orbitals");
+    }
+    // Step 1: locate the open-shell pattern in the occupation
+    // arrays: a single alpha-only orbital (index a, already in
+    // the common space) and a single beta-only orbital (index
+    // j, in the beta channel).
+    let mut orb_a: Option<usize> = None;
+    let mut orb_b_beta: Option<usize> = None;
+    (0..num_state).for_each(|i| {
+        let occ_a = occupation[0][i];
+        let occ_b = occupation[1][i];
+        if occ_a > 0.5 && occ_b < 0.5 {
+            if orb_a.is_some() {
+                panic!("ERROR: the imported wavefunction contains more than one alpha-only occupied orbital (orbital {} and {}), not an rohf-oss pattern", orb_a.unwrap(), i);
+            }
+            orb_a = Some(i);
+        } else if occ_b > 0.5 && occ_a < 0.5 {
+            if orb_b_beta.is_some() {
+                panic!("ERROR: the imported wavefunction contains more than one beta-only occupied orbital (orbital {} and {}), not an rohf-oss pattern", orb_b_beta.unwrap(), i);
+            }
+            orb_b_beta = Some(i);
+        }
+    });
+    let (a, j) = match (orb_a, orb_b_beta) {
+        (Some(a), Some(j)) => (a, j),
+        _ => {
+            panic!("ERROR: the imported wavefunction does not exhibit a single alpha-only and a single beta-only occupied orbital, which is required for rohf-oss");
+        }
+    };
+    // Step 2: map the beta open-shell orbital j onto the common
+    // (alpha) orbital space. The alpha and beta channels of a
+    // UHF/MOM file are two independently sorted orbital sets,
+    // so beta orbital j is in general NOT the same function as
+    // alpha orbital j: instead locate the alpha orbital with
+    // the largest overlap <psi_beta_j|S|psi_alpha_i>.
+    let b = if !scf_data.eigenvectors[1].data.is_empty() {
+        // two-channel import (UHF/MOM file): build
+        // M = C_beta^T S C_alpha with M[j][i] = <psi_beta_j|psi_alpha_i>
+        let ovlp_full = scf_data.ovlp.to_matrixfull().unwrap();
+        let c_alpha = scf_data.eigenvectors[0].to_matrixfullslice();
+        let c_beta = scf_data.eigenvectors[1].to_matrixfullslice();
+        let tmp = _dgemm_tn(&c_beta, &ovlp_full.to_matrixfullslice());
+        let m_ovlp = _dgemm_nn(&tmp.to_matrixfullslice(), &c_alpha);
+        // column-major: M.data[j + i*num_state] = M[j][i]
+        let mut best_i = 0usize;
+        let mut best_ovlp = -1.0f64;
+        (0..num_state).for_each(|i| {
+            let ovlp_ij = m_ovlp.data[j + i * num_state];
+            if ovlp_ij.abs() > best_ovlp {
+                best_ovlp = ovlp_ij.abs();
+                best_i = i;
+            }
+        });
+        println!("rohf-oss: beta open-shell orbital {} mapped onto the common space: alpha orbital {} (overlap = {:.6})", j, best_i, best_ovlp);
+        best_i
+    } else {
+        // single-channel import (ROHF file): alpha and beta
+        // share the same orbital set, so the index is exact
+        j
+    };
+    if a == b {
+        panic!("ERROR: the imported wavefunction has a == b for the open-shell orbitals ({})", a);
+    }
+    scf_data.mol.ctrl.oss_pair = Some([a, b]);
+    println!("rohf-oss: open-shell orbitals derived from the imported wavefunction: alpha = {}, beta = {}", a, b);
+}
 
 pub fn initial_guess_from_hdf5guess(mol: &Molecule) -> Vec<MatrixFull<f64>> {
     info!("Importing density matrix from external initial guess file");
@@ -374,6 +472,9 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
 }
 
 pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, ovlp: &MatrixUpper<f64>, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
+    if mol.ctrl.oss_roks && mol.ctrl.u2r_style != U2RStyle::KeepAlpha {
+        panic!("ERROR: oss_roks requires u2r_style = \"keepalpha\": the open-shell pair (a, b) is read from the per-spin occupation pattern of the imported wavefunction, which the \"average\" / \"natural\" styles do not preserve");
+    }
     match proj::decide_guess(chkfile, &*mol) {
         proj::GuessAction::Refuse(reason) => {
             panic!("Cannot use chkfile '{}' for initial guess: {}", chkfile, reason);
