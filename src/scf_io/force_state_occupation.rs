@@ -282,17 +282,28 @@ pub fn determine_force_projection_v02(
             let p_state = i_obj.prev_state;
             let c_start = i_obj.force_check_min;
 
+            // A restricted open-shell (ROHF/ROKS) calculation stores a single
+            // common orbital set in channel 0, so a constraint addressed to
+            // channel 1 cannot be matched against channel 1 of the current
+            // orbitals: fall back to channel 0 for the overlap search. The
+            // occupation itself is still written into the requested target
+            // channel by adapt_occupation_with_force_projection. The same
+            // fallback applies to the reference when it holds only one channel
+            // (e.g. a ROHF chkfile used as the MOM reference).
+            let cur_spin = if eigenvectors[t_spin].size()[0] == 0 { 0 } else { t_spin };
+            let ref_spin = if ref_eigenvectors[p_spin].size()[0] == 0 { 0 } else { p_spin };
+
             i_obj.ovlp = 0.0;
             i_obj.curr_state = 0;
 
             //let prev_eigenvector = &ref_eigenvectors[p_spin][(..,p_state)];
             let mut prev_eigenvector = vec![0.0;eigenvectors[0].size()[0]];
-            prev_eigenvector[*global_index..*global_index+num_basis].iter_mut().zip(ref_eigenvectors[p_spin][(..,p_state)].iter()).for_each(|(to, from)| {
+            prev_eigenvector[*global_index..*global_index+num_basis].iter_mut().zip(ref_eigenvectors[ref_spin][(..,p_state)].iter()).for_each(|(to, from)| {
                 *to = *from
             });
 
             let r_states = (i_obj.force_check_min..i_obj.force_check_max);
-            eigenvectors[t_spin].iter_columns(r_states).enumerate().for_each(|(il,curr_eigenvector)| {
+            eigenvectors[cur_spin].iter_columns(r_states).enumerate().for_each(|(il,curr_eigenvector)| {
                 let cur_state = il + c_start;
                 let mut tmp_vec = vec![0.0;curr_eigenvector.len()];
                 _dgemv(&ovlp_full,curr_eigenvector,&mut tmp_vec,'n',1.0,0.0,1,1);

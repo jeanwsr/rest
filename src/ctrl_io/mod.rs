@@ -191,6 +191,55 @@ pub enum HamiltonianDistributedMode {
 ///  - `even_tempered-basis`: `Bool`. True: turn on ETB to generate the auxiliary basis set
 ///  - `etb_start_atom_number`: `Usize`. Use ETB, for the element with atomic index larger than this value  
 ///  - `etb_beta`: `f64`. Relevant to the ETB basis set size. Smaller value indicates larger ETB basis set. NOTE: etb_beta should be larger than 1.0
+/// Strategy for importing a two-channel (UHF/UKS) wavefunction into a
+/// restricted (RHF/ROHF/ROKS) calculation, where only one common spatial
+/// orbital set can be carried over.
+///
+/// The alpha and beta channels of a UHF/UKS solution are optimized
+/// independently and do not share a common basis, so the import has to
+/// *choose* one orthonormal set:
+///
+/// * `keepalpha` (default): keep the alpha channel.  The beta channel is still
+///   read in, but only as the MOM / force-state reference.
+/// * `keepbeta`: keep the beta channel instead.
+/// * `natural`: natural orbitals (Lowdin) of the total one-particle density
+///   `D = D_alpha + D_beta`, i.e. the unrestricted natural orbitals (UNO),
+///   ordered by decreasing occupation.  This is the only mixing style: an
+///   average of the two *coefficient* matrices is not well defined (the two
+///   channels are complete orthonormal bases of the same AO space, so their
+///   overlap matrix is orthogonal), and any proper corresponding-orbital
+///   average of the occupied spaces reproduces exactly this eigenbasis.
+///
+/// For weakly spin-polarized sources all styles give the same guess up to
+/// `1 - sigma_min`; they differ when the UHF/UKS solution is strongly
+/// spin-polarized or symmetry broken.  Only the two `keep*` styles retain the
+/// per-spin structure that the restricted open-shell singlet needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum U2RStyle {
+    KeepAlpha,
+    KeepBeta,
+    Natural,
+}
+
+impl U2RStyle {
+    pub const KEYWORDS: [&'static str; 3] = ["keepalpha", "keepbeta", "natural"];
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            U2RStyle::KeepAlpha => "keepalpha",
+            U2RStyle::KeepBeta => "keepbeta",
+            U2RStyle::Natural => "natural",
+        }
+    }
+    pub fn from_keyword(keyword: &str) -> Option<U2RStyle> {
+        match keyword.to_lowercase().as_str() {
+            "keepalpha" | "keep_alpha" | "alpha" => Some(U2RStyle::KeepAlpha),
+            "keepbeta" | "keep_beta" | "beta" => Some(U2RStyle::KeepBeta),
+            "natural" | "uno" => Some(U2RStyle::Natural),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug,Clone,Serialize, Deserialize)]
 #[pyclass]
 pub struct InputKeywords {
@@ -417,6 +466,16 @@ pub struct InputKeywords {
     // Keywords for sad initial guess
     #[pyo3(get, set)]
     pub atom_sad: bool,
+    /// Use the PEXSI pole-expanded selected-inversion solver for the SCF step
+    /// instead of the O(N^3) diagonalisation (`ctrl.pexsi = true`).
+    ///
+    /// Run-time switch: no rebuild is needed to go back to diagonalisation.
+    /// Needs a build with the `pexsi` feature — without it the keyword is
+    /// reported and ignored. Refused for the nested SAD SCF (`atom_sad = true`),
+    /// which is a doublet. Validated for LDA/GGA; with exact exchange the frozen
+    /// `H_core` pattern truncates the 1/R tail of `K`, which only warns.
+    #[pyo3(get, set)]
+    pub pexsi: bool,
     pub empirical_dispersion: Option<String>,
     pub occupation_type: OCCType,
     pub frac_tolerant: f64,
@@ -482,6 +541,31 @@ pub struct InputKeywords {
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
+    /// How a two-channel (UHF/UKS) guess file is converted into the single
+    /// common orbital set of a restricted (RHF/ROHF/ROKS) calculation
+    /// (keyword `u2r_style`, default "keepalpha").  See [`U2RStyle`].
+    pub u2r_style: U2RStyle,
+    // Keywords for the restricted open-shell singlet (rohf-oss) calculations
+    // Force the ROHF path even when n_alpha == n_beta (singlet), with alpha
+    // occupying orbital a and beta occupying orbital b (a != b).
+    #[pyo3(get, set)]
+    pub oss_roks: bool,
+    /// (a, b): 0-based orbital indices of the singly-occupied alpha (a) and
+    /// beta (b) orbitals. None => automatic choice a = nc, b = nc + 1
+    /// (nc = number of closed-shell orbitals), i.e. Q-Chem RHF-OSS style.
+    pub oss_pair: Option<[usize; 2]>,
+    /// OSS + fifth-rung PT2-family energy assembly (default true): the
+    /// Q-Chem ROKS *structure* -- one SCF plus one PT2 pass. The PT2
+    /// reference is the **OSS occupation** (alpha in a, beta in b, the beta
+    /// hole kept open) in the OSS semi-canonical basis:
+    ///   E_S(DH) = E_S(SCF) + PT2(OSS occupation)
+    /// This is the REST OSS reference; the Q-Chem ROKS-MP2 reference is
+    /// undocumented and is not matched (see PR4_oss_roks.md). The triplet
+    /// PT2 pass is skipped (`store_oss_energies` caches pt2_c = [0;3]).
+    /// When false, the legacy double-pass assembly is used instead:
+    /// PT2_t on the triplet occupation is evaluated and
+    ///   E_S(DH) = 2 E_mix(DH) - E_T(DH).
+    pub oss_pt2_single_pass: bool,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -641,6 +725,8 @@ impl InputKeywords {
             //output_fchk: false,
             // Keyword to turn on atom calculations for the SAD initial guess
             atom_sad: false,
+            // Keyword to use the PEXSI solver instead of diagonalisation
+            pexsi: false,
             // Derived keywords of identifying the method used
             //use_dft: false,
             //dft_type: None,
@@ -665,6 +751,10 @@ impl InputKeywords {
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
+            u2r_style: U2RStyle::KeepAlpha,
+            oss_roks: false,
+            oss_pair: None,
+            oss_pt2_single_pass: true,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
@@ -834,6 +924,17 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("                            {:e} Ha. for grad_dm", ctrl.scf_acc_g);
         println!("SCF convergence criteria:       {}", ctrl.scf_conv_criteria);
         println!("Max. SCF cycle number:      {}", ctrl.max_scf_cycle);
+        // Which solver will drive the SCF. Three states worth distinguishing:
+        // requested and compiled in, requested but not compiled in, not
+        // requested.
+        let solver_line = if ctrl.pexsi && cfg!(feature = "pexsi") {
+            "PEXSI (pole-expanded selected inversion)"
+        } else if ctrl.pexsi {
+            "diagonalisation (pexsi requested, but this build has no pexsi feature)"
+        } else {
+            "diagonalisation"
+        };
+        println!("SCF solver:                 {}", solver_line);
         match geom.pbc {
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
@@ -887,6 +988,22 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         };
         for fso in ctrl.force_state_occupation.iter_mut() {
             fso.normalize_ref_index(actual_file);
+        }
+    }
+
+    // sanity checks for the restricted open-shell singlet (rohf-oss) mode
+    if ctrl.oss_roks {
+        if ctrl.spin_polarization {
+            panic!("ERROR: oss_roks is incompatible with spin_polarization=true (the restricted open-shell singlet requires a common orbital set)");
+        }
+        if ctrl.force_state_occupation.len() > 0 {
+            warn!("oss_roks: the occupation pattern is overridden by force_state_occupation (MOM)");
+        }
+        info!("Restricted open-shell singlet (rohf-oss) calculation is requested.");
+        if let Some([orb_a, orb_b]) = ctrl.oss_pair {
+            info!("Open-shell orbitals: alpha = {}, beta = {}", orb_a, orb_b);
+        } else {
+            info!("Open-shell orbitals: automatic choice (alpha = HOMO, beta = LUMO)");
         }
     }
 
@@ -1995,6 +2112,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {false},
             };
 
+            // for the SCF solver: pexsi = true switches the solve step from
+            // diagonalisation to the PEXSI selected inversion. Accepted as a
+            // bool, a string ("true"/"false") or a number (1/0), because the
+            // input file may be written with any of the three.
+            tmp_input.pexsi = match tmp_ctrl.get("pexsi").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value::Number(tmp_num) => tmp_num.as_i64().unwrap_or(0) != 0,
+                _ => false,
+            };
+            if tmp_input.pexsi && !cfg!(feature = "pexsi") {
+                warn!(
+                    "`pexsi = true` is set in [ctrl], but this build has no `pexsi` feature; \
+                        the SCF will use diagonalisation. Rebuild with \
+                        `cargo build --features pexsi` to use it."
+                );
+            }
+
             tmp_input.max_memory = match tmp_ctrl.get("max_memory").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
                 other => None,
@@ -2095,6 +2230,39 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => false,
             };
             
+            // for oss_roks: force the restricted open-shell singlet (rohf-oss) mode
+            tmp_input.oss_roks = match tmp_ctrl.get("oss_roks").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                other => false,
+            };
+            // for oss_pair: [a, b] with 0-based orbital indices of the singly-occupied
+            // alpha (a) and beta (b) orbitals; None (default) => automatic a=nc, b=nc+1
+            tmp_input.oss_pair = match tmp_ctrl.get("oss_pair").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_value) => {
+                    if tmp_value.len() == 2 {
+                        let orb_a = tmp_value[0].as_i64().unwrap_or(-1);
+                        let orb_b = tmp_value[1].as_i64().unwrap_or(-1);
+                        if orb_a >= 0 && orb_b >= 0 {
+                            Some([orb_a as usize, orb_b as usize])
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                other => None,
+            };
+            // for oss_pt2_single_pass: assemble E_S(DH) with a single PT2 on
+            // the OSS occupation (default true)
+            // or with the legacy double-pass 2 E_mix(DH) - E_T(DH)
+            // assembly (separate triplet PT2 pass).
+            tmp_input.oss_pt2_single_pass = match tmp_ctrl.get("oss_pt2_single_pass").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                other => true,
+            };
             // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
             tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
@@ -2117,6 +2285,23 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => 0_usize,
             };
 
+            // for u2r_style: how a two-channel (UHF/UKS) guess file is converted
+            // into the single common orbital set of a restricted calculation.
+            tmp_input.u2r_style = match tmp_ctrl.get("u2r_style").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => match U2RStyle::from_keyword(tmp_str) {
+                    Some(style) => style,
+
+                    None => panic!(
+                        "ERROR: not recognized option for u2r_style: \"{}\" (available: {})",
+                        tmp_str, U2RStyle::KEYWORDS.join("\", \"")
+                    ),
+                },
+                serde_json::Value::Null => U2RStyle::KeepAlpha,
+                _ => panic!(
+                    "ERROR: u2r_style expects a string (available: {})",
+                    U2RStyle::KEYWORDS.join("\", \"")
+                ),
+            };
             tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
                 other => {None},
