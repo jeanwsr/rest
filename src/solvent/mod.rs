@@ -216,7 +216,11 @@ impl PcmStatic{
         // PCM contractions reduce to `M` applied once plus one dgemv against `rimatr`.
         // Only built when the prototype path is requested: the eigendecomposition of
         // the `naux × naux` metric is not free, and every other path ignores it.
-        let j2c_factor = if std::env::var("REST_PCM_RI_REUSE").map(|v| v == "1").unwrap_or(false) {
+        // The RI-reuse path (contracting against the resident rimatr instead of
+        // re-evaluating 3c integrals each iteration) is the DEFAULT since it cuts
+        // the per-iteration PCM cost from ~90s to ~8-15s on large systems. Set
+        // REST_PCM_RI_REUSE=0 to disable and fall back to the integral path.
+        let j2c_factor = if !std::env::var("REST_PCM_RI_REUSE").map(|v| v == "0").unwrap_or(false) {
             let j2c = mol.int_ij_aux_columb();
             // `M = J^{-1/2}`. The spectral route (`_dsyevd` on the naux x naux metric) runs
             // close to single-threaded in this OpenBLAS and cost ~800 s at naux = 11.6k;
