@@ -9,7 +9,7 @@ use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_nn_serial};
 use std::convert::TryInto;
 use std::f64::consts::{PI, E};
 use libm;
-use crate::basis_io::basic_math::{delta_r, opowf, double_factorial, specific_double_factorial};
+use crate::utilities::basic_math::opowf;
 use crate::constants::{C2S_L0, C2S_L1, C2S_L2, C2S_L3, C2S_L4, CarBasInfo, c2s_matrix_const, cartesian_gto_const, cint_cartesian_gto_const};
 use crate::utilities;
 use super::Basis4Elem;

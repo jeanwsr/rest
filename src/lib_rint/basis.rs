@@ -1,6 +1,7 @@
 use crate::basis_io::{BasCell, Basis4Elem};
 use crate::constants::c2s_matrix_const;
 use crate::geom_io::GeomCell;
+use crate::utilities::basic_math::{double_factorial_u128, factorial_u128, log_double_factorial_odd};
 use rest_tensors::{MatrixFull, TensorOpt, TensorOptMut};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -104,47 +105,6 @@ pub struct ShellCoeffDebugRow {
 // Math utilities (f64 only)
 // =========================
 
-/// Factorial n! as u128 (sufficient for small n used in normalization).
-/// For larger n you should switch to log-factorial to avoid overflow.
-pub fn factorial_u128(n: usize) -> u128 {
-    if n <= 1 {
-        return 1;
-    }
-    let mut result: u128 = 1;
-    for i in 2..=n {
-        result = result.saturating_mul(i as u128);
-    }
-    result
-}
-
-/// Double factorial n!! as u128.
-/// For n <= 0, return 1.
-pub fn double_factorial_u128(n: i32) -> u128 {
-    if n <= 0 {
-        return 1;
-    }
-    let mut result: u128 = 1;
-    let mut k = n;
-    while k > 0 {
-        result = result.saturating_mul(k as u128);
-        k -= 2;
-    }
-    result
-}
-
-/// log((2k-1)!!) accumulated form, used for log-safe normalization.
-/// Here input is n where we mean (2n-1)!! for odd double factorial.
-pub fn log_double_factorial_odd(n: u32) -> f64 {
-    if n == 0 {
-        return 0.0;
-    }
-    let mut s = 0.0_f64;
-    for k in 1..=n {
-        let odd = 2.0 * (k as f64) - 1.0;
-        s += odd.ln();
-    }
-    s
-}
 
 /// Cartesian primitive Gaussian normalization constant N(alpha,lx,ly,lz)
 /// such that integral |N x^lx y^ly z^lz e^{-alpha r^2}|^2 d^3r = 1.

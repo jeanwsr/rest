@@ -8,10 +8,22 @@ use tensors::{MathMatrix, ParMathMatrix};
 use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_nn_serial};
 use std::convert::TryInto;
 use std::f64::consts::{PI, E};
-use crate::basis_io::basic_math::{delta_r, opowf, double_factorial, specific_double_factorial};
+use crate::utilities::basic_math::{double_factorial, opowf, specific_double_factorial};
 use crate::constants::{self, C2S_L0, C2S_L1, C2S_L2, C2S_L3, C2S_L4, CarBasInfo, c2s_matrix_const, cartesian_gto_const, cint_cartesian_gto_const};
 use crate::utilities;
 use super::{cint_norm_factor, cint_cart_norm_factor};
+
+/// displacement vector and its squared norm between two points
+#[inline]
+fn delta_r(r1: &[f64;3], r2: &[f64;3]) -> ([f64;3],f64) {
+    let mut dr = [0.0;3];
+    let mut res = 0.0;
+    for i in 0..3 {
+        dr[i] = r1[i] - r2[i];
+        res += dr[i]*dr[i];
+    }
+    return (dr, res);
+}
 
 /// produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
 ///

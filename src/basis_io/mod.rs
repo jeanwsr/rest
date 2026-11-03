@@ -18,21 +18,18 @@ use std::io::{Write,BufRead, BufReader};
 use rest_libcint::{CINTR2CDATA, CintType};
 use std::f64::consts::{PI, E};
 use libm;
-use crate::basis_io::basic_math::{delta_r, opowf};
 use crate::constants::{self, C2S_L0, C2S_L1, C2S_L2, C2S_L3, C2S_L4, CarBasInfo, c2s_matrix_const, cartesian_gto_const, cint_cartesian_gto_const};
 use crate::utilities;
 pub mod bse_downloader;
 pub mod basis_list;
 pub mod etb;
 pub mod ecp;
-pub(crate) mod basic_math;
 mod gto_cartesian;
 pub use gto_cartesian::*;
 mod gto_value;
 pub use gto_value::*;
 #[cfg(test)]
 mod tests;
-use self::basic_math::{double_factorial, specific_double_factorial};
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct BasCellRaw {
