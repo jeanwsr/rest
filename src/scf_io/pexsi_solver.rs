@@ -429,7 +429,7 @@ fn check_reference(scf: &SCF) -> Result<(), String> {
 /// is just the answer for a truncated Fock. Flipping this to a hard error is a
 /// one-line change if the group decides a silent bias is worse than a refusal.
 fn warn_if_exact_exchange(scf: &SCF) {
-    if scf.mol.use_eri {
+    if scf.mol.dfadef.is_hybrid() {
         warn!(
             "PEXSI: xc = `{}` builds exact-exchange factors (dfa_hybrid_scf = {:.6}), so F is \
              NOT contained in the H_core pattern: K_ij needs only (i,k) and (j,l) to overlap \
@@ -437,7 +437,7 @@ fn warn_if_exact_exchange(scf: &SCF) {
              Measured on H2O20/cc-pVDZ: max|F_off| = 5.8e-4, ||F_off||_F = 3.7e-3, converged \
              energy 13.7 mHa away from the diagonalisation path. The PEXSI path is validated \
              for LDA/GGA only; treat this density as approximate.",
-            scf.mol.ctrl.xc, scf.mol.xc_data.dfa_hybrid_scf
+            scf.mol.ctrl.xc, scf.mol.dfadef.dfa_hybrid_scf
         );
     }
 }

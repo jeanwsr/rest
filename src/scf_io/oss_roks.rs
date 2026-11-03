@@ -576,7 +576,7 @@ impl SCF {
 
         // HF fast path: keep the Step-4 values bitwise (all HF anchors
         // unchanged); the KS evaluator runs as a self-check only.
-        let is_hf = self.mol.xc_data.dfa_compnt_scf.len() == 0;
+        let is_hf = !self.mol.dfadef.is_dfa_scf();
         if is_hf {
             self.energies.insert("oss_e_triplet".to_string(), vec![e_mix - k_ab]);
             self.energies.insert("oss_e_singlet".to_string(), vec![e_mix + k_ab]);
@@ -591,11 +591,11 @@ impl SCF {
         // KS path: the same-orbital triplet is a full KS energy on the
         // triplet occupation (see the doc comment above). The RPA family
         // has no same-orbital triplet evaluator yet.
-        if self.mol.xc_data.is_rpa() {
+        if self.mol.dfadef.is_rpa() {
             panic!("ERROR: rohf-oss with the RPA correlation family is not yet supported (the same-orbital triplet E_T(RPA) is not implemented)");
         }
 
-        let fifth = self.mol.xc_data.is_fifth_dfa();
+        let fifth = self.mol.dfadef.is_fifth_dfa();
         let (e_t_ks, x_t, xc_scf_t, xc_xdh_t) = self.evaluate_triplet_ks_quantities(mpi_operator, fifth);
         // Single-pass PT2 (oss_pt2_single_pass, Q-Chem ROKS structure): the
         // triplet PT2 pass is skipped -- E_S(DH) is assembled in
@@ -772,11 +772,11 @@ impl SCF {
             self.energies.insert("oss_e_singlet_scf".to_string(), v.clone());
         }
 
-        if !self.mol.xc_data.is_fifth_dfa() { return; }
+        if !self.mol.dfadef.is_fifth_dfa() { return; }
         let Some(cache) = &mut self.oss_triplet_cache else { return; };
-        let hy_scf = self.mol.xc_data.dfa_hybrid_scf;
-        let hy_xdh = self.mol.xc_data.dfa_hybrid_pos.unwrap_or(0.0);
-        let pt2_coeff = self.mol.xc_data.dfa_paramr_adv.clone().unwrap_or(vec![0.0, 0.0]);
+        let hy_scf = self.mol.dfadef.dfa_hybrid_scf;
+        let hy_xdh = self.mol.dfadef.dfa_hybrid_nscf.unwrap_or(0.0);
+        let pt2_coeff = self.mol.dfadef.fifth_rung_component().map(|c| c.param_positional.clone()).unwrap_or_else(|| vec![0.0, 0.0]);
         let (e_t_dh, e_s_dh) = if self.mol.ctrl.oss_pt2_single_pass {
             // single-pass (Q-Chem ROKS structure): E_S(DH) = E_S(SCF) +
             // corr_S + Ec[PT2], the PT2 correlation on the OSS occupation
@@ -863,7 +863,7 @@ impl SCF {
         let [orb_a, orb_b] = match self.mol.ctrl.oss_pair { Some(occ) => occ, None => return };
         let [s2, mlpy] = evaluate_spin_angular_momentum(&self.density_matrix, &self.ovlp, 2, &self.mol.num_elec);
         let e_mix = self.scf_energy;
-        let is_hf = self.mol.xc_data.dfa_compnt_scf.len() == 0;
+        let is_hf = !self.mol.dfadef.is_dfa_scf();
 
         println!("");
         println!("====================================================");
@@ -878,7 +878,7 @@ impl SCF {
         if let Some(cache) = &self.oss_triplet_cache {
             let e_t_ks = cache.e_t_ks;
             let e_s_ks = 2.0 * e_mix - e_t_ks;
-            if self.mol.xc_data.is_fifth_dfa() {
+            if self.mol.dfadef.is_fifth_dfa() {
                 let e_mix_dh = match self.energies.get("xdh_energy") {
                     Some(e) => e[0],
                     None => panic!("ERROR: rohf-oss: xdh_energy is missing at report time (the post-SCF step did not run?)"),

@@ -170,8 +170,8 @@ impl<'a> TddftGradEngine<'a> {
         let natm = scf.mol.geom.nfree;
         let raw = build_raw_ri_tensors(scf);
         // dfa_hybrid_scf is 1.0 for an HF reference (set by DFA4REST::parse_scf).
-        let hyb = scf.mol.xc_data.dfa_hybrid_scf;
-        let hyb_sr = match scf.mol.xc_data.rsh_params() {
+        let hyb = scf.mol.dfadef.dfa_hybrid_scf;
+        let hyb_sr = match scf.mol.dfadef.rsh_params_scf() {
             Some((_omega, _c_lr, c_sr)) => {
                 panic!(
                     "TDDFT gradient: range-separated hybrids are not yet supported \
@@ -712,18 +712,17 @@ impl<'a> TddftGradEngine<'a> {
         let mut f1oo = if dmoo.is_some() { Some(vec![0.0; 4 * nao * nao]) } else { None };
         let mut v1ao = if with_vxc { Some(vec![0.0; 4 * nao * nao]) } else { None };
 
-        let xc_data = &self.scf.mol.xc_data;
-        let xc_type = if xc_data.use_density_gradient() { XCType::GGA } else { XCType::LDA };
+        let dfadef = &self.scf.mol.dfadef;
+        let xc_type = if dfadef.use_density_gradient() { XCType::GGA } else { XCType::LDA };
         // libxc functionals without a third derivative (e.g. PBE) contribute
         // no `kxc` term; PySCF treats it as zero.
         // libxc builds used by REST may be configured with `XC_DONT_COMPILE_KXC`;
         // in that case `kxc` cannot be requested analytically and the KXC
         // contraction is reconstructed by differencing `fxc` (see
         // `contract_kxc_fd`).  `deriv` stays 2 then, and `kxc_raw` is `None`.
+        let funcs = dfadef.scf_func_list(1);
         let has_kxc = with_kxc
-            && xc_data.dfa_compnt_scf.iter().all(|&code| {
-                LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized).has_kxc()
-            });
+            && funcs.iter().all(|(_factor, f)| f.has_kxc());
         let deriv = if has_kxc { 3 } else { 2 };
 
         let dmvo_is_zero = dmvo.map_or(true, |d| d.data.iter().all(|&v| v == 0.0));
@@ -795,7 +794,7 @@ impl<'a> TddftGradEngine<'a> {
             };
             if verbose_time { t_rho += _m.elapsed().as_secs_f64(); _m = std::time::Instant::now(); }
             let xc_tensors =
-                eval_xc_eff(&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf, xc_type, 0, &rho, ng, deriv);
+                eval_xc_eff(&funcs, xc_type, 0, &rho, ng, deriv);
             if verbose_time { t_xc += _m.elapsed().as_secs_f64(); _m = std::time::Instant::now(); }
             let vxc_raw = tensor_slice(xc_tensors[1].as_ref().expect("vxc"), ng * nvar);
             let fxc_raw = if dmvo_is_zero && dmoo_is_zero {
@@ -845,8 +844,7 @@ impl<'a> TddftGradEngine<'a> {
                     let wv_k = match kxc_raw.as_ref() {
                         Some(kxc_raw) => contract_kxc(rho1, kxc_raw, weights, ng, nvar),
                         None => contract_kxc_fd(
-                            &xc_data.dfa_compnt_scf,
-                            &xc_data.dfa_paramr_scf,
+                            &funcs,
                             xc_type,
                             &rho,
                             rho1,
@@ -1149,7 +1147,7 @@ impl<'a> TddftGradEngine<'a> {
         // suppressed with `REST_TDDFT_GRAD_NO_KXC`.
         // Pre-evaluate the grid AO once so the second (`fxcz1`) pass can reuse
         // it, when the memory budget allows (see `build_ao_cache`).
-        let xc_type = if self.scf.mol.xc_data.use_density_gradient() { XCType::GGA } else { XCType::LDA };
+        let xc_type = if self.scf.mol.dfadef.use_density_gradient() { XCType::GGA } else { XCType::LDA };
         let (ao_deriv_c, ao_comp_c, blksize_c) = self.xc_grid_setup(xc_type);
         let ao_cache = self.build_ao_cache(ao_deriv_c, ao_comp_c, blksize_c);
         let (mut f1vo, mut f1oo, mut vxc1) =
@@ -2034,8 +2032,7 @@ fn contract_fxc(rho1: &[f64], fxc: &[f64], weights: &[f64], ng: usize, nvar: usi
 /// The perturbation is applied to the *generalized* density `(rho, grad rho)`
 /// so that `sigma = |grad rho|^2` is perturbed consistently.
 fn contract_kxc_fd(
-    func_ids: &Vec<usize>,
-    func_factors: &Vec<f64>,
+    funcs: &[(f64, LibXCFunctional)],
     xc_type: XCType,
     rho: &[f64],
     rho1: &[f64],
@@ -2067,7 +2064,7 @@ fn contract_kxc_fd(
         }
     }
     let fxc_of = |r: &[f64]| -> Vec<f64> {
-        let tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, r, ng, 2);
+        let tensors = eval_xc_eff(funcs, xc_type, 0, r, ng, 2);
         tensor_slice(tensors[2].as_ref().expect("fxc"), ng * nvar * nvar)
     };
     let fp = fxc_of(&rho_p);

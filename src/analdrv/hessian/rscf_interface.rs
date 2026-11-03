@@ -1,6 +1,6 @@
 use crate::analdrv::prelude::*;
 use super::print_hessian_and_timing;
-use crate::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
+use crate::analdrv::response::rresp_interface::scf_jk_factors;
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dft::gen_grids::RadiiAdjust;
@@ -120,7 +120,7 @@ pub fn rscf_hess_interface<'a>(
         let verbose = scf_data.mol.ctrl.print_level > 2;
         let grid_shift = cfg.grid_shift_deriv;
         let proton_charges = scf_proton_charges(scf_data);
-        RHessKSNIMatmul::new(&mol, scf_xc_func_list(scf_data), ni, grid_shift, proton_charges, verbose)
+        RHessKSNIMatmul::new(&mol, scf_data.mol.dfadef.scf_func_list(1), ni, grid_shift, proton_charges, verbose)
     });
     if let Some(ref mut hess_nimatmul_obj) = hess_nimatmul_obj {
         hess_el_list.push(hess_nimatmul_obj);
@@ -169,12 +169,12 @@ pub fn rscf_hess_interface<'a>(
 /// grid-shift attribution requires the ByAtom grouping. The regrouping only permutes, never
 /// changes values.
 pub(crate) fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Option<NIMatmul<'a>> {
-    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+    if !scf_data.mol.dfadef.is_dfa_scf() {
         return None;
     }
     let mol = get_cint_mol(&scf_data.mol);
 
-    let xc_func_list = scf_xc_func_list(scf_data);
+    let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
     let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
     let is_mgga = matches!(xc_type, XCDenType::TAU);
     let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
@@ -211,6 +211,6 @@ pub(crate) fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradC
 /// radii must come from the same charges grid generation used — the *element* charges — not
 /// from `CInt::atom_charges()`, which stores the ECP-reduced charge for ECP atoms (e.g. 19 for
 /// Ag).  Using the reduced charge makes the analytic Hessian inconsistent with the energy grid.
-pub(crate) fn scf_proton_charges(scf_data: &SCF) -> Vec<i32> {
+pub fn scf_proton_charges(scf_data: &SCF) -> Vec<i32> {
     get_mass_charge(&scf_data.mol.geom.rg_elem).iter().map(|&(_, charge)| charge as i32).collect_vec()
 }

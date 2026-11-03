@@ -43,8 +43,8 @@
 //! Fréchet derivative of `J^{-1/2}`, which folds the weight matrices once so that the raw
 //! metric-derivative integrals contract against them directly.
 
-use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
-use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
+use crate::analdrv::response::rresp_interface::{rscf_resp_interface, RRespSCF};
+use crate::analdrv::response::rgfock_interface::{dh_jk_factors, solve_z_vector};
 use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::analdrv::response::trait_rresp::RRespAPI;
 use crate::dft::num_int::{NumInt, XCData};
@@ -71,6 +71,7 @@ use rest_libcint::prelude::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
 use tensors::MatrixFull;
+use libxc::prelude::LibXCFunctional;
 
 /// Analytic gradient of the PT2-correlation (RI-MP2) energy, restricted case.
 pub struct RDHGradient<'a> {
@@ -99,7 +100,7 @@ impl<'a> RDHGradient<'a> {
         assert!(mol_obj.start_mo == 0, "RDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "RDHGradient is not MPI-parallelized yet.");
         assert!(
-            scf_data.mol.xc_data.omega().is_none(),
+            scf_data.mol.dfadef.omega().is_none(),
             "RSH doubly-hybrid gradients are not supported."
         );
         assert!(
@@ -140,25 +141,28 @@ impl<'a> RDHGradient<'a> {
         let config = mol_obj.ctrl.analdrv.clone().unwrap_or_default();
         let mut resp_objs: RRespSCF = rscf_resp_interface(scf_data, &config);
         let [c_os, c_ss]: [f64; 2] = mol_obj
-            .xc_data
-            .dfa_paramr_adv
+            .dfadef
+            .fifth_rung_component()
+            .expect("Doubly-hybrid gradient requires the fifth-rung spin factors (os/ss parameters).")
+            .param_positional
             .clone()
-            .expect("Doubly-hybrid gradient requires the PT2 spin factors (dfa_paramr_adv).")
             .try_into()
-            .expect("dfa_paramr_adv must have exactly two entries.");
+            .expect("the fifth-rung factors must have exactly two entries.");
 
         // gates of the final-functional (doubly-hybrid) terms; the pure-MP2 family has none, and
         // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
-        let xc_data = &mol_obj.xc_data;
-        let delta_hyb = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
-        let xc_func_pos = dh_xc_func_list(scf_data);
-        let xc_n_is_scf = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-            (Some(code), Some(param)) => {
-                code.iter().eq(xc_data.dfa_compnt_scf.iter())
-                    && param.len() == xc_data.dfa_paramr_scf.len()
-                    && param.iter().zip(xc_data.dfa_paramr_scf.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
+        let dfadef = &mol_obj.dfadef;
+        let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
+        let xc_func_pos = mol_obj.dfadef.nscf_func_list(1);
+        let func_codes = |funcs: &[(f64, LibXCFunctional)]| -> Vec<(usize, f64)> {
+            funcs.iter().map(|(factor, func)| (func.number() as usize, *factor)).collect()
+        };
+        let xc_n_is_scf = match &dfadef.xc_nscf {
+            Some(_) => {
+                let n = func_codes(dfadef.nscf_func_list(1).as_deref().unwrap_or(&[]));
+                n == func_codes(&dfadef.scf_func_list(1))
             },
-            _ => true,
+            None => true,
         };
         let add_delta_k = delta_hyb.abs() > 1.0e-10;
         let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
@@ -192,7 +196,7 @@ impl<'a> RDHGradient<'a> {
             let mut fock_n = &h_core + resp_rijk.get_fock_rdm(d_hf.view(), true);
             if xc_func_pos.is_some() {
                 let ni_dh = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
-                let mut resp_ks = RRespKSNIMatmul::new(dh_xc_func_list(scf_data).unwrap(), ni_dh, mol_obj.ctrl.print_level > 2);
+                let mut resp_ks = RRespKSNIMatmul::new(mol_obj.dfadef.nscf_func_list(1).unwrap(), ni_dh, mol_obj.ctrl.print_level > 2);
                 *&mut fock_n += &resp_ks.get_fock_rdm(d_hf.view(), true);
             }
             Some(fock_n.into_contig(ColMajor))
@@ -253,7 +257,7 @@ impl<'a> RDHGradient<'a> {
         let d_r_s: Tsr<f64> = d_r_sym.mapv(|x| 0.5 * x);
         // the exchange (K) part of the SCF functional linearized upon the relaxed density carries
         // the SCF hybrid coefficient (forge `C1 = cx C D_r_symm`; unity for the MP2/HF reference)
-        let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
+        let cx_scf = mol_obj.dfadef.dfa_hybrid_scf;
         let c1_dr: Tsr<f64> = (mo_coeff.view() % d_r_s.view()).mapv(|x| cx_scf * x).into_contig(ColMajor);
         let d_r_ao = (mo_coeff.view() % d_r_s.view() % mo_coeff.view().t()).into_contig(ColMajor);
         // total relaxed density (SCF + relaxed correlation) for the fchk density dump of force
@@ -637,7 +641,7 @@ impl<'a> RDHGradient<'a> {
                 // the explicit AO-derivative of the SCF functional's XC potential (forge
                 // `hessian.rks._get_vxc_deriv1`), contracted with the relaxed density on the fly;
                 // the grid-shift terms are absent, following the forge reference
-                de_resp = de_xc_response_term(&mol, &scf_xc_func_list(scf_data), &mut ni, dm0.view(), d_r_ao.view());
+                de_resp = de_xc_response_term(&mol, &scf_data.mol.dfadef.scf_func_list(1), &mut ni, dm0.view(), d_r_ao.view());
             }
             if has_final_functional {
                 let fock_n = fock_n.as_ref().unwrap();
@@ -863,7 +867,7 @@ impl GradAPI for RDHGradient<'_> {
 /// Whether the SCF-iteration functional carries a non-HF XC part (the gate of the
 /// response-density XC term; the kernels handle LDA/GGA/MGGA alike, unlike forge's GGA-only gate).
 fn has_scf_xc(scf_data: &SCF) -> bool {
-    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
+    scf_data.mol.dfadef.is_dfa_scf()
 }
 
 /// A bare gradient helper carrying the SCF control flags, for reuse of the gradient kernels
@@ -886,20 +890,21 @@ fn dh_grad_helper<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<MPIOperator>) 
 /// contribution); `scf` selects the SCF-iteration functional, else the final (`pos`) one.
 fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool, grids: &crate::dft::Grids) -> Tsr<f64> {
     let mol_obj = &scf_data.mol;
-    let xc_data = &mol_obj.xc_data;
-    let (code, param) = if scf {
-        (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
+    let xc_data = &mol_obj.dfadef;
+    let funcs = if scf {
+        xc_data.scf_func_list(1)
     } else {
-        (
-            xc_data.dfa_compnt_pos.as_ref().expect("the final functional has no XC component list."),
-            xc_data.dfa_paramr_pos.as_ref().expect("the final functional has no XC parameter list."),
+        crate::dft::parse_xc::func_list_from_components(
+            mol_obj.dfadef.xc_nscf.as_deref(),
+            1,
         )
+        .expect("the final functional has no XC component list or libxc components")
     };
-    let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
+    let xc_type = if funcs.iter().any(|(_f, func)| func.needs_tau()) {
         XCType::MGGA
-    } else if code
+    } else if funcs
         .iter()
-        .any(|&c| !matches!(xc_data.init_libxc(&c).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+        .any(|(_f, func)| !matches!(func.family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
     {
         XCType::GGA
     } else {
@@ -907,8 +912,7 @@ fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool
     };
     let xc_data_sel = XCData {
         xc_type,
-        xc_code: code,
-        xc_params: param,
+        funcs,
         device: DeviceOpenBLAS::default(),
         dm: &scf_data.density_matrix,
         mo_coeffs: None,

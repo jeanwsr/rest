@@ -977,8 +977,8 @@ impl<'a> GwGradEngine<'a> {
         };
 
         // ---- reference static-term data and low-rank factors (LR-only) ----
-        let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
-        let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
+        let hybrid = scf.mol.dfadef.dfa_hybrid_scf;
+        let fock_hyb = if !scf.mol.dfadef.is_dfa_scf() { 1.0 } else { hybrid };
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
         let (shells, shell_of) = degenerate_shells(&e, config.degenerate_tol);
         if config.degenerate_tol > 0.0 && std::env::var("REST_GWGRAD_DBG").is_ok() {
@@ -2114,7 +2114,7 @@ impl GwGradEngine<'_> {
             &device,
             self.scf.mol.ctrl.j2c_decomp.clone(),
         );
-        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !self.scf.mol.dfadef.is_dfa_scf();
         assert!(is_hf, "gw_grad: analdrv CP-HF path supports HF references only");
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
 

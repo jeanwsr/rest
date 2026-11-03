@@ -34,7 +34,7 @@
 use crate::analdrv::response::rgfock_interface::dh_jk_factors;
 use crate::analdrv::response::trait_uresp::URespAPI;
 use crate::analdrv::response::uresp_interface::{
-    dh_xc_func_list_uks, scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
+    uscf_resp_interface, URespSCF,
 };
 use crate::dft::num_int::XCData;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
@@ -66,6 +66,7 @@ use rstsr::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use tensors::MatrixFull;
+use libxc::prelude::LibXCFunctional;
 
 /// Analytic gradient of the PT2-correlation (RI-MP2) energy, unrestricted case.
 pub struct UDHGradient<'a> {
@@ -96,7 +97,7 @@ impl<'a> UDHGradient<'a> {
         assert!(mol_obj.start_mo == 0, "UDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "UDHGradient is not MPI-parallelized yet.");
         assert!(
-            scf_data.mol.xc_data.omega().is_none(),
+            scf_data.mol.dfadef.omega().is_none(),
             "RSH doubly-hybrid gradients are not supported."
         );
         assert!(
@@ -120,25 +121,28 @@ impl<'a> UDHGradient<'a> {
         let naux = aux.nao();
 
         let [c_os, c_ss]: [f64; 2] = mol_obj
-            .xc_data
-            .dfa_paramr_adv
+            .dfadef
+            .fifth_rung_component()
+            .expect("Doubly-hybrid gradient requires the fifth-rung spin factors (os/ss parameters).")
+            .param_positional
             .clone()
-            .expect("Doubly-hybrid gradient requires the PT2 spin factors (dfa_paramr_adv).")
             .try_into()
-            .expect("dfa_paramr_adv must have exactly two entries.");
+            .expect("the fifth-rung factors must have exactly two entries.");
 
         // gates of the final-functional (doubly-hybrid) terms; the pure-MP2 family has none, and
         // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
-        let xc_data = &mol_obj.xc_data;
-        let delta_hyb = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
-        let xc_func_pos = dh_xc_func_list_uks(scf_data);
-        let xc_n_is_scf = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-            (Some(code), Some(param)) => {
-                code.iter().eq(xc_data.dfa_compnt_scf.iter())
-                    && param.len() == xc_data.dfa_paramr_scf.len()
-                    && param.iter().zip(xc_data.dfa_paramr_scf.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
+        let dfadef = &mol_obj.dfadef;
+        let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
+        let xc_func_pos = mol_obj.dfadef.nscf_func_list(2);
+        let func_codes = |funcs: &[(f64, LibXCFunctional)]| -> Vec<(usize, f64)> {
+            funcs.iter().map(|(factor, func)| (func.number() as usize, *factor)).collect()
+        };
+        let xc_n_is_scf = match &dfadef.xc_nscf {
+            Some(_) => {
+                let n = func_codes(dfadef.nscf_func_list(2).as_deref().unwrap_or(&[]));
+                n == func_codes(&dfadef.scf_func_list(2))
             },
-            _ => true,
+            None => true,
         };
         let add_delta_k = delta_hyb.abs() > 1.0e-10;
         let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
@@ -211,7 +215,7 @@ impl<'a> UDHGradient<'a> {
             let mut resp_rijk = URespRIJK::new_with_cderi(factor_j_dh, factor_k_dh, cderi_dh);
             let f_jk = resp_rijk.get_fock_rdm(&[d_hf[0].view(), d_hf[1].view()], true);
             let mut fock_n = [(&h_core + &f_jk[0]).into_contig(ColMajor), (&h_core + &f_jk[1]).into_contig(ColMajor)];
-            if let Some(xc_func_list) = dh_xc_func_list_uks(scf_data) {
+            if let Some(xc_func_list) = mol_obj.dfadef.nscf_func_list(2) {
                 let ni_dh = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
                 let mut resp_ks = URespKSNIMatmul::new(xc_func_list, ni_dh, mol_obj.ctrl.print_level > 2);
                 let f_ks = resp_ks.get_fock_rdm(&[d_hf[0].view(), d_hf[1].view()], true);
@@ -354,7 +358,7 @@ impl<'a> UDHGradient<'a> {
         ];
         // the exchange (K) part of the SCF functional linearized upon the relaxed density carries
         // the SCF hybrid coefficient (forge `C1^s = cx C D_r^{S,s}`; unity for the MP2/HF reference)
-        let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
+        let cx_scf = mol_obj.dfadef.dfa_hybrid_scf;
         let c1_dr: [Tsr; 2] = [
             (mo_coeff[0].view() % d_r_s[0].view()).mapv(|x| cx_scf * x).into_contig(ColMajor),
             (mo_coeff[1].view() % d_r_s[1].view()).mapv(|x| cx_scf * x).into_contig(ColMajor),
@@ -871,7 +875,7 @@ impl<'a> UDHGradient<'a> {
                 // the explicit AO-derivative of the SCF functional's XC potential (forge
                 // `hessian.uks._get_vxc_deriv1`), contracted with the relaxed density on the fly;
                 // the grid-shift terms are absent, following the forge reference
-                de_resp = de_xc_response_term(&mol, &scf_xc_func_list_uks(scf_data), &mut ni, &dm0, &d_r_ao);
+                de_resp = de_xc_response_term(&mol, &scf_data.mol.dfadef.scf_func_list(2), &mut ni, &dm0, &d_r_ao);
             }
             if has_final_functional {
                 let fock_n = fock_n.as_ref().unwrap();
@@ -943,7 +947,7 @@ fn l1_fold_eig(weight: TsrView, j2c_e: TsrView, j2c_v: TsrView, threshold: f64) 
 /// gate). Unrestricted twin of the helper in [`crate::grad::rdh`], duplicated to keep the
 /// restricted module untouched.
 fn has_scf_xc(scf_data: &SCF) -> bool {
-    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
+    scf_data.mol.dfadef.is_dfa_scf()
 }
 
 /// A bare unrestricted gradient helper carrying the SCF control flags, for reuse of the UKS
@@ -973,20 +977,21 @@ fn xc_skeleton_dao(
     grids: &crate::dft::Grids,
 ) -> Vec<Tsr> {
     let mol_obj = &scf_data.mol;
-    let xc_data = &mol_obj.xc_data;
-    let (code, param) = if scf {
-        (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
+    let xc_data = &mol_obj.dfadef;
+    let funcs = if scf {
+        xc_data.scf_func_list(2)
     } else {
-        (
-            xc_data.dfa_compnt_pos.as_ref().expect("the final functional has no XC component list."),
-            xc_data.dfa_paramr_pos.as_ref().expect("the final functional has no XC parameter list."),
+        crate::dft::parse_xc::func_list_from_components(
+            mol_obj.dfadef.xc_nscf.as_deref(),
+            2,
         )
+        .expect("the final functional has no XC component list or libxc components")
     };
-    let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
+    let xc_type = if funcs.iter().any(|(_f, func)| func.needs_tau()) {
         XCType::MGGA
-    } else if code
+    } else if funcs
         .iter()
-        .any(|&c| !matches!(xc_data.init_libxc(&c).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+        .any(|(_f, func)| !matches!(func.family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
     {
         XCType::GGA
     } else {
@@ -994,8 +999,7 @@ fn xc_skeleton_dao(
     };
     let xc_data_sel = XCData {
         xc_type,
-        xc_code: code,
-        xc_params: param,
+        funcs,
         device: DeviceOpenBLAS::default(),
         dm: &scf_data.density_matrix,
         mo_coeffs: None,

@@ -1629,7 +1629,7 @@ pub fn prepare_m_isdf_dm_v2(k_mu: usize, mol: &mut Molecule, grids: &mut Option<
 
     // generate ao and aop again here (if needed)
     // copy from prepare_density_grids
-    if mol.xc_data.is_dfa_scf() || mol.ctrl.initial_guess == "vsap" {
+    if mol.dfadef.is_dfa_scf() || mol.ctrl.initial_guess == "vsap" {
         if let Some(dftgrids) = grids {
             dftgrids.ao_cutoff = mol.ctrl.ao_cutoff;
             if dftgrids.ao_cutoff > 0.0 {

@@ -35,7 +35,7 @@ pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperato
     //dfa_oo_hamiltonian.formated_output(20,"full");
     //println!("DFA vv hamiltonian");
     //dfa_vv_hamiltonian.formated_output(20,"full");
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    scf_data.mol.dfadef.xc_scf = Some(vec![]);
     scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
     let hf_oo_hamiltonian=hamiltonian_ao2mo(scf_data,'O');
     let hf_vv_hamiltonian=hamiltonian_ao2mo(scf_data,'V');
@@ -82,7 +82,7 @@ pub fn renormalized_singles_diagonalization_fullspace(scf_data:&mut SCF,w_rs:boo
     println!("The full HF Hamiltonian in MO basis is diagonalized and renormalized.");
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    scf_data.mol.dfadef.xc_scf = Some(vec![]);
     scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
     let hf_full_hamiltonian=hamiltonian_ao2mo_full(scf_data);
     
@@ -405,7 +405,7 @@ pub fn renormalized_singles_with_orbitals(scf_data:&mut SCF,full_space:bool,mpi_
     // The RS Hamiltonian is the HF Hamiltonian evaluated with the DFT density
     // matrix, and is expanded in the DFT orbitals: build it before touching the
     // orbital coefficients.
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    scf_data.mol.dfadef.xc_scf = Some(vec![]);
     scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
     let previous_coeff=scf_data.eigenvectors[0].clone();
     let (energies,rotation)=rs_rotation_in_mo_basis(scf_data,full_space);

@@ -138,7 +138,7 @@ pub enum PT2TorchFoldMode {
 }
 
 pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<f64> {
-    let postscf_method = match scf_data.mol.xc_data.dfa_family_pos.clone().unwrap() {
+    let postscf_method = match scf_data.mol.dfadef.family_pos().expect("ri_pt2 requires a fifth-rung family") {
         crate::dft::DFAFamily::PT2 => "PT2".to_string(),
         crate::dft::DFAFamily::SBGE2 => "SBGE2".to_string(),
         crate::dft::DFAFamily::RPA => "RPA".to_string(),
@@ -181,8 +181,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     if !scf_data.mol.ctrl.post_ai_correction.to_lowercase().eq("none") {
         if let Some(grids) = &scf_data.grids {
             let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
-            let post_xc_energy = dfa.post_xc_exc(
-                &vec![String::from("gga_x_pbe")], grids,
+            let post_xc_energy = crate::dft::post_xc_exc(
+                &vec![String::from("gga_x_pbe")], scf_data.mol.spin_channel, grids,
                 &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation,
             );
             let mut x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];
@@ -206,7 +206,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     // pre-computation above), grids are no longer needed.
     scf_data.grids = None;
 
-    let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
+    let dfa_family_pos = scf_data.mol.dfadef.family_pos().expect("ri_pt2 requires a fifth-rung family");
 
     // engine = "torch" delegates the pair-energy contraction to the embedded-CPython
     // torch kernel on a CUDA device (see torch_pt2_pair_eng). Guards are hard errors
@@ -495,9 +495,9 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     };
     
     //println!("{:?}",&pt2_c);
-    let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
-    let hy_coeffi_xdh = if let Some(coeff) = scf_data.mol.xc_data.dfa_hybrid_pos {coeff} else {0.0};
-    let hy_coeffi_pt2 = if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {coeff.clone()} else {vec![0.0,0.0]};
+    let hy_coeffi_scf = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hy_coeffi_xdh = scf_data.mol.dfadef.dfa_hybrid_nscf.unwrap_or(0.0);
+    let hy_coeffi_pt2 = scf_data.mol.dfadef.fifth_rung_component().map(|c| c.param_positional.clone()).unwrap_or_else(|| vec![0.0, 0.0]);
     // The ROHF single-excitation contribution does not vanish in the
     // semi-canonical basis: the restricted open-shell reference violates
     // Brillouin's theorem, so the occ-vir block of its Fock stays non-zero.
@@ -517,7 +517,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     // so it is deliberately dropped.  (The PT2 drivers still print the raw
     // contribution, see `print_ro_pt2_singles_warning`.)
     let singles = pt2_c[0] - pt2_c[1] - pt2_c[2];
-    let pure_hf_reference = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let pure_hf_reference = !scf_data.mol.dfadef.is_dfa_scf();
     let rohf_singles = if matches!(scf_data.scftype, SCFType::ROHF) && pure_hf_reference {
         singles
     } else {
@@ -593,7 +593,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 /// reason). The restricted open-shell drivers build occ_range =
 /// start_mo..homo+1 and handle the hole correctly.
 pub fn oss_triplet_pt2_correlation(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> [f64; 3] {
-    let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
+    let dfa_family_pos = scf_data.mol.dfadef.family_pos().unwrap();
     let [_, orb_b] = match scf_data.mol.ctrl.oss_pair {
         Some(occ) => occ,
         None => panic!("ERROR: rohf-oss: the open-shell orbital indices (a, b) are not fixed yet"),
@@ -1998,7 +1998,7 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
 ///   functionals is doubles-only by definition, so the term is computed and
 ///   reported here but **not** added.
 fn print_ro_pt2_singles_warning(scf_data: &SCF, e_singles: &[f64; 2]) {
-    let pure_hf_reference = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let pure_hf_reference = !scf_data.mol.dfadef.is_dfa_scf();
     let verdict = if pure_hf_reference {
         "The reference is pure Hartree-Fock (plain MP2): this contribution is ADDED to the \
          second-order energy with weight 1."

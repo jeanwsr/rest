@@ -118,11 +118,11 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     flags.ext_field_dipole(scf_data.mol.geom.ext_field.dipole);
 
     // set hybrid factor
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     let factor_k = if is_hf {
         Some(1.0)
     } else {
-        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        let fac = scf_data.mol.dfadef.dfa_hybrid_scf;
         if fac == 0.0 {
             None
         } else {
@@ -131,8 +131,8 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     };
     flags.factor_k(factor_k);
 
-    // set rsh factor
-    if let Some((omega, alpha, _beta)) = scf_data.mol.xc_data.dfa_rsh_scf {
+    // set rsh factor: read the stored RSH field of the definition
+    if let Some((omega, alpha, _c_sr)) = scf_data.mol.dfadef.rsh_params_scf() {
         flags.omega(Some(omega));
         flags.factor_alpha(Some(alpha));
     }
