@@ -1,45 +1,4 @@
-//! Basic math utilities (factorials, inverse trig, misc) shared by GTO evaluation.
-pub fn pi() -> f64 {
-    return std::f64::consts::PI;
-}
-
-pub fn rad2deg(x:f64) -> f64 {
-    return x*180.00/pi();
-}
-
-pub fn arctan(x: f64) -> f64 {
-    let y = x;
-    let sqrt_three = (3.0_f64).sqrt();
-    if y < 0.0 {
-        return -1.0 * arctan(-1.0 * y);
-    } else
-    /* if positive */
-    {
-        if y < 1.0 {
-            if y <= 0.267949 {
-                return y - (y*y*y / 3.0) + (y*y*y*y*y / 5.0);
-            } else {
-                return rad2deg(
-                    (pi() / 6.0)
-                        + arctan(( sqrt_three * y) - 1.0)
-                            / arctan(sqrt_three + y),
-                        //+ arctan(((3.0_f64).sqrt() * y) - 1.0)
-                        //    / arctan((3.0_f64).sqrt() + y),
-                );
-            }
-            
-        } else {
-            return (pi() / 2.0) - arctan(1.0 / y);
-        }
-    }
-}
-pub fn arcsin(x: f64) -> f64 {
-    return arctan(x / (1.0 - x*x).sqrt());
-}
-pub fn arccos(x: f64) -> f64 {
-    return arctan((1.0 - x*x).sqrt() / x);
-}
-
+//! Basic math utilities (factorials, vector helpers) shared by GTO evaluation.
 pub fn factorial(end:i32) -> i32 {
     if end == 0 {return 1
     } else {
