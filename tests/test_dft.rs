@@ -394,6 +394,7 @@ fn test_all_rsh_via_auto_resolver() {
 /// (`AtmIndices::ByAtom` from the monotonic split of the same array).
 #[test]
 fn test_becke_partition_deriv_weights() {
+    use pyrest::dft::gen_grids::RadiiAdjust;
     use pyrest::dft::gen_grids::becke_partitioning_deriv::{
         becke_partition, gen_adjustment_factor, try_atm_quad_split, AtmIndices,
     };
@@ -436,7 +437,7 @@ fn test_becke_partition_deriv_weights() {
     // new implementation: unit quadrature weights, so w is the bare partition weight
     let atm_coords: Vec<[f64; 3]> =
         center_coordinates_bohr.iter().map(|c| [c.0, c.1, c.2]).collect();
-    let adjustment_factor = gen_adjustment_factor(&proton_charges);
+    let adjustment_factor = gen_adjustment_factor(&proton_charges, RadiiAdjust::Becke);
     let output = becke_partition(
         &grids.coordinates,
         &atm_coords,

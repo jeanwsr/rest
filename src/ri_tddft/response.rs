@@ -637,9 +637,13 @@ pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     let solver = tddft_ctrl.response_tddft_solver.clone();
     let tol = tddft_ctrl.response_tddft_tol;
     let max_iter = tddft_ctrl.response_tddft_max_iter;
-    let xlet = if tddft_ctrl.tddft_spin == "singlet" { 'S' }
-               else if tddft_ctrl.tddft_spin == "triplet" { 'T' }
-               else { 'R' };
+    // Response TDDFT is a restricted-reference method, so `tddft_spin` is a
+    // genuine spin label here (see `TDDFTParameters::tddft_spin`).
+    let xlet = match tddft_ctrl.restricted_spin() {
+        "triplet" => 'T',
+        "singlet" => 'S',
+        _ => 'R',
+    };
 
     // Enable optimised (rayon-parallel) fxc kernel if requested
     set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);

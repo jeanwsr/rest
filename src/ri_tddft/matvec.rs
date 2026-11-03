@@ -18,8 +18,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dgemv};
 use crate::scf_io::SCF;
 use crate::ri_bse;
-use crate::dft::num_int::{FXCMatvecData, fxc_matvec};
-use crate::ri_tddft::utils::tddft_occupation_parameters;
+use crate::dft::num_int::{fxc_matvec, fxc_matvec_unrestricted};
 use crate::ri_tddft::TDDFTData;
 
 // ── Timing instrumentation for the MO matvec (debug level; see `mo_timing_report`) ──
@@ -54,19 +53,59 @@ pub fn mo_timing_report() {
     }
 }
 
-/// Build the diagonal preconditioner from KS orbital energy differences
+/// Per-sector MO-basis RI tensors of the TDDFT response (MO mode): the
+/// Coulomb tensor plus the reshaped HF/RSH exchange tensors, bundled so that
+/// one sector loop serves restricted (one sector) and unrestricted
+/// (alpha/beta) references alike.
 ///
-/// hdiag[i + a*nocc] = ε_{lumo+a} - ε_{start_mo+i}
+/// The exchange contribution of A and B reads
+/// `-coeff_full * K_full[z] - coeff_sr * K_SR[z]`, where `K_full` is built
+/// from the full-range 3-center integrals and `K_SR` from the short-range
+/// (erfc(omega*r12)/r12) integrals. The coefficients themselves are NOT
+/// stored here: they derive from `scf.mol.xc_data` (`rsh_params()` +
+/// `dfa_hybrid_scf`) at each use site.
 ///
-/// Uses KS eigenvalues from scf.eigenvalues[0], NOT GW quasiparticle energies.
+/// For ordinary hybrids (and pure functionals) the SR tensors are absent and
+/// the exchange is the full-range term alone, scaled by the hybrid
+/// coefficient. For a range-separated hybrid the HF exchange is
+/// `c_SR*K_SR + c_LR*K_LR`, evaluated as
+/// `coeff_full*K_full + coeff_sr*K_SR` with `coeff_full = c_LR` and
+/// `coeff_sr = c_SR - c_LR` (since `K_full = K_SR + K_LR`), mirroring the
+/// ground-state Fock build in `scf_io`.
+pub struct RITensorTerms {
+    /// Sector window this bundle was built for.
+    pub occ_size: usize,
+    pub vir_size: usize,
+    /// [naux, occ*vir], Coulomb (Hartree) contraction.
+    pub coulomb: MatrixFull<f64>,
+    /// [occ*naux, occ], A-block exchange.
+    pub oo_exch: MatrixFull<f64>,
+    /// [naux*vir, vir], A-block exchange.
+    pub vv_exch: MatrixFull<f64>,
+    /// [naux*occ, vir], B-block exchange.
+    pub ov_exch: MatrixFull<f64>,
+    /// Short-range (erfc) exchange tensors; `None` for a non-RSH DFA. All
+    /// three are set together or none are (all-or-nothing SR triple).
+    pub oo_sr: Option<MatrixFull<f64>>,
+    pub vv_sr: Option<MatrixFull<f64>>,
+    pub ov_sr: Option<MatrixFull<f64>>,
+}
+
+/// Build the diagonal preconditioner from KS orbital energy differences:
+/// per sector, `hdiag[i + a*occ] = ε_{lumo+a} − ε_{start_mo+i}`, the sectors
+/// concatenated as `[alpha (dim_a); beta (dim_b)]` for UHF (one sector for
+/// RHF/ROHF), matching the amplitude layout of the corresponding matvecs.
+///
+/// Uses KS eigenvalues from scf.eigenvalues, NOT GW quasiparticle energies.
 pub fn build_hdiag(scf: &SCF) -> Vec<f64> {
-    let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
-        tddft_occupation_parameters(scf);
-    let ks = &scf.eigenvalues[0];
-    let mut hdiag = Vec::with_capacity(occ_size * vir_size);
-    for a in 0..vir_size {
-        for i in 0..occ_size {
-            hdiag.push(ks[lumo + a] - ks[start_mo + i]);
+    let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
+    let mut hdiag = Vec::new();
+    for (i_spin, sec) in sectors.iter().enumerate() {
+        let ks = &scf.eigenvalues[i_spin];
+        for a in 0..sec.vir_size {
+            for i in 0..sec.occ_size {
+                hdiag.push(ks[sec.lumo + a] - ks[sec.start_mo + i]);
+            }
         }
     }
     hdiag
@@ -146,16 +185,24 @@ pub fn exchange_b_matvec(
     let mut t_tensor = MatrixFull::new([num_auxbas * occ_size, occ_size], 0.0);
     _dgemm_full(ri_ov_reshaped, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
 
-    // Step 2: Transpose and reshape (converting RI index ordering)
-    // t_tensor: [naux*occ, occ] → we need to swap the occ and aux dimensions
-    // Result should be [occ, naux*occ] in a DGEMM-compatible form
-    t_tensor = t_tensor.transpose_and_drop();
-    // Now [occ, naux*occ]
-    t_tensor.reshape([num_auxbas * occ_size, occ_size]);
-    // Now [naux*occ, occ] with transposed data
+    // Step 2: Block-swap to convert RI index ordering
+    // t_tensor[P*occ + j, i] → t_tensor[P*occ + i, j]
+    // This swaps the two occupied indices in the block structure:
+    // original block at position (j,i) moves to position (i,j)
+    let mut swapped_data = vec![0.0; t_tensor.data.len()];
+    for new_idx in 0..occ_size * occ_size {
+        let n2 = new_idx / occ_size;
+        let n1 = new_idx % occ_size;
+        let orig_idx = n1 * occ_size + n2;
+        let source_start = orig_idx * num_auxbas;
+        let source_end = source_start + num_auxbas;
+        swapped_data[new_idx * num_auxbas..(new_idx + 1) * num_auxbas]
+            .copy_from_slice(&t_tensor.data[source_start..source_end]);
+    }
+    t_tensor = MatrixFull::from_vec([num_auxbas * occ_size, occ_size], swapped_data).unwrap();
 
     // Step 3: result[i, a] = -alpha * Σ_j Σ_P t_tensor^T[i, j*naux+P] * ri_ov[P*nocc + j, a]
-    // t_tensor after reshape-transpose: [naux*occ, occ]
+    // t_tensor after block-swap: [naux*occ, occ], with t_tensor[P*occ + i, j] = Σ_b (P|jb) * z_{ib}
     // t_tensor^T: [occ, naux*occ]
     // ri_ov_reshaped: [naux*occ, vir]
     // result: [occ, vir]
@@ -165,15 +212,20 @@ pub fn exchange_b_matvec(
     result.data
 }
 
-/// Full A-block matrix-vector product for TDDFT
+/// Full A-block matrix-vector product for TDDFT, sector-generic: one call
+/// serves the restricted single-sector reference (z = [occ*vir]) and the
+/// unrestricted concatenated reference (z = [z_alpha (dim_a); z_beta (dim_b)]).
 ///
-/// A·z = (ε_a - ε_i)*z + 2*Σ_jb(ia|jb)*z_jb - c_x*Σ_jb(ij|ab)*z_jb + fxc[z]
+/// A·z = (ε_a - ε_i)*z + w_J*J[Σ_τ z^τ] - coeff_full*K_A[z] - coeff_sr*K_SR[z] + fxc[z]
+///
+/// The diagonal, bare exchange and fxc act within a spin sector; the Coulomb
+/// (Hartree) term responds to the summed transition density of all sectors
+/// and is the only alpha/beta coupling of an unrestricted reference.
+/// Restricted spin adaptation enters as the Coulomb weight: singlet
+/// (xlet='S') 2, 'R' 1, triplet (xlet='T') 0; unrestricted uses unit weight.
 ///
 /// For TDA: this is the complete matvec (A matrix only).
 /// For full LR: this is the A-block of [A B; -B -A].
-///
-/// singlet (xlet='S'): Coulomb factor = 2
-/// triplet (xlet='T'): Coulomb factor = 0
 pub fn a_matvec(
     scf: &SCF,
     data: &crate::ri_tddft::TDDFTData,
@@ -182,69 +234,127 @@ pub fn a_matvec(
 ) -> Vec<f64> {
     let t_mv = Instant::now();
     N_MO_MV.fetch_add(1, Ordering::Relaxed);
-    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
-    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
-    let ri_oo_exch = data.ri_oo_exch.as_ref().expect("MO mode requires ri_oo_exch");
-    let ri_vv_exch = data.ri_vv_exch.as_ref().expect("MO mode requires ri_vv_exch");
-    let alpha_hybrid = fxc_data.alpha_hybrid;
-    let occ_size = fxc_data.nocc;
-    let vir_size = fxc_data.nvir;
-    let dim = occ_size * vir_size;
+    let terms = &data.ri_terms;
+    let n_sec = terms.len();
+    debug_assert_eq!(n_sec, data.n_sectors());
+    let dims: Vec<usize> = terms.iter().map(|t| t.occ_size * t.vir_size).collect();
+    let dim_total: usize = dims.iter().sum();
+    debug_assert_eq!(z.len(), dim_total);
 
-    // Build diagonal using KS eigenvalues
-    let (start_mo, _num_state, _, _, _homo, lumo) = tddft_occupation_parameters(scf);
-    let ks = &scf.eigenvalues[0];
+    // Response HF-exchange coefficients from the DFA
+    // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
+    // spin-independent, derived once here and applied per sector.
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
+    // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
+    let coulomb_factor = if data.is_uhf() {
+        1.0
+    } else if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
 
-    // Step 1: Diagonal contribution: (ε_a - ε_i) * z
-    let mut result = vec![0.0; dim];
-    for a in 0..vir_size {
-        for i in 0..occ_size {
-            let idx = i + a * occ_size;
-            result[idx] = (ks[lumo + a] - ks[start_mo + i]) * z[idx];
+    // fxc: the restricted table evaluates the single sector; the
+    // spin-resolved table evaluates the whole concatenated block at once
+    // and is split per sector below. An HF reference carries neither table
+    // (no XC kernel): the fxc contribution is zero.
+    let t_fxc = Instant::now();
+    let fxc_parts: Vec<Vec<f64>> = if let Some(fxc_u) = data.fxc_u.as_ref() {
+        let (fa, fb) = fxc_matvec_unrestricted(fxc_u, z);
+        vec![fa, fb]
+    } else if let Some(fxc_data) = data.fxc.as_ref() {
+        vec![fxc_matvec(fxc_data, &z[..dims[0]])]
+    } else {
+        dims.iter().map(|&d| vec![0.0; d]).collect()
+    };
+    add_ns(&T_MV_FXC, t_fxc);
+
+    // Sector windows for the diagonal.
+    let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
+    debug_assert_eq!(sectors.len(), n_sec);
+
+    let mut result = vec![0.0; dim_total];
+    let mut offset = 0usize;
+    for s in 0..n_sec {
+        let ns = dims[s];
+        if ns == 0 { continue; }
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+        let term_s = &terms[s];
+
+        // Step 1: Diagonal contribution: (ε_a - ε_i) * z
+        let sec = &sectors[s];
+        let ks = &scf.eigenvalues[s];
+        for a in 0..term_s.vir_size {
+            for i in 0..term_s.occ_size {
+                let idx = i + a * term_s.occ_size;
+                rs[idx] = (ks[sec.lumo + a] - ks[sec.start_mo + i]) * zs[idx];
+            }
         }
-    }
 
-    // Step 2: Coulomb contribution: 2 * J[z] (singlet only)
-    let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
-    if coulomb_factor != 0.0 {
-        let t0 = Instant::now();
-        let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
-        add_ns(&T_MV_J, t0);
-        for idx in 0..dim {
-            result[idx] += coulomb_factor * jz[idx];
+        // Step 2: Coulomb contribution: w_J * Σ_τ J_{sτ}[z^τ]
+        // (restricted: one sector; unrestricted: same-spin + cross-spin sums)
+        if coulomb_factor != 0.0 {
+            let t0 = Instant::now();
+            let mut vs = vec![0.0; ns];
+            let mut offset_t = 0usize;
+            for t in 0..n_sec {
+                if dims[t] == 0 { continue; }
+                let zt = z[offset_t..offset_t + dims[t]].to_vec();
+                let jt = if s == t {
+                    ri_bse::matvec::coulomb_contribution(&term_s.coulomb, &zt)
+                } else {
+                    ri_bse::matvec::coulomb_cross_contribution(&term_s.coulomb, &terms[t].coulomb, &zt)
+                };
+                for (v, c) in vs.iter_mut().zip(jt) { *v += c; }
+                offset_t += dims[t];
+            }
+            add_ns(&T_MV_J, t0);
+            for idx in 0..ns {
+                rs[idx] += coulomb_factor * vs[idx];
+            }
         }
-    }
 
-    // Step 3: Exchange contribution: -c_x * K_A[z] (hybrid only)
-    if alpha_hybrid.abs() > 1e-15 {
-        let t0 = Instant::now();
-        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, alpha_hybrid);
-        add_ns(&T_MV_K, t0);
-        for idx in 0..dim {
-            result[idx] += kz[idx];
+        // Step 3: Exchange contribution: -coeff_full * K_A[z] - coeff_sr * K_SR[z]
+        if coeff_full.abs() > 1e-15 {
+            let t0 = Instant::now();
+            let kz = exchange_a_matvec(&term_s.oo_exch, &term_s.vv_exch, zs, term_s.occ_size, term_s.vir_size, coeff_full);
+            add_ns(&T_MV_K, t0);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
         }
-    }
+        if coeff_sr.abs() > 1e-15 {
+            let (oo_sr, vv_sr) = match (term_s.oo_sr.as_ref(), term_s.vv_sr.as_ref()) {
+                (Some(oo), Some(vv)) => (oo, vv),
+                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
+            };
+            let t0 = Instant::now();
+            let kz = exchange_a_matvec(oo_sr, vv_sr, zs, term_s.occ_size, term_s.vir_size, coeff_sr);
+            add_ns(&T_MV_K, t0);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
 
-    // Step 4: XC kernel contribution: fxc[z]
-    let t0 = Instant::now();
-    let fxc = fxc_matvec(fxc_data, z);
-    add_ns(&T_MV_FXC, t0);
-    for idx in 0..dim {
-        result[idx] += fxc[idx];
+        // Step 4: XC kernel contribution: fxc[z]
+        for idx in 0..ns {
+            rs[idx] += fxc_parts[s][idx];
+        }
+
+        result[offset..offset + ns].copy_from_slice(&rs);
+        offset += ns;
     }
 
     add_ns(&T_MV_ALL, t_mv);
     result
 }
 
-/// Full B-block matrix-vector product for TDDFT (used in full LR, not TDA)
+/// Full B-block matrix-vector product for TDDFT (used in full LR, not TDA),
+/// sector-generic (see `a_matvec` for the sector convention).
 ///
-/// B·z = 2*Σ_jb(ia|jb)*z_jb - c_x*Σ_jb(ja|ib)*z_jb + fxc[z]
+/// B·z = w_J*J[Σ_τ z^τ] - coeff_full*K_B[z] - coeff_sr*K_SR[z] + fxc[z]
 ///
 /// Note: B has no diagonal term (no orbital energy differences).
-///
-/// singlet (xlet='S'): Coulomb factor = 2
-/// triplet (xlet='T'): Coulomb factor = 0
 pub fn b_matvec(
     scf: &SCF,
     data: &crate::ri_tddft::TDDFTData,
@@ -253,48 +363,101 @@ pub fn b_matvec(
 ) -> Vec<f64> {
     let t_mv = Instant::now();
     N_MO_MV.fetch_add(1, Ordering::Relaxed);
-    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
-    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
-    let ri_ov_exch = data.ri_ov_exch.as_ref().expect("MO mode requires ri_ov_exch");
-    let alpha_hybrid = fxc_data.alpha_hybrid;
-    let occ_size = fxc_data.nocc;
-    let vir_size = fxc_data.nvir;
-    let dim = occ_size * vir_size;
+    let terms = &data.ri_terms;
+    let n_sec = terms.len();
+    debug_assert_eq!(n_sec, data.n_sectors());
+    let dims: Vec<usize> = terms.iter().map(|t| t.occ_size * t.vir_size).collect();
+    let dim_total: usize = dims.iter().sum();
+    debug_assert_eq!(z.len(), dim_total);
 
-    let mut result = vec![0.0; dim];
+    // Response HF-exchange coefficients from the DFA (see a_matvec).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
+    // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
+    let coulomb_factor = if data.is_uhf() {
+        1.0
+    } else if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
 
-    // Step 1: Coulomb contribution: 2 * J[z] (singlet only)
-    let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
-    if coulomb_factor != 0.0 {
-        let t0 = Instant::now();
-        let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
-        add_ns(&T_MV_J, t0);
-        for idx in 0..dim {
-            result[idx] += coulomb_factor * jz[idx];
+    // fxc (see a_matvec): absent tables (HF reference) contribute zero.
+    let t_fxc = Instant::now();
+    let fxc_parts: Vec<Vec<f64>> = if let Some(fxc_u) = data.fxc_u.as_ref() {
+        let (fa, fb) = fxc_matvec_unrestricted(fxc_u, z);
+        vec![fa, fb]
+    } else if let Some(fxc_data) = data.fxc.as_ref() {
+        vec![fxc_matvec(fxc_data, &z[..dims[0]])]
+    } else {
+        dims.iter().map(|&d| vec![0.0; d]).collect()
+    };
+    add_ns(&T_MV_FXC, t_fxc);
+
+    let mut result = vec![0.0; dim_total];
+    let mut offset = 0usize;
+    for s in 0..n_sec {
+        let ns = dims[s];
+        if ns == 0 { continue; }
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+        let term_s = &terms[s];
+
+        // Step 1: Coulomb contribution: w_J * Σ_τ J_{sτ}[z^τ]
+        if coulomb_factor != 0.0 {
+            let t0 = Instant::now();
+            let mut vs = vec![0.0; ns];
+            let mut offset_t = 0usize;
+            for t in 0..n_sec {
+                if dims[t] == 0 { continue; }
+                let zt = z[offset_t..offset_t + dims[t]].to_vec();
+                let jt = if s == t {
+                    ri_bse::matvec::coulomb_contribution(&term_s.coulomb, &zt)
+                } else {
+                    ri_bse::matvec::coulomb_cross_contribution(&term_s.coulomb, &terms[t].coulomb, &zt)
+                };
+                for (v, c) in vs.iter_mut().zip(jt) { *v += c; }
+                offset_t += dims[t];
+            }
+            add_ns(&T_MV_J, t0);
+            for idx in 0..ns {
+                rs[idx] += coulomb_factor * vs[idx];
+            }
         }
-    }
 
-    // Step 2: Exchange contribution: -c_x * K_B[z]
-    if alpha_hybrid.abs() > 1e-15 {
-        let t0 = Instant::now();
-        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, alpha_hybrid);
-        add_ns(&T_MV_K, t0);
-        for idx in 0..dim {
-            result[idx] += kz[idx];
+        // Step 2: Exchange contribution: -coeff_full * K_B[z] - coeff_sr * K_SR[z]
+        if coeff_full.abs() > 1e-15 {
+            let t0 = Instant::now();
+            let kz = exchange_b_matvec(&term_s.ov_exch, zs, term_s.occ_size, term_s.vir_size, coeff_full);
+            add_ns(&T_MV_K, t0);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
         }
-    }
+        if coeff_sr.abs() > 1e-15 {
+            let ov_sr = match term_s.ov_sr.as_ref() {
+                Some(ov) => ov,
+                None => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
+            };
+            let t0 = Instant::now();
+            let kz = exchange_b_matvec(ov_sr, zs, term_s.occ_size, term_s.vir_size, coeff_sr);
+            add_ns(&T_MV_K, t0);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
 
-    // Step 3: XC kernel contribution: fxc[z]
-    let t0 = Instant::now();
-    let fxc = fxc_matvec(fxc_data, z);
-    add_ns(&T_MV_FXC, t0);
-    for idx in 0..dim {
-        result[idx] += fxc[idx];
+        // Step 3: XC kernel contribution: fxc[z]
+        for idx in 0..ns {
+            rs[idx] += fxc_parts[s][idx];
+        }
+
+        result[offset..offset + ns].copy_from_slice(&rs);
+        offset += ns;
     }
 
     add_ns(&T_MV_ALL, t_mv);
     result
 }
+
 
 // ====== Tests with synthetic data ======
 

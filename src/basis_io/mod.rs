@@ -229,13 +229,13 @@ impl Basis4Elem {
         })
     }
     pub fn to_numgrid_io(&self) -> (HashMap<usize,f64>,f64) {
-        let mut alpha_max = -std::f64::MAX;
+        let mut alpha_max = -f64::MAX;
         let mut alpha_min = HashMap::new();
         self.electron_shells.iter().for_each(|value| {
             let angular_momentum = value.angular_momentum[0] as usize;
             value.exponents.iter().for_each(|exponent| {
                 alpha_max = alpha_max.max(*exponent);
-                let s = alpha_min.entry(angular_momentum).or_insert(std::f64::MAX);
+                let s = alpha_min.entry(angular_momentum).or_insert(f64::MAX);
                 if exponent < s {
                     *s = *exponent;
                 }
@@ -470,8 +470,10 @@ impl BasCell {
 
 /// produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
 ///
+/// ```text
 ///       gau(a,l,c) = Norm*x^{lx}*y^{ly}*z^{lz}*exp[-a*r^2],
 ///                  = Norm*Fang*exp[-a*r^2],
+/// ```
 ///
 /// The GTO is normalized with the normalization factor "Norm" as
 ///
@@ -804,7 +806,14 @@ pub fn cint_cartesian_gto_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -
     // results in the same order that are used in libcint
     let num_grids = r.len();
     let num_bas = (l+1)*(l+2)/2;
-    let norm0 =(2.0*a/PI).powf(0.75)*opowf((4.0*a),(l as f64)/2.0);
+    // For l>=2 (cartesian), libcint leaves the GTO un-normalized (only gto_norm is
+    // absorbed into the contraction coefficients). The tabulated GTO must therefore
+    // be the *raw* polynomial x^lx y^ly z^lz exp(-a r^2) with no Norm0/Fang factor.
+    let norm0 = if l >= 2 {
+        1.0
+    } else {
+        (2.0*a/PI).powf(0.75)*opowf((4.0*a),(l as f64)/2.0)
+    };
 
     // In libcint, the GTOs with l>=2 are not normalized. 
     // In concequence, the tabulated Cartesian GTOs prepared by REST are 
@@ -823,13 +832,12 @@ pub fn cint_cartesian_gto_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -
                     .fold(1.0, |fang, (rr,lx)| {
                         fang * opowf(*rr,*lx)
                 });
-                *bas_r = unsafe {bas_i.get_unchecked(3)*fang*exp_part};
+                *bas_r = fang*exp_part;
             });
     });
     tmp_mat
 
 }
-
 
 pub fn cartesian_gto_1st_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
     let num_grids = r.len();
@@ -1122,7 +1130,13 @@ pub fn cartesian_gto_1st_batch_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) ->
 pub fn cint_cartesian_gto_1st_batch_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
     let num_grids = r.len();
     let num_bas = (l+1)*(l+2)/2;
-    let norm0 = (2.0*a/PI).powf(0.75)*opowf((4.0*a),(l as f64)/2.0);
+    // For l>=2 (cartesian), the tabulated GTO gradient must match the raw polynomial
+    // (no Norm0/Fang), consistent with cint_cartesian_gto_batch_v04.
+    let norm0 = if l >= 2 {
+        1.0
+    } else {
+        (2.0*a/PI).powf(0.75)*opowf((4.0*a),(l as f64)/2.0)
+    };
     let cut_off:f64 = (constants::E7).log(constants::E)/a;
 
     let binding = cint_cartesian_gto_const(l);
@@ -1168,9 +1182,9 @@ pub fn cint_cartesian_gto_1st_batch_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]
                 });
             let [x,y,z] = xyz;
             let [px,py,pz] = pxyz;
-            *aox_r = bas_i[3]*exp_part*px*y*z;
-            *aoy_r = bas_i[3]*exp_part*x*py*z;
-            *aoz_r = bas_i[3]*exp_part*x*y*pz;
+            *aox_r = exp_part*px*y*z;
+            *aoy_r = exp_part*x*py*z;
+            *aoz_r = exp_part*x*y*pz;
         });
     });
 
@@ -1972,7 +1986,7 @@ pub fn cartesian_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4
                 ibas_start += c_len;
             }
         } else {
-            for coeff in ibas.native_coefficients.iter() {
+            for coeff in ibas.coefficients.iter() {
                 let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
                 coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
                         tmp_cart += cint_cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
@@ -2205,7 +2219,7 @@ pub fn cartesian_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Ba
                 ibas_start += c_len;
             }
         } else {
-            for coeff in ibas.native_coefficients.iter() {
+            for coeff in ibas.coefficients.iter() {
                 let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
                 coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
                     let mut tmp_cart_0 = cint_cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);

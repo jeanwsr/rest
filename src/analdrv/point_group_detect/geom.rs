@@ -119,12 +119,7 @@ mod tests {
     #[test]
     fn cn_about_z_square() {
         // four points on the unit circle in xy: C4 about z
-        let pts = [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-        ];
+        let pts = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]];
         let cn = matrix_3d_rotation_cn(&pts, &[0.0, 0.0, 1.0], false, 1e-9, 0);
         assert_eq!(cn, 4);
     }

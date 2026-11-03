@@ -25,6 +25,18 @@ pub struct NIMatmul<'a> {
     /// Pre-partition (radial × angular) quadrature weight of each grid point, before the Becke
     /// partitioning factor; the same convention as `Grids::quadrature_weights`.
     pub quadrature_weights: Vec<f64>,
+    /// Becke radii adjustment scheme the grid weights were built with (see `RadiiAdjust` in
+    /// `crate::dft::gen_grids`).
+    ///
+    /// The pre-partitioned `weights` do not need it. It is consumed by the Becke grid-shift
+    /// derivative terms of the DFT hessian (`hess_rks` / `hess_uks`), which rebuild the partition
+    /// from the atomic radii and must use the same scheme as the grid generation, otherwise the
+    /// analytic hessian is inconsistent with the energy.
+    ///
+    /// Defaults to `RadiiAdjust::Becke` (raw Bragg radii, REST historical behaviour). Set it with
+    /// [`NIMatmul::with_radii_adjust`] when the grid was built with the `radii_adjust` ctrl
+    /// keyword.
+    pub radii_adjust: RadiiAdjust,
 
     /// Cache for computed AO values, keyed by derivative order (e.g., "deriv0", "deriv1", etc.).
     ///
@@ -123,10 +135,21 @@ impl<'a> NIMatmul<'a> {
             weights: weights.to_vec(),
             atm_idx: atm_idx.to_vec(),
             quadrature_weights: quadrature_weights.to_vec(),
+            radii_adjust: RadiiAdjust::Becke,
             cache_tensor: HashMap::new(),
             nchunk,
             nbatch,
         }
+    }
+
+    /// Declare the Becke radii adjustment scheme the grid was built with (see the
+    /// `radii_adjust` field). `Grids::build` applies the `radii_adjust` ctrl keyword.
+    ///
+    /// The DFT hessian grid-shift terms consume it, so a hessian run must set it to the scheme
+    /// used for the grid, otherwise the analytic derivatives do not match the energy.
+    pub fn with_radii_adjust(mut self, radii_adjust: RadiiAdjust) -> Self {
+        self.radii_adjust = radii_adjust;
+        self
     }
 
     /// Clone everything, except the cached tensors.
@@ -137,6 +160,7 @@ impl<'a> NIMatmul<'a> {
             weights: self.weights.clone(),
             atm_idx: self.atm_idx.clone(),
             quadrature_weights: self.quadrature_weights.clone(),
+            radii_adjust: self.radii_adjust,
             cache_tensor: HashMap::new(),
             nchunk: self.nchunk,
             nbatch: self.nbatch,

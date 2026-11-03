@@ -88,6 +88,7 @@ pub mod ri_cphf;
 pub mod lib_rint;
 pub mod x2c;
 pub mod analdrv;
+pub mod md;
 
 //extern crate rest;
 

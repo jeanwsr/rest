@@ -52,6 +52,22 @@ where
     let nthreads = rayon::current_num_threads();
 
     if let Some(rimatr) = &scf_data.rimatr {
+        // This kernel walks the full packed pair space of the stored tensor. Under storage-level
+        // pruning the tensor carries the retained rows only, so a packed walk would read the
+        // wrong pairs. The drivers that reach here (`ri_pt2` `new_driver = true` and
+        // `engine = "torch"`) are not wired to `PairMap`, so refuse instead of returning a
+        // wrong correlation energy. The streaming driver and the `ri3mo` route go through the
+        // map-aware `scf_io::ao2mo_rayon*` kernels and do support pruning.
+        if let Some(map) = &scf_data.rimatr_pair_map {
+            assert!(
+                map.len() == map.num_baspar_full(),
+                "ri_pt2 new_driver / torch engine does not support storage-level AO-pair \
+                 pruning: {} of {} packed pair rows are stored. Run with streaming PT2 \
+                 (ri_pt2.streaming = true) or set pair_screen_threshold = 0.0.",
+                map.len(),
+                map.num_baspar_full()
+            );
+        }
         // make direct call of ao2mo
         let rimatr = rimatr.0.to_rstsr_view(&device);
         let naux = rimatr.shape()[1];
@@ -196,6 +212,22 @@ where
     let nthreads = rayon::current_num_threads();
 
     if let Some(rimatr) = &scf_data.rimatr {
+        // This kernel walks the full packed pair space of the stored tensor. Under storage-level
+        // pruning the tensor carries the retained rows only, so a packed walk would read the
+        // wrong pairs. The drivers that reach here (`ri_pt2` `new_driver = true` and
+        // `engine = "torch"`) are not wired to `PairMap`, so refuse instead of returning a
+        // wrong correlation energy. The streaming driver and the `ri3mo` route go through the
+        // map-aware `scf_io::ao2mo_rayon*` kernels and do support pruning.
+        if let Some(map) = &scf_data.rimatr_pair_map {
+            assert!(
+                map.len() == map.num_baspar_full(),
+                "ri_pt2 new_driver / torch engine does not support storage-level AO-pair \
+                 pruning: {} of {} packed pair rows are stored. Run with streaming PT2 \
+                 (ri_pt2.streaming = true) or set pair_screen_threshold = 0.0.",
+                map.len(),
+                map.num_baspar_full()
+            );
+        }
         // make direct call of ao2mo
         let rimatr = rimatr.0.to_rstsr_view(&device);
         let naux = rimatr.shape()[1];

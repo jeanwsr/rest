@@ -103,7 +103,7 @@ pub fn radial_grid_lmg(
     // factor 2.0 to match DIRAC code
     let r_inner = get_r_inner(radial_precision, alpha_max * 2.0);
 
-    let mut h = std::f64::MAX;
+    let mut h = f64::MAX;
     let mut r_outer: f64 = 0.0;
 
     // we need alpha_min sorted by l
@@ -245,7 +245,7 @@ fn get_r_inner(max_error: f64, alpha_inner: f64) -> f64 {
 ///
 fn get_r_outer(max_error: f64, alpha_outer: f64, l: usize, guess: f64) -> f64 {
     let m = (2 * l) as f64;
-    let mut r_old = std::f64::MAX;
+    let mut r_old = f64::MAX;
     let mut step = 0.5;
     let mut sign = 1.0;
     let mut r = guess;
@@ -290,7 +290,7 @@ fn get_r_outer(max_error: f64, alpha_outer: f64, l: usize, guess: f64) -> f64 {
 ///
 fn get_h(max_error: f64, l: usize, guess: f64) -> f64 {
     let m = (2 * l) as f64;
-    let mut h_old = std::f64::MAX;
+    let mut h_old = f64::MAX;
     let mut h = guess;
     let mut step = 0.1 * guess;
     let mut sign = -1.0;
@@ -413,7 +413,11 @@ pub fn radial_grid_becke(n: usize, charge: usize) -> (Vec<f64>, Vec<f64>) {
     let (mut t, mut w) = chebgauss_polynomial(n);
     
     let r = t.iter().map(|item| (1.0+item)/(1.0-item)*rm).collect();
-    w.iter_mut().zip(t.iter()).for_each(|(w,t)| *w *= 2.0/(1.0-t).powf(2.0)*rm);
+    // Gauss-Chebyshev quadrature of the first kind over x in (-1,1):
+    //   int_{-1}^1 g(x) dx ~= (pi/n) * sum_i g(x_i) * sqrt(1-x_i^2).
+    // r(x) = rm (1+x)/(1-x), dr/dx = rm * 2/(1-x)^2, hence the weight is
+    //   w_i = (pi/n) * dr/dx * sqrt(1-x_i^2).
+    w.iter_mut().zip(t.iter()).for_each(|(w,t)| *w *= 2.0/(1.0-t).powf(2.0)*rm*(1.0-t*t).sqrt());
     //println!("r = {:?}, w = {:?}", &r, &w);
     (r,w)
 

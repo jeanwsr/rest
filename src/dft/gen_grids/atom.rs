@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::convert::TryInto;
-use rayon::prelude::*;
 
 use super::becke_partitioning;
+use super::becke_partitioning::RadiiAdjust;
 use super::bragg;
 use super::bse;
 use super::lebedev;
@@ -27,6 +27,7 @@ pub fn atom_grid_bse(
     pruning: String,
     rad_grid_method: String,
     level: usize,
+    radii_adjust: RadiiAdjust,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
     let (alpha_min, alpha_max) =
         bse::ang_min_and_max(basis_set, proton_charges[center_index] as usize);
@@ -44,6 +45,7 @@ pub fn atom_grid_bse(
         pruning,
         rad_grid_method,
         level,
+        radii_adjust,
     )
 }
 
@@ -78,8 +80,39 @@ pub fn atom_grid(
     pruning: String,
     rad_grid_method: String,
     level: usize,
+    radii_adjust: RadiiAdjust,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
 
+    atom_grid_with_isdf(
+        alpha_min, alpha_max, radial_precision, min_num_angular_points,
+        max_num_angular_points, proton_charges, center_index,
+        center_coordinates_bohr, hardness, pruning, rad_grid_method, level, radii_adjust, false,
+    )
+}
+
+/// Use the historical angular tables only for an explicitly requested ISDF grid.
+pub(crate) fn atom_grid_with_isdf(
+    alpha_min: HashMap<usize, f64>,
+    alpha_max: f64,
+    radial_precision: f64,
+    min_num_angular_points: usize,
+    max_num_angular_points: usize,
+    proton_charges: Vec<i32>,
+    center_index: usize,
+    center_coordinates_bohr: Vec<(f64, f64, f64)>,
+    hardness: usize,
+    pruning: String,
+    rad_grid_method: String,
+    level: usize,
+    radii_adjust: RadiiAdjust,
+    use_isdf: bool,
+) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
+
+    let angular_grid = if use_isdf {
+        super::lebedev_isdf::angular_grid
+    } else {
+        lebedev::angular_grid
+    };
 
 /*
     //Generate radial grid through lmg method
@@ -187,10 +220,10 @@ pub fn atom_grid(
                     num_angular = min_num_angular_points;
                 }
             }
-            lebedev::angular_grid(num_angular)
+            angular_grid(num_angular)
         }
         else {
-                lebedev::angular_grid(ang_array[radial_coord_index])
+                angular_grid(ang_array[radial_coord_index])
             };
 
         radial_coord_index += 1;
@@ -211,18 +244,22 @@ pub fn atom_grid(
 
     let quadrature_weights = weights.clone();
     if center_coordinates_bohr.len() > 1 {
-        let w_partitioning: Vec<f64> = coordinates
-            .par_iter()
-            .map(|c| {
-                becke_partitioning::partitioning_weight(
-                    center_index,
-                    &center_coordinates_bohr,
-                    &proton_charges,
-                    *c,
-                    hardness,
-                )
-            })
-            .collect();
+        // Becke partitioning is the only part of this function whose cost grows with the
+        // square of the atom count. Hoist everything that depends on the molecule alone
+        // into one pair table, then evaluate the grid in blocks, reusing the scratch
+        // buffers of each worker. `partitioning_weights_par` is bit-identical to calling
+        // `partitioning_weight` once per grid point.
+        let table =
+            becke_partitioning::BeckePairTable::new(&center_coordinates_bohr, &proton_charges, radii_adjust);
+        let mut w_partitioning = vec![0.0f64; coordinates.len()];
+        becke_partitioning::partitioning_weights_par(
+            &table,
+            center_index,
+            &center_coordinates_bohr,
+            &coordinates,
+            hardness,
+            &mut w_partitioning,
+        );
 
         for (i, w) in weights.iter_mut().enumerate() {
             *w *= w_partitioning[i];

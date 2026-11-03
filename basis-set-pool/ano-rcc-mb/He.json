@@ -1,0 +1,43 @@
+{
+  "electron_shells": [
+    {
+      "function_type": "gto",
+      "region": "",
+      "angular_momentum": [
+        0
+      ],
+      "exponents": [
+        "1149.2705",
+        "172.04457",
+        "39.080465",
+        "11.036173",
+        "3.5641520",
+        "1.2404430",
+        ".44731600",
+        ".16420600",
+        ".05747200"
+      ],
+      "coefficients": [
+        [
+          ".00035774",
+          ".00277289",
+          ".01429838",
+          ".05586749",
+          ".16336284",
+          ".33133146",
+          ".41429728",
+          ".18903228",
+          ".00515606"
+        ]
+      ]
+    }
+  ],
+  "references": [
+    {
+      "reference_description": "ANO-RCC-MB basis (truncated form of ANO-RCC)",
+      "reference_keys": [
+        "widmark1990a"
+      ]
+    }
+  ]
+}

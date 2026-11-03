@@ -1,15 +1,15 @@
 //! Molecular point-group detection — a pure-std port of Psi4's libmints
 //! algorithm (`psi4/driver/qcdb/libmintsmolecule.py`).
-//! 
+//!
 //! # Note on AI usage
-//! 
+//!
 //! This module is purely written by AI (GLM-5.2 with Claude Code). Human review is virtually nonexistent.
-//! 
+//!
 //! I (ajz34) notices some redundant implementations (for examples elements).
 //! These files can be refactored in the future, or kept as independent implementations for clarity.
-//! 
+//!
 //! As long as functionality retains, I'm not aware if anyone will modify this module freely.
-//! 
+//!
 //! Unittests are not included in this module. For more information, see
 //! <https://gitee.com/ajz34/rust-showcase-point-group>.
 //!

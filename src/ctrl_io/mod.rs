@@ -7,7 +7,7 @@ use std::{fs};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
-use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask, parse_analdrv_keywords};
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
@@ -29,6 +29,8 @@ pub mod ri_jk_io;
 pub mod ri_pt2_io;
 pub use ri_jk_io::*;
 pub use ri_pt2_io::*;
+pub mod output;
+pub use output::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
@@ -38,7 +40,7 @@ pub mod tddft_parameters;
 pub mod hessian_parameters;
 pub mod thermo_parameters;
 use geometric_pyo3_io::GeomeTRIC;
-mod path_util;
+pub mod path_util;
 use quasiparticle_methods::QuasiParticle;
 use tddft_parameters::TDDFTParameters;
 use hessian_parameters::HessianParameters;
@@ -64,6 +66,7 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    check_top_level_blocks(tmp_keys)?;
     let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
@@ -86,8 +89,41 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     if let Some(tmp_thermo) = &mut tmp_thermo {
         tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
-    tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
+    tmp_input.analdrv = parse_analdrv_keywords(tmp_keys);
+    tmp_input.output = parse_output_keywords(tmp_keys);
+    resolve_cube_keywords(&mut tmp_input, tmp_keys);
     Ok((tmp_input,tmp_geomcell))
+}
+
+const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
+    "ctrl",
+    "geom",
+    "output",
+    "md",
+    "tddft",
+    "hessian",
+    "thermo",
+    "analdrv",
+    "geometric_pyo3",
+    "quasiparticle_methods",
+];
+
+fn check_top_level_blocks(tmp_keys: &serde_json::Value) -> anyhow::Result<()> {
+    if let serde_json::Value::Object(top_level) = tmp_keys {
+        let unknown: Vec<&str> = top_level
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !VALID_TOP_LEVEL_BLOCKS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Unknown input block(s): [{}]. Valid top-level blocks are: {}.",
+                unknown.join("], ["),
+                VALID_TOP_LEVEL_BLOCKS.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
@@ -122,6 +158,7 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+    MD,
 }
 
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
@@ -154,6 +191,55 @@ pub enum HamiltonianDistributedMode {
 ///  - `even_tempered-basis`: `Bool`. True: turn on ETB to generate the auxiliary basis set
 ///  - `etb_start_atom_number`: `Usize`. Use ETB, for the element with atomic index larger than this value  
 ///  - `etb_beta`: `f64`. Relevant to the ETB basis set size. Smaller value indicates larger ETB basis set. NOTE: etb_beta should be larger than 1.0
+/// Strategy for importing a two-channel (UHF/UKS) wavefunction into a
+/// restricted (RHF/ROHF/ROKS) calculation, where only one common spatial
+/// orbital set can be carried over.
+///
+/// The alpha and beta channels of a UHF/UKS solution are optimized
+/// independently and do not share a common basis, so the import has to
+/// *choose* one orthonormal set:
+///
+/// * `keepalpha` (default): keep the alpha channel.  The beta channel is still
+///   read in, but only as the MOM / force-state reference.
+/// * `keepbeta`: keep the beta channel instead.
+/// * `natural`: natural orbitals (Lowdin) of the total one-particle density
+///   `D = D_alpha + D_beta`, i.e. the unrestricted natural orbitals (UNO),
+///   ordered by decreasing occupation.  This is the only mixing style: an
+///   average of the two *coefficient* matrices is not well defined (the two
+///   channels are complete orthonormal bases of the same AO space, so their
+///   overlap matrix is orthogonal), and any proper corresponding-orbital
+///   average of the occupied spaces reproduces exactly this eigenbasis.
+///
+/// For weakly spin-polarized sources all styles give the same guess up to
+/// `1 - sigma_min`; they differ when the UHF/UKS solution is strongly
+/// spin-polarized or symmetry broken.  Only the two `keep*` styles retain the
+/// per-spin structure that the restricted open-shell singlet needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum U2RStyle {
+    KeepAlpha,
+    KeepBeta,
+    Natural,
+}
+
+impl U2RStyle {
+    pub const KEYWORDS: [&'static str; 3] = ["keepalpha", "keepbeta", "natural"];
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            U2RStyle::KeepAlpha => "keepalpha",
+            U2RStyle::KeepBeta => "keepbeta",
+            U2RStyle::Natural => "natural",
+        }
+    }
+    pub fn from_keyword(keyword: &str) -> Option<U2RStyle> {
+        match keyword.to_lowercase().as_str() {
+            "keepalpha" | "keep_alpha" | "alpha" => Some(U2RStyle::KeepAlpha),
+            "keepbeta" | "keep_beta" | "beta" => Some(U2RStyle::KeepBeta),
+            "natural" | "uno" => Some(U2RStyle::Natural),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug,Clone,Serialize, Deserialize)]
 #[pyclass]
 pub struct InputKeywords {
@@ -189,6 +275,9 @@ pub struct InputKeywords {
     // Keywords for IDSF
     #[pyo3(get, set)]
     pub use_isdf: bool,
+    /// ISDF interpolation-points multiplier k; `None` uses the Rust/PyO3 estimator.
+    #[pyo3(get, set)]
+    pub isdf_k: Option<usize>,
     #[pyo3(get, set)]
     pub isdf_k_only: bool,
     #[pyo3(get, set)]
@@ -196,6 +285,12 @@ pub struct InputKeywords {
     // Keywords for systems
     #[pyo3(get, set)]
     pub isdf_new: bool,
+    /// ISDF interpolation-point generation scheme: "udd" (density-driven) or "cvt".
+    #[pyo3(get, set)]
+    pub isdf_type: String,
+    /// Control input file name used by the ISDF k auto-estimation script.
+    #[pyo3(get, set)]
+    pub ctrl_file: String,
     #[pyo3(get, set)]
     pub eri_type: String,
     #[pyo3(get, set)]
@@ -249,6 +344,11 @@ pub struct InputKeywords {
     pub rad_grid_method: String,
     #[pyo3(get, set)]
     pub external_grids: String,
+    /// Becke radii adjustment used by the grid partitioning: `"becke"` keeps the raw Bragg radii
+    /// (Becke 1988, REST historical behaviour), `"treutler"` uses their square roots
+    /// (Treutler-Ahlrichs 1995, the PySCF/PyFock convention).
+    #[pyo3(get, set)]
+    pub radii_adjust: String,
     // Keywords for the scf procedures
     #[pyo3(get, set)]
     pub mixer: String,
@@ -256,6 +356,15 @@ pub struct InputKeywords {
     pub mix_param: f64,
     #[pyo3(get, set)]
     pub num_max_diis: usize,
+    /// Truncation threshold of the pseudo-inverse used by the DIIS solver (Pulay
+    /// coefficients are obtained from the Gram matrix of the error vectors). Larger
+    /// values discard more of the near-singular directions of that matrix, which
+    /// bounds the extrapolation coefficients.
+    pub diis_pinv_threshold: f64,
+    /// Whether the DIIS error vector is transformed to the orthonormal basis,
+    /// i.e. S^(-1/2) (FDS - SDF) S^(-1/2). PySCF and PyFock use the plain AO-basis
+    /// commutator; set this to false to reproduce that behaviour.
+    pub diis_orthogonalize_error: bool,
     #[pyo3(get, set)]
     pub start_diis_cycle: usize,
     #[pyo3(get, set)]
@@ -311,14 +420,28 @@ pub struct InputKeywords {
     pub initial_guess: String,
     #[pyo3(get, set)]
     pub basis_projection: String,
+    /// Options of the `[output]` block (see `OutputKeywords`).
+    pub output: OutputKeywords,
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
-    pub check_stab: bool,
+    pub check_stab: String,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
     #[pyo3(get, set)]
     pub vxc_screen_threshold: f64,
+    /// Drop the grid points whose initial-guess density contribution
+    /// `|rho_p * w_p|` is below this value, once, before the SCF iterations.
+    /// 0.0 (default) keeps every grid point.
+    #[pyo3(get, set)]
+    pub grid_prune_threshold: f64,
+    /// How the one-shot grid pruning materializes the smaller grid. `true` (default)
+    /// copies the surviving columns of the already tabulated AO/AOP tables, which costs
+    /// about a fifth of a re-tabulation but needs the old and the new table at once.
+    /// `false` re-tabulates the surviving points, keeping the peak at one table at the
+    /// price of about 0.8x of the first tabulation.
+    #[pyo3(get, set)]
+    pub grid_prune_compact: bool,
     #[pyo3(get, set)]
     pub ao_cutoff: f64,
     #[pyo3(get, set)]
@@ -346,6 +469,16 @@ pub struct InputKeywords {
     // Keywords for sad initial guess
     #[pyo3(get, set)]
     pub atom_sad: bool,
+    /// Use the PEXSI pole-expanded selected-inversion solver for the SCF step
+    /// instead of the O(N^3) diagonalisation (`ctrl.pexsi = true`).
+    ///
+    /// Run-time switch: no rebuild is needed to go back to diagonalisation.
+    /// Needs a build with the `pexsi` feature — without it the keyword is
+    /// reported and ignored. Refused for the nested SAD SCF (`atom_sad = true`),
+    /// which is a doublet. Validated for LDA/GGA; with exact exchange the frozen
+    /// `H_core` pattern truncates the 1/R tail of `K`, which only warns.
+    #[pyo3(get, set)]
+    pub pexsi: bool,
     pub empirical_dispersion: Option<String>,
     pub occupation_type: OCCType,
     pub frac_tolerant: f64,
@@ -359,6 +492,13 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub bench_eps: bool,
     // Keywords for parallism
+    /// Number of threads of **this MPI process**, not of the node.
+    ///
+    /// Every rank is an independent process and builds its own global rayon pool (and sets the
+    /// OpenMP thread count of the BLAS behind it) to this value, so a node runs `num_threads`
+    /// times the number of ranks placed on it. For a hybrid MPI + threads run, set it to
+    /// `cores per node / ranks per node`. The default is 1, which serialises the parallel
+    /// regions of each process.
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
     // batch size for each thread
@@ -369,10 +509,21 @@ pub struct InputKeywords {
     pub force_state_occupation: Vec<ForceStateOccupation>,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
-    /// Maximum memory available in MB, `None` if no limit.
-    /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
-    /// For multi-node (MPI), this keyword is not fully discussed.
+    /// Maximum memory available to **this MPI process** in MB, `None` if no limit.
+    ///
+    /// The budget is consumed as `max_memory` minus the resident set of the current process
+    /// (`detect_used_memory_mb("proc")`), so under MPI every rank applies it to itself and a node
+    /// is allowed `max_memory` times the number of ranks placed on it. For a hybrid MPI + threads
+    /// run, set it to `memory per node / ranks per node` with some head room. When it is not set,
+    /// the batch decisions fall back to the available memory of the node, which every rank reads
+    /// as its own budget, so an explicit value is recommended whenever several ranks share a node.
+    ///
+    /// The keyword only works where the algorithm is aware of the memory usage and performs batched
+    /// computation, and it is not a hard cap: it feeds the batch sizes and the force-phase monitor.
     pub max_memory: Option<f64>,
+    /// Back up of max_memory for the ISDF new driver (restored after ISDF preparation).
+    #[pyo3(get, set)]
+    pub max_memory_backup: Option<f64>,
     /// Abort the calculation when memory usage exceeds max_memory.
     pub abort_on_mem_exceed: bool,
     pub smear: Option<SmearingType>,
@@ -393,6 +544,31 @@ pub struct InputKeywords {
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
+    /// How a two-channel (UHF/UKS) guess file is converted into the single
+    /// common orbital set of a restricted (RHF/ROHF/ROKS) calculation
+    /// (keyword `u2r_style`, default "keepalpha").  See [`U2RStyle`].
+    pub u2r_style: U2RStyle,
+    // Keywords for the restricted open-shell singlet (rohf-oss) calculations
+    // Force the ROHF path even when n_alpha == n_beta (singlet), with alpha
+    // occupying orbital a and beta occupying orbital b (a != b).
+    #[pyo3(get, set)]
+    pub oss_roks: bool,
+    /// (a, b): 0-based orbital indices of the singly-occupied alpha (a) and
+    /// beta (b) orbitals. None => automatic choice a = nc, b = nc + 1
+    /// (nc = number of closed-shell orbitals), i.e. Q-Chem RHF-OSS style.
+    pub oss_pair: Option<[usize; 2]>,
+    /// OSS + fifth-rung PT2-family energy assembly (default true): the
+    /// Q-Chem ROKS *structure* -- one SCF plus one PT2 pass. The PT2
+    /// reference is the **OSS occupation** (alpha in a, beta in b, the beta
+    /// hole kept open) in the OSS semi-canonical basis:
+    ///   E_S(DH) = E_S(SCF) + PT2(OSS occupation)
+    /// This is the REST OSS reference; the Q-Chem ROKS-MP2 reference is
+    /// undocumented and is not matched (see PR4_oss_roks.md). The triplet
+    /// PT2 pass is skipped (`store_oss_energies` caches pt2_c = [0;3]).
+    /// When false, the legacy double-pass assembly is used instead:
+    /// PT2_t on the triplet occupation is evaluated and
+    ///   E_S(DH) = 2 E_mix(DH) - E_T(DH).
+    pub oss_pt2_single_pass: bool,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -404,6 +580,7 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_jk: RIJKOption,
     /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
@@ -453,9 +630,12 @@ impl InputKeywords {
             numerical_force: false,
             use_isdf: false,
             ri_k_only: false,
+            isdf_k: None,
             isdf_k_only: false,
             isdf_k_mu: 17,
             isdf_new: false,
+            isdf_type: String::from("udd"),
+            ctrl_file: String::from("ctrl.in"),
             // Keywords associated with the method employed
             xc: String::from("x3lyp"),
             xc_type: DFTType::Standard,
@@ -491,6 +671,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
+            radii_adjust: String::from("treutler"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -503,27 +684,32 @@ impl InputKeywords {
             mixer: String::from("diis"),
             mix_param: 0.6,
             num_max_diis: 8,
+            diis_pinv_threshold: 1.0e-12,
+            diis_orthogonalize_error: true,
             start_diis_cycle: 1,
             start_check_oscillation: 20,
             level_shift : None, 
             max_scf_cycle: 100,
-            scf_acc_rho: 1.0e-6,
-            scf_acc_eev: 1.0e-5,
+            scf_acc_rho: 1.0e-5,
+            scf_acc_eev: 1.0e-3,
             scf_acc_etot:1.0e-8,
             scf_conv_criteria: String::from("dm,eev"),
             scf_acc_g: 1.0e-5,
             has_chkfile: false, // not directly set by input
             external_init_guess: None, // not directly set by input
-            initial_guess: String::from("sad"),
+            initial_guess: String::from("pao"),
             basis_projection: String::from("occupied"),
+            output: OutputKeywords::default(),
             noiter: false,
-            check_stab: false,
+            check_stab: String::from("off"),
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
-            vxc_screen_threshold: 1.0e-15,
-            ao_cutoff: 0.0,
+            vxc_screen_threshold: 0.0, // 0.0 = 关闭格点密度筛选（见 README）
+            grid_prune_threshold: 0.0,  // 0.0 = 不剪枝（见 README）
+            grid_prune_compact: true,   // true = 就地压缩（省时间、多一份表的峰值内存）
+            ao_cutoff: 1.0e-9,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
@@ -545,6 +731,8 @@ impl InputKeywords {
             //output_fchk: false,
             // Keyword to turn on atom calculations for the SAD initial guess
             atom_sad: false,
+            // Keyword to use the PEXSI solver instead of diagonalisation
+            pexsi: false,
             // Derived keywords of identifying the method used
             //use_dft: false,
             //dft_type: None,
@@ -557,6 +745,7 @@ impl InputKeywords {
             force_state_occupation: Vec::new(),
             rpa_de_excitation_parameters: None,
             max_memory: None,
+            max_memory_backup: None,
             abort_on_mem_exceed: true,
             smear: None,
             smear_sigma: None,
@@ -568,6 +757,10 @@ impl InputKeywords {
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
+            u2r_style: U2RStyle::KeepAlpha,
+            oss_roks: false,
+            oss_pair: None,
+            oss_pt2_single_pass: true,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
@@ -578,7 +771,7 @@ impl InputKeywords {
             solvent_ri: true,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
-            solv_chunk: 8,
+            solv_chunk: 16,
             pcm_cavity_radii: RadiusScheme::UFF,
             smd_cavity_radii: SmdCavityRadii::Bondi,
             solvent_name: String::new(),
@@ -586,6 +779,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
             rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
@@ -638,6 +832,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         },
         JobType::NormalModes => {
             println!("Calculation type: Vibrational normal modes (frequency) calculation");
+        },
+        JobType::MD => {
+            println!("Calculation type: Molecular dynamics (MD) simulation");
         },
     }
 
@@ -736,6 +933,17 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("                            {:e} Ha. for grad_dm", ctrl.scf_acc_g);
         println!("SCF convergence criteria:       {}", ctrl.scf_conv_criteria);
         println!("Max. SCF cycle number:      {}", ctrl.max_scf_cycle);
+        // Which solver will drive the SCF. Three states worth distinguishing:
+        // requested and compiled in, requested but not compiled in, not
+        // requested.
+        let solver_line = if ctrl.pexsi && cfg!(feature = "pexsi") {
+            "PEXSI (pole-expanded selected inversion)"
+        } else if ctrl.pexsi {
+            "diagonalisation (pexsi requested, but this build has no pexsi feature)"
+        } else {
+            "diagonalisation"
+        };
+        println!("SCF solver:                 {}", solver_line);
         match geom.pbc {
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
@@ -767,6 +975,15 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
 
     }
+    // The GW/evGW archive is stored inside the chkfile, so the feature needs one.
+    if let Some(qp) = ctrl.quasiparticle_methods.as_ref() {
+        if (qp.save_gw_checkpoint || qp.resume_from_checkpoint) && !ctrl.has_chkfile {
+            panic!(
+                "ERROR: `save_gw_checkpoint` / `resume_from_checkpoint` store and read the GW \
+                 state inside the chkfile; set `chkfile = \"job.chk\"` in [ctrl] (not \"none\")."
+            );
+        }
+    }
     if ctrl.force_state_occupation.len()>0 {
         if ! ctrl.external_init_guess.is_some() {
             panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");
@@ -783,6 +1000,22 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         }
     }
 
+    // sanity checks for the restricted open-shell singlet (rohf-oss) mode
+    if ctrl.oss_roks {
+        if ctrl.spin_polarization {
+            panic!("ERROR: oss_roks is incompatible with spin_polarization=true (the restricted open-shell singlet requires a common orbital set)");
+        }
+        if ctrl.force_state_occupation.len() > 0 {
+            warn!("oss_roks: the occupation pattern is overridden by force_state_occupation (MOM)");
+        }
+        info!("Restricted open-shell singlet (rohf-oss) calculation is requested.");
+        if let Some([orb_a, orb_b]) = ctrl.oss_pair {
+            info!("Open-shell orbitals: alpha = {}, beta = {}", orb_a, orb_b);
+        } else {
+            info!("Open-shell orbitals: automatic choice (alpha = HOMO, beta = LUMO)");
+        }
+    }
+
     if ctrl.use_ri_symm {
         debug!("Turn on the basis pair symmetry for RI 3D-tensors")
     } else {
@@ -790,6 +1023,7 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     };
     debug!("The pruning method is {}", ctrl.pruning);
     debug!("The radial grid generation method is {}", ctrl.rad_grid_method);
+    debug!("The Becke radii adjustment scheme is {}", ctrl.radii_adjust);
     debug!("min_num_angular_points: {}", ctrl.min_num_angular_points);
     debug!("max_num_angular_points: {}", ctrl.max_num_angular_points);
     debug!("hardness: {}", ctrl.hardness);
@@ -893,7 +1127,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             // if env REST_BASIS_DIR is set, use it as rest_basis_dir, 
             // otherwise use the default path from rest docker's convention or $REST_HOME/rest/basis-set-pool/
-            let rest_basis_dir = path_util::get_rest_basis_dir(tmp_input.print_level);
+            let rest_basis_dir = path_util::get_rest_basis_dir();
 
             tmp_input.basis_path = match tmp_ctrl.get("basis_path").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_bas) => {
@@ -924,6 +1158,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
 
+            tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("treutler")} // default: Treutler-Ahlrichs sqrt radii (PySCF/PyFock default)
+            };
+            //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
+
             tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_eri) => {
                     if tmp_eri.to_lowercase().eq("ri_v") || tmp_eri.to_lowercase().eq("ri-v")
@@ -950,6 +1190,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 //====================================================
                 tmp_input.use_auxbas = true;
                 tmp_input.use_isdf = true;
+            }else if eri_type.eq(&String::from("isdf")) {
+                // density-driven ISDF (like old version): isdf_new = true
+                tmp_input.use_auxbas = true;
+                tmp_input.use_isdf = true;
+                tmp_input.isdf_new = true;
+                tmp_input.eri_type = String::from("ri_v");
             }else if eri_type.eq(&String::from("isdf_k_new")){
                     tmp_input.use_auxbas = true;
                     tmp_input.use_isdf = true;
@@ -985,6 +1231,26 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8_usize},
             };            
+
+            tmp_input.isdf_type = match tmp_ctrl.get("isdf_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("udd")},
+            };
+
+            tmp_input.isdf_k = match tmp_ctrl.get("isdf_k").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    if lower == "none" {
+                        None
+                    } else {
+                        lower.parse::<usize>().ok()
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    n.as_u64().and_then(|v: u64| v.try_into().ok())
+                }
+                _ => None,
+            };
 
             tmp_input.auxbas_type = match tmp_ctrl.get("auxbas_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
@@ -1029,13 +1295,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
                         JobType::NumDipole
                     } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
-                      tmp_xc_low.eq("single_point") {
+                      tmp_xc_low.eq("single_point") || tmp_xc_low.eq("sp") ||
+                      tmp_xc_low.eq("singlepoint") {
                         JobType::SinglePoint
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
                         JobType::NormalModes
+                    } else if tmp_xc_low.eq("md") || tmp_xc_low.eq("molecular dynamics") ||
+                      tmp_xc_low.eq("molecular_dynamics") {
+                        JobType::MD
                     } else {
-                        JobType::SinglePoint
+                        anyhow::bail!(
+                            "Unknown job_type '{}' in the [ctrl] block. Valid values: \
+                             energy/single point/single_point/sp/singlepoint, force/gradient, \
+                             numdipole/numerical dipole, \
+                             opt/geometry optimization/geometry relaxation/geom_opt/geom_relax/relax, \
+                             normal_modes/freq/frequency/vibration, md/molecular dynamics/molecular_dynamics.",
+                            tmp_xc
+                        );
                     }
                 },
                 other => {JobType::SinglePoint},
@@ -1373,10 +1650,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             // Experimental function
             tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                other => {8},
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(16)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(16) as usize},
+                _ => {16},
             };
+            // 0 would panic the RI veff path (`par_chunks(0)`); clamp to at least one point.
+            tmp_input.solv_chunk = tmp_input.solv_chunk.max(1);
             // ==============================================
             //  Keywords associated with relativistic methods 
             // ==============================================
@@ -1452,15 +1731,21 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => {None}
             };
+            // The default stopping rule stays "dm,eev". Only the density and eigenvalue
+            // thresholds are loosened (1e-6 -> 1e-5 and 1e-5 -> 1e-3), matching the level
+            // PySCF reaches by default; switching the criterion itself to the gradient
+            // norm moved analytic derivatives and thermochemistry by more than their
+            // regression tolerances, so "g" is left as an explicit user choice.
+            // scf_acc_etot still binds in every mode, so it keeps its historical value.
             tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
-                other => {1.0e-8}
-            };
-            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-5)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
-                other => {1.0e-6}
+                other => {1.0e-5}
+            };
+            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
+                other => {1.0e-3}
             };
             tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
@@ -1494,6 +1779,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8_usize}
             };
+            tmp_input.diis_pinv_threshold = match tmp_ctrl.get("diis_pinv_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-12)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-12)},
+                other => {1.0e-12}
+            };
+            tmp_input.diis_orthogonalize_error = match tmp_ctrl.get("diis_orthogonalize_error").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => {matches!(tmp_str.to_lowercase().as_str(), "true" | "yes" | "on" | "1")},
+                other => {true}
+            };
             tmp_input.start_diis_cycle = match tmp_ctrl.get("start_diis_cycle").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
@@ -1526,9 +1821,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.has_chkfile = ! tmp_input.chkfile.to_lowercase().eq(&"none");
 
+            // Keep this fallback in sync with `InputKeywords::init_ctrl`: the parser, not the
+            // struct initializer, decides the effective default when the ctrl file has no
+            // `initial_guess` line.
             tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
-                other => {String::from("sad")},
+                other => {String::from("pao")},
             };
 
             tmp_input.basis_projection = match tmp_ctrl.get("basis_projection").unwrap_or(&serde_json::Value::Null) {
@@ -1542,9 +1840,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => false,
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase(),
+                serde_json::Value:: Bool(true) => String::from("auto"),
+                serde_json::Value:: Bool(false) => String::from("off"),
+                other => String::from("off"),
             };
             tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
@@ -1552,14 +1851,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.vxc_screen_threshold = match tmp_ctrl.get("vxc_screen_threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-15),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-15),
-                _ => 1.0e-15,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.grid_prune_threshold = match tmp_ctrl.get("grid_prune_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.grid_prune_compact = match tmp_ctrl.get("grid_prune_compact").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase().parse().unwrap_or(true),
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-12),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-12),
-                _ => 1.0e-12,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-9),
+                _ => 1.0e-9,
             };
             tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),
@@ -1576,6 +1885,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.ri_jk = tmp_ctrl.get("ri_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
@@ -1844,6 +2154,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {false},
             };
 
+            // for the SCF solver: pexsi = true switches the solve step from
+            // diagonalisation to the PEXSI selected inversion. Accepted as a
+            // bool, a string ("true"/"false") or a number (1/0), because the
+            // input file may be written with any of the three.
+            tmp_input.pexsi = match tmp_ctrl.get("pexsi").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value::Number(tmp_num) => tmp_num.as_i64().unwrap_or(0) != 0,
+                _ => false,
+            };
+            if tmp_input.pexsi && !cfg!(feature = "pexsi") {
+                warn!(
+                    "`pexsi = true` is set in [ctrl], but this build has no `pexsi` feature; \
+                        the SCF will use diagonalisation. Rebuild with \
+                        `cargo build --features pexsi` to use it."
+                );
+            }
+
             tmp_input.max_memory = match tmp_ctrl.get("max_memory").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
                 other => None,
@@ -1944,6 +2272,39 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => false,
             };
             
+            // for oss_roks: force the restricted open-shell singlet (rohf-oss) mode
+            tmp_input.oss_roks = match tmp_ctrl.get("oss_roks").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                other => false,
+            };
+            // for oss_pair: [a, b] with 0-based orbital indices of the singly-occupied
+            // alpha (a) and beta (b) orbitals; None (default) => automatic a=nc, b=nc+1
+            tmp_input.oss_pair = match tmp_ctrl.get("oss_pair").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_value) => {
+                    if tmp_value.len() == 2 {
+                        let orb_a = tmp_value[0].as_i64().unwrap_or(-1);
+                        let orb_b = tmp_value[1].as_i64().unwrap_or(-1);
+                        if orb_a >= 0 && orb_b >= 0 {
+                            Some([orb_a as usize, orb_b as usize])
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                other => None,
+            };
+            // for oss_pt2_single_pass: assemble E_S(DH) with a single PT2 on
+            // the OSS occupation (default true)
+            // or with the legacy double-pass 2 E_mix(DH) - E_T(DH)
+            // assembly (separate triplet PT2 pass).
+            tmp_input.oss_pt2_single_pass = match tmp_ctrl.get("oss_pt2_single_pass").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                other => true,
+            };
             // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
             tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
@@ -1966,6 +2327,23 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => 0_usize,
             };
 
+            // for u2r_style: how a two-channel (UHF/UKS) guess file is converted
+            // into the single common orbital set of a restricted calculation.
+            tmp_input.u2r_style = match tmp_ctrl.get("u2r_style").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => match U2RStyle::from_keyword(tmp_str) {
+                    Some(style) => style,
+
+                    None => panic!(
+                        "ERROR: not recognized option for u2r_style: \"{}\" (available: {})",
+                        tmp_str, U2RStyle::KEYWORDS.join("\", \"")
+                    ),
+                },
+                serde_json::Value::Null => U2RStyle::KeepAlpha,
+                _ => panic!(
+                    "ERROR: u2r_style expects a string (available: {})",
+                    U2RStyle::KEYWORDS.join("\", \"")
+                ),
+            };
             tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
                 other => {None},

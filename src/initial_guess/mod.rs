@@ -1,8 +1,10 @@
 #![warn(unused_imports)]
-use tensors::{MatrixFull, MatrixUpper};
+use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_tn, _dsvd};
+use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
+use crate::ctrl_io::U2RStyle;
 use crate::initial_guess::enxc::effective_nxc_matrix;
 #[cfg(feature = "mpi")]
-use crate::mpi_io::mpi_broadcast_matrixfull;
+use crate::mpi_io::{mpi_broadcast_matrixfull, mpi_broadcast_vector};
 use crate::mpi_io::MPIOperator;
 use crate::scf_io::{SCFType};
 use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids};
@@ -14,6 +16,7 @@ pub mod sap;
 pub mod sad;
 pub mod enxc;
 pub mod proj;
+pub mod pao;
 mod pyrest_enxc;
 use crate::fileop::chkfile;
 
@@ -99,11 +102,65 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
         //scf_data.generate_hf_hamiltonian();
-    } else if scf_data.mol.ctrl.initial_guess.eq(&"sad") {
-        let cur_log_level = log::max_level();
-        log::set_max_level(LevelFilter::Info);
-        scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
-        log::set_max_level(cur_log_level);
+    } else if scf_data.mol.ctrl.initial_guess.eq(&"sad")
+        || scf_data.mol.ctrl.initial_guess.eq(&"pao") {
+        // The PAO guess reuses the SAD atomic SCF step and hands the atomic guess orbitals to
+        // the SCF, per spin channel. When it is not available (ghost basis, ISDF enabled, or a
+        // construction failure) the branch falls through to plain SAD below.
+        let mut pao_done = false;
+        if scf_data.mol.ctrl.initial_guess.eq(&"pao") && !scf_data.mol.ctrl.use_isdf {
+            match crate::initial_guess::pao::initial_guess_from_pao(&scf_data.mol) {
+                Some((mut eigv, mut occ)) => {
+                    #[cfg(feature = "mpi")]
+                    if let Some(mpi_op) = mpi_operator {
+                        for i_spin in 0..scf_data.mol.spin_channel {
+                            if !eigv[i_spin].data.is_empty() {
+                                mpi_broadcast_matrixfull(&mpi_op.world, &mut eigv[i_spin], 0);
+                            }
+                            if !occ[i_spin].is_empty() {
+                                mpi_broadcast_vector(&mpi_op.world, &mut occ[i_spin], 0);
+                            }
+                        }
+                    }
+                    let ncols = crate::scf_io::util::occupied_orbital_count(&occ[0]);
+                    let ncols_beta = if scf_data.mol.spin_channel == 2 {
+                        crate::scf_io::util::occupied_orbital_count(&occ[1])
+                    } else {
+                        0
+                    };
+                    scf_data.eigenvectors = [eigv[0].clone(), eigv[1].clone()];
+                    scf_data.occupation = [occ[0].clone(), occ[1].clone()];
+                    scf_data.generate_density_matrix();
+                    // The guess carries occupied orbitals, so every Fock build here and below
+                    // takes the orbital-based (pair-screened) RI-K instead of the dense dm-only
+                    // kernel. One Roothaan step then runs on that Fock: it is cheap on the orbital
+                    // path and it makes the effective starting density the same kind of object
+                    // SAD hands over (idempotent, occupations taken from `num_elec`), which keeps
+                    // the downstream SCF trajectory and the converged density bit-comparable.
+                    scf_data.mol.ctrl.use_dm_only = false;
+                    scf_data.generate_hf_hamiltonian(mpi_operator);
+                    scf_data.diagonalize_hamiltonian(mpi_operator);
+                    scf_data.generate_occupation();
+                    scf_data.generate_density_matrix();
+                    if ncols_beta > 0 {
+                        info!("PAO guess: {} alpha and {} beta occupied atomic orbitals drive the first Fock build", ncols, ncols_beta);
+                    } else {
+                        info!("PAO guess: {} occupied atomic orbitals drive the first Fock build", ncols);
+                    }
+                    pao_done = true;
+                },
+                None => {
+                    warn!("initial_guess = pao is not available for this system, falling back to SAD");
+                }
+            }
+        }
+        if !pao_done {
+        if !scf_data.mol.ctrl.use_isdf {
+            let cur_log_level = log::max_level();
+            log::set_max_level(LevelFilter::Info);
+            scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
+            log::set_max_level(cur_log_level);
+        }
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
@@ -112,6 +169,12 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
             mpi_broadcast_matrixfull(&mpi_op.world, &mut scf_data.density_matrix[0], 0);
             mpi_broadcast_matrixfull(&mpi_op.world, &mut scf_data.density_matrix[1], 0);
         }
+        // The SAD guess has no orbitals, so the first Fock build runs on the
+        // dm-only paths. NOTE: do NOT replace this with pseudo-orbitals
+        // (diagonalizing P_SAD): the SAD pseudo-eigenvectors are delocalized,
+        // which defeats the pair screening of the RI-K/XC contraction
+        // (measured 15-28x slower on ts2/water30) and breaks SCF convergence
+        // (fractional occupations, 2026-10-21 experiment).
         let original_flag = scf_data.mol.ctrl.use_dm_only;
         scf_data.mol.ctrl.use_dm_only = true;
 
@@ -146,6 +209,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         //scf_data.generate_hf_hamiltonian(mpi_operator);
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.scf_energy)};
         //===============================see====================================
+        }
     // generate the initial guess from hcore
     } else if scf_data.mol.ctrl.initial_guess.eq(&"hcore") {
         let init_fock = scf_data.h_core.clone();
@@ -185,7 +249,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 
 pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
-                &mut scf_data.mol, &scf_data.scftype, &chkfile);
+                &mut scf_data.mol, &scf_data.scftype, &scf_data.ovlp, &chkfile);
 
             //=============================
             // for MOM projection
@@ -236,7 +300,22 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             scf_data.eigenvalues = eigenvalues;
             scf_data.eigenvectors = eigenvectors;
             if let Some(occupation) = is_occupation {
-                scf_data.occupation = occupation;
+                // For the restricted open-shell singlet, derive the
+                // open-shell orbital indices (a: alpha-only, b: beta-only)
+                // from the occupation pattern of the imported wavefunction
+                // when they are not given explicitly (see
+                // `derive_oss_pair_from_occupation`).
+                if scf_data.mol.ctrl.oss_roks && scf_data.mol.ctrl.oss_pair.is_none() {
+                    derive_oss_pair_from_occupation(scf_data, &occupation);
+                }
+                if scf_data.mol.ctrl.oss_roks {
+                    // Explicit `oss_pair` (or the pair just derived above):
+                    // build the OSS occupation alpha = c + {a}, beta = c + {b}
+                    // from the imported orbitals, ignoring the file occupation.
+                    scf_data.generate_occupation();
+                } else {
+                    scf_data.occupation = occupation;
+                }
                 // let (homo, lumo) = scf_io::util::get_homo_lumo_from_occ_integer(&scf_data.occupation, &scf_data.scftype);
                 // scf_data.homo = homo;
                 // scf_data.lumo = lumo;
@@ -248,6 +327,89 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             // println!("occ {:?}", scf_data.occupation);
             scf_data.generate_density_matrix();
         }
+
+
+/// Derive the open-shell orbital pair `(a, b)` of the restricted open-shell
+/// singlet from the occupation pattern of an imported wavefunction, and fix
+/// it in `ctrl.oss_pair` (fixed-index scheme, shared by every SCF iteration).
+///
+/// `a` (alpha-only occupied) already indexes the common (alpha) orbital set.
+/// The beta open-shell orbital `j` belongs to the independently sorted beta
+/// channel of a UHF/MOM file, so it is mapped onto the common space by the
+/// maximum overlap `<psi_beta_j|S|psi_alpha_i>`; a single-channel (ROHF)
+/// import shares one orbital set and the index is exact.
+fn derive_oss_pair_from_occupation(scf_data: &mut SCF, occupation: &[Vec<f64>; 2]) {
+    let num_state = scf_data.mol.num_state;
+    // per-spin occupations are required to identify the
+    // open-shell pattern; a single-channel (RHF) guess file
+    // only stores the total occupation and cannot serve this
+    if occupation[0].len() != num_state || occupation[1].len() != num_state {
+        panic!("ERROR: rohf-oss requires per-spin occupations in the imported wavefunction (UHF/MOM or ROHF guess file); a single-channel (RHF) guess file cannot identify the open-shell orbitals");
+    }
+    // Step 1: locate the open-shell pattern in the occupation
+    // arrays: a single alpha-only orbital (index a, already in
+    // the common space) and a single beta-only orbital (index
+    // j, in the beta channel).
+    let mut orb_a: Option<usize> = None;
+    let mut orb_b_beta: Option<usize> = None;
+    (0..num_state).for_each(|i| {
+        let occ_a = occupation[0][i];
+        let occ_b = occupation[1][i];
+        if occ_a > 0.5 && occ_b < 0.5 {
+            if orb_a.is_some() {
+                panic!("ERROR: the imported wavefunction contains more than one alpha-only occupied orbital (orbital {} and {}), not an rohf-oss pattern", orb_a.unwrap(), i);
+            }
+            orb_a = Some(i);
+        } else if occ_b > 0.5 && occ_a < 0.5 {
+            if orb_b_beta.is_some() {
+                panic!("ERROR: the imported wavefunction contains more than one beta-only occupied orbital (orbital {} and {}), not an rohf-oss pattern", orb_b_beta.unwrap(), i);
+            }
+            orb_b_beta = Some(i);
+        }
+    });
+    let (a, j) = match (orb_a, orb_b_beta) {
+        (Some(a), Some(j)) => (a, j),
+        _ => {
+            panic!("ERROR: the imported wavefunction does not exhibit a single alpha-only and a single beta-only occupied orbital, which is required for rohf-oss");
+        }
+    };
+    // Step 2: map the beta open-shell orbital j onto the common
+    // (alpha) orbital space. The alpha and beta channels of a
+    // UHF/MOM file are two independently sorted orbital sets,
+    // so beta orbital j is in general NOT the same function as
+    // alpha orbital j: instead locate the alpha orbital with
+    // the largest overlap <psi_beta_j|S|psi_alpha_i>.
+    let b = if !scf_data.eigenvectors[1].data.is_empty() {
+        // two-channel import (UHF/MOM file): build
+        // M = C_beta^T S C_alpha with M[j][i] = <psi_beta_j|psi_alpha_i>
+        let ovlp_full = scf_data.ovlp.to_matrixfull().unwrap();
+        let c_alpha = scf_data.eigenvectors[0].to_matrixfullslice();
+        let c_beta = scf_data.eigenvectors[1].to_matrixfullslice();
+        let tmp = _dgemm_tn(&c_beta, &ovlp_full.to_matrixfullslice());
+        let m_ovlp = _dgemm_nn(&tmp.to_matrixfullslice(), &c_alpha);
+        // column-major: M.data[j + i*num_state] = M[j][i]
+        let mut best_i = 0usize;
+        let mut best_ovlp = -1.0f64;
+        (0..num_state).for_each(|i| {
+            let ovlp_ij = m_ovlp.data[j + i * num_state];
+            if ovlp_ij.abs() > best_ovlp {
+                best_ovlp = ovlp_ij.abs();
+                best_i = i;
+            }
+        });
+        println!("rohf-oss: beta open-shell orbital {} mapped onto the common space: alpha orbital {} (overlap = {:.6})", j, best_i, best_ovlp);
+        best_i
+    } else {
+        // single-channel import (ROHF file): alpha and beta
+        // share the same orbital set, so the index is exact
+        j
+    };
+    if a == b {
+        panic!("ERROR: the imported wavefunction has a == b for the open-shell orbitals ({})", a);
+    }
+    scf_data.mol.ctrl.oss_pair = Some([a, b]);
+    println!("rohf-oss: open-shell orbitals derived from the imported wavefunction: alpha = {}, beta = {}", a, b);
+}
 
 pub fn initial_guess_from_hdf5guess(mol: &Molecule) -> Vec<MatrixFull<f64>> {
     info!("Importing density matrix from external initial guess file");
@@ -309,7 +471,10 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
     }
 }
 
-pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
+pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, ovlp: &MatrixUpper<f64>, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
+    if mol.ctrl.oss_roks && mol.ctrl.u2r_style != U2RStyle::KeepAlpha {
+        panic!("ERROR: oss_roks requires u2r_style = \"keepalpha\": the open-shell pair (a, b) is read from the per-spin occupation pattern of the imported wavefunction, which the \"average\" / \"natural\" styles do not preserve");
+    }
     match proj::decide_guess(chkfile, &*mol) {
         proj::GuessAction::Refuse(reason) => {
             panic!("Cannot use chkfile '{}' for initial guess: {}", chkfile, reason);
@@ -321,6 +486,8 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
                 loaded_eigenvalues,
                 loaded_occupation.unwrap(),
                 scftype,
+                ovlp,
+                mol.ctrl.u2r_style,
                 mol.num_state,
                 mol.num_basis,
                 mol.ctrl.print_level
@@ -335,6 +502,8 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
                 loaded_eigenvalues,
                 loaded_occupation.unwrap(),
                 scftype,
+                ovlp,
+                mol.ctrl.u2r_style,
                 source.num_state,
                 source.num_basis,
                 mol.ctrl.print_level
@@ -425,11 +594,98 @@ fn import_mode(target_scftype: &SCFType, source: SCFType) -> ImportMode {
     }
 }
 
+/// `M = c1^T S c2`: the overlap matrix of two MO sets ([num_state, num_state]).
+/// `M = c1^T S c2`: the overlap matrix of two MO sets ([num_state, num_state]).
+fn mo_overlap_matrix(c1: &MatrixFull<f64>, s: &MatrixFull<f64>, c2: &MatrixFull<f64>) -> MatrixFull<f64> {
+    let tmp = _dgemm_tn(&c1.to_matrixfullslice(), &s.to_matrixfullslice());
+    _dgemm_nn(&tmp.to_matrixfullslice(), &c2.to_matrixfullslice())
+}
+
+/// Indices of the occupied orbitals of one spin channel (occupation > 0.5).
+fn occupied_columns(occ: &[f64]) -> Vec<usize> {
+    (0..occ.len()).filter(|&i| occ[i] > 0.5).collect()
+}
+
+/// Sub-matrix made of the selected columns ([num_basis, cols.len()]).
+fn select_columns(c: &MatrixFull<f64>, cols: &[usize]) -> MatrixFull<f64> {
+    let num_basis = c.size()[0];
+    let mut out = MatrixFull::new([num_basis, cols.len()], 0.0_f64);
+    for (j, &col) in cols.iter().enumerate() {
+        for i in 0..num_basis {
+            out.data[i + j * num_basis] = c.data[i + col * num_basis];
+        }
+    }
+    out
+}
+
+/// Natural orbitals of a weighted sum of the two channels' occupied projectors,
+/// `D = sum_i w_a[i] |c_a_i><c_a_i| + sum_j w_b[j] |c_b_j><c_b_j|`,
+/// i.e. the solution of `D c = n S c` (S-orthonormal eigenvectors; the
+/// eigenvalues are the natural occupations of that density).
+///
+/// Only the occupied orbitals carry a non-zero weight.  `dspgvx` returns the
+/// eigenvalues ascending (virtuals first), so the columns are reversed to give
+/// the core-first (aufbau) order.
+fn u2r_density_basis(
+    c_a: &MatrixFull<f64>, eps_a: &[f64], w_a: &[f64],
+    c_b: &MatrixFull<f64>, eps_b: &[f64], w_b: &[f64],
+    s: &MatrixFull<f64>,
+) -> (MatrixFull<f64>, Vec<f64>) {
+    let [num_basis, num_state] = c_a.size();
+    let mut density = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+    for (c, w) in [(c_a, w_a), (c_b, w_b)] {
+        let mut weighted = c.clone();
+        for i in 0..num_state {
+            let wi = w[i];
+            if wi.abs() < 1.0e-12 { continue; }
+            for k in 0..num_basis { weighted.data[k + i * num_basis] *= wi; }
+        }
+        let c_t = c.transpose();
+        let contrib = _dgemm_nn(&weighted.to_matrixfullslice(), &c_t.to_matrixfullslice());
+        for k in 0..density.data.len() { density.data[k] += contrib.data[k]; }
+    }
+
+    let mut density_upper = density.to_matrixupper();
+    let mut ovlp_upper = s.to_matrixupper();
+    let (eigenvectors, _occupations) = density_upper
+        .to_matrixupperslicemut()
+        .lapack_dspgvx(ovlp_upper.to_matrixupperslicemut(), num_state)
+        .expect("ERROR: u2r: the generalized eigenvalue problem for the natural orbitals failed");
+
+    let mut c_out = MatrixFull::new([num_basis, num_state], 0.0_f64);
+    for i in 0..num_state {
+        let src = num_state - 1 - i;
+        for k in 0..num_basis {
+            c_out.data[k + i * num_basis] = eigenvectors.data[k + src * num_basis];
+        }
+    }
+
+    // MO energies of the restricted guess: the expectation value of the alpha /
+    // beta orbital-energy operator in each new orbital,
+    //   eps_i = (1/2) sum_j ( |<c_i|C_a_j>|^2 eps_a_j + |<c_i|C_b_j>|^2 eps_b_j ),
+    // whose weights sum to one because each source set is complete.
+    let w_ov_a = mo_overlap_matrix(&c_out, s, c_a);
+    let w_ov_b = mo_overlap_matrix(&c_out, s, c_b);
+    let mut eps_out = vec![0.0_f64; num_state];
+    for i in 0..num_state {
+        let mut ea = 0.0_f64;
+        let mut eb = 0.0_f64;
+        for j in 0..num_state {
+            ea += w_ov_a.data[i + j * num_state].powi(2) * eps_a[j];
+            eb += w_ov_b.data[i + j * num_state].powi(2) * eps_b[j];
+        }
+        eps_out[i] = 0.5 * (ea + eb);
+    }
+    (c_out, eps_out)
+}
+
 pub fn initial_guess_from_raw(
     loaded_eigenvectors: Vec<f64>,
     loaded_eigenvalues: Vec<f64>,
     loaded_occupation: Vec<f64>,
     target_scftype: &SCFType,
+    ovlp: &MatrixUpper<f64>,
+    u2r_style: U2RStyle,
     num_state: usize,
     num_basis: usize,
     print_level: usize
@@ -523,7 +779,119 @@ pub fn initial_guess_from_raw(
             tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
         },
         ImportMode::U2R => {
-            panic!("Importing UHF/UKS MOs in an RHF/RKS calculation is not supported at present");
+            // The file stores two spin channels (UHF/UKS/MOM) but the target is a
+            // restricted calculation (RHF/ROHF/ROKS), which uses a single common
+            // spatial orbital set.  `u2r_style` selects how that set is built from
+            // the two channels (see [`U2RStyle`]); the beta channel is kept as the
+            // MOM / force-state reference in every case.
+            info!(
+                "Importing MO coefficients in the UHF/UKS format (restricted calculation): u2r_style = \"{}\"",
+                u2r_style.as_str()
+            );
+            if loaded_eigenvalues.len() < num_state {
+                panic!("u2r: the imported mo_energy has {} entries, expected at least {}",
+                    loaded_eigenvalues.len(), num_state);
+            }
+            let mut c_src: [MatrixFull<f64>; 2] = [MatrixFull::empty(), MatrixFull::empty()];
+            let mut eps_src: [Vec<f64>; 2] = [vec![], vec![]];
+            for i_spin in 0..2 {
+                let start = i_spin * num_state * num_basis;
+                let end = (i_spin + 1) * num_state * num_basis;
+                if end > loaded_eigenvectors.len() {
+                    panic!("u2r: the imported MO buffer has {} coefficients, expected at least {}",
+                        loaded_eigenvectors.len(), end);
+                }
+                let tmp_eigen = MatrixFull::from_vec(
+                    [num_state, num_basis],
+                    loaded_eigenvectors[start..end].to_vec()
+                ).unwrap();
+                c_src[i_spin] = tmp_eigen.transpose_and_drop();
+                eps_src[i_spin] = if loaded_eigenvalues.len() >= (i_spin + 1) * num_state {
+                    loaded_eigenvalues[i_spin * num_state..(i_spin + 1) * num_state].to_vec()
+                } else {
+                    vec![0.0; num_state]
+                };
+            }
+
+            // per-spin occupations of the source; a two-channel file stores both
+            let (occ_a, occ_b) = if loaded_occupation.len() >= 2 * num_state {
+                (loaded_occupation[0..num_state].to_vec(),
+                 loaded_occupation[num_state..2 * num_state].to_vec())
+            } else {
+                // only a total occupation was stored: split it evenly
+                let half: Vec<f64> = loaded_occupation.iter().map(|x| 0.5 * x).collect();
+                (half.clone(), half)
+            };
+
+            // the AO overlap: needed by the mixing routes and by the diagnostic.
+            // A not-yet-initialized overlap (the default 1x1) is treated as absent.
+            let ovlp_full = match ovlp.to_matrixfull() {
+                Some(s) if s.size()[0] == num_basis && s.size()[1] == num_basis => Some(s),
+                _ => None,
+            };
+
+            // How strongly do the two source channels differ?  The overlap of the
+            // *occupied* subspaces, C_a^T S C_b, has the corresponding-orbital
+            // cosines as singular values; sigma_min = 1 means identical (weakly
+            // polarized), sigma_min -> 0 means strongly spin-polarized.  (The
+            // overlap of the full sets is an orthogonal matrix -- both channels
+            // are complete bases -- and would be identically one.)
+            let occ_idx_a = occupied_columns(&occ_a);
+            let occ_idx_b = occupied_columns(&occ_b);
+            let sigma_min = match &ovlp_full {
+                Some(s) if !occ_idx_a.is_empty() && !occ_idx_b.is_empty() => {
+                    let c_a_occ = select_columns(&c_src[0], &occ_idx_a);
+                    let c_b_occ = select_columns(&c_src[1], &occ_idx_b);
+                    let m = mo_overlap_matrix(&c_a_occ, s, &c_b_occ);
+                    let (_u, sigma, _vt) = _dsvd(&m, 'A', 'A');
+                    sigma.iter().cloned().fold(f64::INFINITY, f64::min)
+                }
+                _ => f64::NAN,
+            };
+
+            let (c_common, eps_common) = match u2r_style {
+                U2RStyle::KeepAlpha => (c_src[0].clone(), eps_src[0].clone()),
+                U2RStyle::KeepBeta => (c_src[1].clone(), eps_src[1].clone()),
+                U2RStyle::Natural => {
+                    let s = ovlp_full.as_ref().unwrap_or_else(|| panic!(
+                        "u2r: u2r_style = \"natural\" needs the AO overlap matrix, which is not available"));
+                    u2r_density_basis(&c_src[0], &eps_src[0], &occ_a,
+                                      &c_src[1], &eps_src[1], &occ_b, s)
+                }
+            };
+
+            tmp_eigenvectors[0] = c_common;
+            tmp_eigenvalues[0] = eps_common;
+            if let U2RStyle::Natural = u2r_style {
+                // the mixing routes carry a single set for both channels
+                tmp_eigenvectors[1] = tmp_eigenvectors[0].clone();
+                tmp_eigenvalues[1] = tmp_eigenvalues[0].clone();
+            } else {
+                // keep the beta channel as the MOM / force-state reference
+                tmp_eigenvectors[1] = c_src[1].clone();
+                tmp_eigenvalues[1] = eps_src[1].clone();
+            }
+
+            if sigma_min.is_finite() {
+                if sigma_min < 0.9 {
+                    warn!(
+                        "u2r: the occupied spaces of the two spin channels differ strongly \
+(min corresponding-orbital overlap sigma_min = {:.3}): the source is strongly spin-polarized, so \
+the restricted guess built with u2r_style = \"{}\" may be poor (consider \"natural\")",
+                        sigma_min, u2r_style.as_str()
+                    );
+                } else if print_level > 1 {
+                    info!("u2r: corresponding-orbital overlap sigma_min = {:.3} (the two channels are nearly identical)",
+                        sigma_min);
+                }
+            }
+
+            // The per-spin occupations of a UHF/UKS file refer to two different
+            // orbital sets and are not meaningful for the restricted common orbital
+            // space. Return None so that the SCF regenerates them from the target's
+            // (charge, spin); they are regenerated every SCF step anyway
+            // (scf_io/mod.rs, generate_occupation_outside).
+            return (tmp_eigenvectors, tmp_eigenvalues, None);
         }
     }
 

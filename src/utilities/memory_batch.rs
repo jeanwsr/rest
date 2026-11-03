@@ -40,6 +40,111 @@ pub fn detect_used_memory_mb(use_case: &str) -> f64 {
         },
     }
 }
+/// Lower bound of the XC gradient block budget (MiB): a process that already exceeds its
+/// declared budget still walks the grid in usable blocks.
+pub const MIN_XC_GRAD_BLOCK_MB: f64 = 8.0;
+/// Upper bound of the XC gradient block budget (MiB): one block never dominates the resident
+/// set even when the declared budget is generous.
+pub const MAX_XC_GRAD_BLOCK_MB: f64 = 256.0;
+
+/// Working-set budget (MiB) of one XC gradient grid block, **per worker**.
+///
+/// `max_memory` is the declared process budget in MiB, the unit of `[ctrl] max_memory`.
+/// The budget of one block of one worker is the head room left after the resident set, capped
+/// at 10% of the declared budget (a single block must never claim the whole process budget) and
+/// divided by the number of rayon workers of the grid loop. It is clamped to
+/// [`MIN_XC_GRAD_BLOCK_MB`, `MAX_XC_GRAD_BLOCK_MB`].
+///
+/// `fallback_mb` is used when no budget is declared, which keeps the historical block size of
+/// the gradient path.
+///
+/// `REST_XC_GRAD_BLK_MB` overrides the result, for experiments and for machines where the
+/// declared budget does not describe the process.
+pub fn xc_grad_block_mb(max_memory: Option<f64>, fallback_mb: f64) -> f64 {
+    if let Ok(v) = std::env::var("REST_XC_GRAD_BLK_MB") {
+        if let Ok(mb) = v.parse::<f64>() {
+            return mb.max(1.0);
+        }
+    }
+    match max_memory {
+        Some(total) => {
+            let avail = (total - detect_used_memory_mb("proc")).max(0.0);
+            let workers = rayon::current_num_threads().max(1) as f64;
+            (avail.min(0.1 * total) / workers).clamp(MIN_XC_GRAD_BLOCK_MB, MAX_XC_GRAD_BLOCK_MB)
+        }
+        None => fallback_mb,
+    }
+}
+
+/// Message of the hybrid MPI + threads oversubscription check, `None` when the request fits.
+///
+/// `num_threads` is the per-process value of `[ctrl] num_threads`, `mpi_size` the number of MPI
+/// processes and `node_slots` the number of logical CPUs of the local node. The check asks
+/// whether every process of the job could run its threads on this node, which is the pessimistic
+/// reading when the ranks are spread over several nodes.
+///
+/// `node_slots` must come from a hardware listing and not from
+/// `std::thread::available_parallelism()`: an MPI launcher binds every rank to a subset of the CPUs
+/// (two logical CPUs here for `mpirun -n 2` on a 16 CPU node), and that affinity width is not what
+/// the other ranks of the job can use.
+pub fn check_thread_oversubscription(
+    num_threads: usize,
+    mpi_size: usize,
+    node_slots: usize,
+) -> Option<String> {
+    let num_threads = num_threads.max(1);
+    let mpi_size = mpi_size.max(1);
+    if node_slots == 0 || num_threads.saturating_mul(mpi_size) <= node_slots {
+        return None;
+    }
+    let demanded = num_threads.saturating_mul(mpi_size);
+    let suggested = (node_slots / mpi_size).max(1);
+    Some(format!(
+        "[WARN] Thread oversubscription: [ctrl] num_threads = {num_threads} is the thread count of one MPI process, and this job has {mpi_size} process(es), so {demanded} threads are requested while the local node offers {node_slots} parallel slots. The processes may be spread over several nodes, in which case this estimate is pessimistic. For a hybrid MPI + threads run set num_threads = {suggested} (cores per node / ranks per node). Set the environment variable REST_SKIP_THREAD_WARN=1 to silence this check."
+    ))
+}
+
+/// Print [`check_thread_oversubscription`] for the current job, unless `REST_SKIP_THREAD_WARN`
+/// is set. Called once at startup, where only the root rank still writes to the standard output.
+pub fn warn_thread_oversubscription(num_threads: Option<usize>, mpi_size: Option<usize>) {
+    if std::env::var("REST_SKIP_THREAD_WARN").is_ok() {
+        return;
+    }
+    // The node level has to come from a hardware listing: an MPI launcher binds every rank to a
+    // subset of the CPUs, so the affinity width of this process (`available_parallelism`) is not
+    // what the other ranks can use. `sysinfo` lists the CPUs of the node, binding aside.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    let node_slots = match sys.cpus().len() {
+        0 => match std::thread::available_parallelism() {
+            Ok(slots) => slots.get(),
+            Err(_) => return,
+        },
+        listed => listed,
+    };
+    if let Some(msg) =
+        check_thread_oversubscription(num_threads.unwrap_or(1), mpi_size.unwrap_or(1), node_slots)
+    {
+        println!("{msg}");
+    }
+}
+
+/// Peak-attribution probe: print the resident set of this process together with a label.
+///
+/// Enabled by the environment variable `REST_MEM_PROBE=1` or by `print_level >= 3`, and a no-op
+/// otherwise, so the calls can stay in the hot paths of the force driver. Used to attribute the
+/// peak memory of an analytic gradient.
+pub fn mem_probe(label: &str, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    println!("[mem-probe] {:9.1} MB | {}", detect_used_memory_mb("proc"), label);
+}
+
+/// Whether the memory probe is switched on for this run.
+pub fn mem_probe_enabled(print_level: usize) -> bool {
+    print_level >= 3 || std::env::var("REST_MEM_PROBE").map(|v| v == "1").unwrap_or(false)
+}
 
 /// Calculate batch size within possible memory.
 ///
@@ -97,7 +202,7 @@ pub fn calc_batch_size<T>(
 /// # Example
 ///
 /// ```rust
-/// # use pyrest::grad::rhf::blocksize_partition;
+/// # use pyrest::utilities::memory_batch::blocksize_partition;
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
 /// let partitions = blocksize_partition(&indices, 4);
 /// // A info of `[WARN] Batch size is too small: 15 - 10 > 4` will be printed.
@@ -211,7 +316,7 @@ impl MemEstimate {
 ///     fixed: 500_000,
 ///     thread: 100_000,
 /// };
-/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), false));
 /// println!("Calculated batch size: {}", batch_size);
 /// assert_eq!(batch_size, 256);
 /// ```
@@ -273,5 +378,20 @@ mod tests {
             pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), true));
         println!("Calculated batch size: {batch_size}");
         assert_eq!(batch_size, 256);
+    }
+
+    #[test]
+    fn test_check_thread_oversubscription() {
+        // fits, including the exact fit
+        assert!(check_thread_oversubscription(4, 2, 16).is_none());
+        assert!(check_thread_oversubscription(8, 2, 16).is_none());
+        assert!(check_thread_oversubscription(1, 16, 16).is_none());
+        // degenerate values never warn
+        assert!(check_thread_oversubscription(0, 1, 16).is_none());
+        assert!(check_thread_oversubscription(4, 1, 0).is_none());
+        // oversubscribed
+        let msg = check_thread_oversubscription(16, 4, 16).expect("oversubscription not detected");
+        assert!(msg.contains("64") && msg.contains("16") && msg.contains("REST_SKIP_THREAD_WARN"));
+        assert!(msg.contains("num_threads = 4"));
     }
 }

@@ -256,7 +256,42 @@ impl RIUHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[1];
+        // The auxiliary dimension of the *global* RI tensor. Under MPI the stored tensor holds
+        // only the column block of this rank (see `local_aux_function_range`), so the shape of
+        // `ederi_utp` is the local column count and must not be used as the auxiliary dimension.
+        let naux = mol_obj.num_auxbas;
+
+        // Storage-level AO-pair pruning: the stored tensor holds the retained rows only, and every
+        // contraction of the derivative runs over exactly those rows. The row set of the energy is
+        // the row set of its derivative, because the dropped rows are zero at every geometry.
+        let pair_map = self.scf_data.rimatr_pair_map.as_ref();
+        if let Some(map) = pair_map {
+            assert_eq!(
+                map.len(),
+                ederi_utp.shape()[0],
+                "the stored RI tensor and its pair map disagree on the number of stored rows"
+            );
+        }
+        let row_space = pair_map.map(|map| RIMatrRowSpace::new(nao, map, &device));
+        // packed density on the stored rows, for the contractions against the compacted tensor
+        let dm_tp_row = match &row_space {
+            Some(rows) => rows.project_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // packed density on the full pair space of the derivative integrals, dropped rows zeroed
+        let dm_tp_masked = match &row_space {
+            Some(rows) => rows.mask_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // AO density on the square pair space of int3c2e_ip1, dropped pairs zeroed
+        let dm_ao = match &row_space {
+            Some(rows) => rows.mask_ao(dm.view()),
+            None => dm.clone(),
+        };
+        let (ao_pair_mask, packed_pair_mask) = match &row_space {
+            Some(rows) => (Some(&rows.ao_mask), Some(&rows.packed_mask)),
+            None => (None, None),
+        };
 
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -273,13 +308,23 @@ impl RIUHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
-        let aux_batch_size = calc_batch_size::<f64>(
+        let aux_batch_raw = calc_batch_size::<f64>(
             8 * nao * nao,
             mem_avail,
             None,
             Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])),
         );
-        let aux_batch_size = aux_batch_size.min(216);
+        // `calc_batch_size` 在预算耗尽时下限是 1，会让下面的循环退化成「每个辅助壳一批」
+        // （上千次小积分）。这里保底 MIN_AUX_BATCH_FUNCS 个函数并给出告警：预算不足时
+        // 允许内存稍微超一点，而不是让墙钟爆掉。
+        const MIN_AUX_BATCH_FUNCS: usize = 16;
+        let aux_batch_size = aux_batch_raw.clamp(MIN_AUX_BATCH_FUNCS, 216);
+        if aux_batch_raw < MIN_AUX_BATCH_FUNCS && self.flags.print_level >= 1 {
+            println!(
+                "[WARN] the memory budget allows only {} auxiliary basis functions per derivative batch, raised to {} (nao = {}). Raise [ctrl] max_memory or expect a higher peak.",
+                aux_batch_raw, aux_batch_size, nao
+            );
+        }
 
         // ── MPI: restrict the 3c-2e integral batches to this rank's local
         // slice of the auxiliary basis (same deterministic distribution as
@@ -323,7 +368,16 @@ impl RIUHFGradient<'_> {
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
+            // the compacted tensor is contracted with the density on its own row space
+            itm_j = get_itm_j_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    dm_tp_row.view(),
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+            );
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -335,8 +389,26 @@ impl RIUHFGradient<'_> {
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
             itm_k_occtp = [
-                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[0].view()),
-                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[1].view()),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    occ_coeff[0].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    occ_coeff[1].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
             ];
             dao_k = rt::zeros(([nao, 3], &device));
         }
@@ -371,13 +443,13 @@ impl RIUHFGradient<'_> {
 
             if self.flags.factor_j.is_some() {
                 time_records.count_start("de-jk batch 1");
-                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm.view(), itm_j.i(p0..p1));
+                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm_ao.view(), itm_j.i(p0..p1));
                 time_records.count("de-jk batch 1");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
                     *&mut daux_j.i_mut(p0..p1) +=
-                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
+                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp_masked.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
             }
@@ -389,12 +461,17 @@ impl RIUHFGradient<'_> {
                 time_records.count("de-jk batch 3");
 
                 time_records.count_start("de-jk batch 4");
-                *&mut dao_k += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view());
+                *&mut dao_k +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 4");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_k_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 5");
                 }
             }
@@ -442,6 +519,15 @@ impl RIUHFGradient<'_> {
                 let tsr = ederi_utp_rimatr_sr;
                 rt::asarray((&tsr.0.data, tsr.0.size, &device))
             };
+            // the short-range tensor of a range-separated hybrid shares the row space of the
+            // full-range one, which is the map the SCF compacted both onto
+            if let Some(map) = pair_map {
+                assert_eq!(
+                    map.len(),
+                    ederi_utp_sr.shape()[0],
+                    "the stored short-range RI tensor and the pair map of the full-range one disagree"
+                );
+            }
 
             // regenerate essential cheap integrals
             let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -456,8 +542,26 @@ impl RIUHFGradient<'_> {
 
             // temporaries for de_sraux
             let mut itm_k_occtp_sr = [
-                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), occ_coeff[0].view()),
-                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), occ_coeff[1].view()),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp_sr,
+                    ederi_utp_sr.view(),
+                    occ_coeff[0].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp_sr,
+                    ederi_utp_sr.view(),
+                    occ_coeff[1].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
             ];
             dao_sr = rt::zeros(([nao, 3], &device));
             let itm_sr_aux = get_itm_k_aux(itm_k_occtp_sr[0].view_mut()) + get_itm_k_aux(itm_k_occtp_sr[1].view_mut());
@@ -494,13 +598,17 @@ impl RIUHFGradient<'_> {
                 time_records.count("de-jk batch 6");
 
                 time_records.count_start("de-jk batch 7");
-                *&mut dao_sr += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_sr_ao.view());
+                *&mut dao_sr +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_sr_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 7");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 8");
-                    *&mut daux_sr.i_mut(p0..p1) +=
-                        get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_sr_ao.view());
+                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_sr_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 8");
                 }
 
@@ -537,7 +645,7 @@ impl RIUHFGradient<'_> {
         let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
         for atm in 0..natm {
-            let [_, _, p0, p1] = ao_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = ao_slice[atm];
             if self.flags.factor_j.is_some() {
                 *&mut de_j.i_mut((.., atm)).assign(dao_j.i(p0..p1).sum_axes(0));
             }
@@ -552,7 +660,7 @@ impl RIUHFGradient<'_> {
             // the rank that owns the corresponding auxiliary rows, so every
             // rank must restrict its aux-atom summation to its local rows; the
             // partial [3, natm] results are summed over ranks below.
-            let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = aux_slice[atm];
             let (q0, q1) = (p0.max(aux_span0), p1.min(aux_span1));
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
                 if q0 < q1 {
@@ -645,7 +753,7 @@ impl RIUHFGradient<'_> {
             self.result.insert("de_solvent".into(), MatrixFull::new([3, natm], 0.0));
             return self;
         }
-        let de_solvent = crate::solvent::grad::compute_solvent_gradient(self.scf_data);
+        let de_solvent = crate::solvent::grad::compute_solvent_gradient_with_mpi(self.scf_data, self.mpi_operator);
         self.result.insert("de_solvent".into(), de_solvent);
         return self;
     }

@@ -48,8 +48,10 @@ pub fn get_ao2mo_s2ij_to_s1_notrans_with_output<T, O>(
 
     // - output_flat: output mutables reshaped to (ni, na, np)
     // - ns: minimum of ni and na among all sets, used for scratch size
+    // - n_scratch_out: maximum of ni * na among all sets, used for scratch size
     let mut output_flat = vec![];
-    let mut ns = usize::MAX;
+    let mut ns = 1;
+    let mut n_scratch_out = 1;
     for iset in 0..nset {
         let ni = bra[iset].shape()[1];
         let na = ket[iset].shape()[1];
@@ -67,14 +69,17 @@ pub fn get_ao2mo_s2ij_to_s1_notrans_with_output<T, O>(
         let out_iset = unsafe { output[iset].force_mut().into_compatible_shape((ni, na, np), ColMajor) };
         output_flat.push(out_iset);
         ns = ns.max(ni.min(na));
+        n_scratch_out = n_scratch_out.max(ni * na);
     }
 
     // scratch buffer for half-transform
     let scratch_pool = BufferPool::new(|| unsafe { uninitialized_vec(nao * ns).unwrap() });
 
     // check if type T is the same to O; if so, create a scratch buffer
-    let scratch_out_pool = BufferPool::new(|| unsafe { uninitialized_vec(ns * ns).unwrap() });
+    let scratch_out_pool = BufferPool::new(|| unsafe { uninitialized_vec(n_scratch_out).unwrap() });
 
+    // the scratch pools are mutex-protected and the per-`p` outputs are disjoint slices, so the
+    // parallel loop over the auxiliary index is safe
     (0..np).into_par_iter().for_each(|p| {
         let j3c_p = j3c.i((.., p)).unpack_tri(uplo, FlagSymm::He);
         for iset in 0..nset {

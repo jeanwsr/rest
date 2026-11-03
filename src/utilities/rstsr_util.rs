@@ -78,6 +78,17 @@ where
     }
 }
 
+impl<T> RestTensorIntoRstsrTsrAPI<T> for MatrixFull<T>
+where
+    T: Clone,
+{
+    fn into_rstsr(self, device: &DeviceBLAS) -> Tsr<T> {
+        let layout = layout_from_rest_tensor_matrix(&self);
+        let data = self.data;
+        rt::asarray((data, layout, device))
+    }
+}
+
 impl<T> RestTensorToRstsrTsrAPI<T> for &[&MatrixFull<T>]
 where
     T: Clone,
@@ -174,6 +185,15 @@ pub fn fingerprint_f64(tsr: TsrView<f64>) -> f64 {
         .enumerate()
         .fold(|| 0.0_f64, |acc, (i, &x)| acc + x * (i as f64).cos())
         .reduce(|| 0.0_f64, |a, b| a + b)
+}
+
+/// Check if two tensors are exactly identical (shape and value).
+///
+/// This function is used for the cache-invalidation checks of `make_`-style cached evaluations:
+/// the cached result is reused only when the new inputs match the ones the cache was evaluated
+/// with.
+pub fn is_same_tensor(a: TsrView, b: TsrView) -> bool {
+    a.shape() == b.shape() && rt::allclose(&a, &b, (0.0, 0.0))
 }
 
 /* #endregion */

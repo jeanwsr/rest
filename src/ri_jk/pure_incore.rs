@@ -234,6 +234,111 @@ pub fn get_vk_ri_incore_coeff(
 
 /* #endregion ri-vk incore coeff */
 
+/* #region ri-vk incore coeff bra */
+
+/// Generate the exchange (K) matrix contracted by a bra coefficient matrix, using RI incore
+/// method with molecular coefficients: the half-transformed (bra) form `K[D] @ B`, without
+/// materializing the full `(nao, nao)` exchange matrix.
+///
+/// The density is defined by `mo_coeff`/`mo_occ` (as in [`get_vk_ri_incore_coeff`]); the output
+/// is the exchange matrix of that density right-contracted by `bra_coeff`. Per auxiliary batch,
+/// the `(nao, nao)` accumulation `A @ A^T` of the coeff route is replaced by the occupied-space
+/// contraction `A @ (A^T @ B)`, with `A = M_P @ C_occ sqrt(f)`; this mirrors the bra form of the
+/// response kernel (`crate::ri_jk::resp_r::get_rijk_response_bra_separated`).
+///
+/// # Parameters
+///
+/// - `cderi`: [`TsrView<f64>`]
+///
+///   - Cholesky decomposed 3c-2e ERI in shape (nao_tp, naux), stored in f-contiguous order.
+///
+/// - `mo_coeff`: [`TsrView<f64>`] — molecular orbital coefficients in shape (nao, nmo, nset),
+///   stored in f-contiguous order. Occupations are read from `mo_occ`.
+///
+/// - `mo_occ`: [`TsrView<f64>`] — molecular occupations in shape (nmo, nset).
+///
+/// - `bra_coeff`: [`TsrView<f64>`] — bra coefficients in shape (nao, nbra), stored in
+///   f-contiguous order. Usually the occupied orbital coefficients `C_occ`.
+///
+/// - `batch_size`: `usize` — batch size for auxiliary basis partitionation. This value controls
+///   memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`] — `K @ B` in shape (nao, nbra, nset), stored in f-contiguous order.
+pub fn get_vk_ri_incore_coeff_bra(
+    cderi: TsrView<f64>,
+    mo_coeff: TsrView<f64>,
+    mo_occ: TsrView<f64>,
+    bra_coeff: TsrView<f64>,
+    batch_size: usize,
+) -> Tsr<f64> {
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular orbital coefficients must have 3 dimensions");
+    assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
+    assert_eq!(bra_coeff.ndim(), 2, "Bra coefficients must have 2 dimensions");
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+
+    // get shapes
+    let nao = mo_coeff.shape()[0];
+    let nmo = mo_coeff.shape()[1];
+    let nset = mo_coeff.shape()[2];
+    let nbra = bra_coeff.shape()[1];
+    let naux = cderi.shape()[1];
+    let nao_tp = (nao + 1) * nao / 2;
+    let device = cderi.device().clone();
+
+    // shape check
+    assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+    assert_eq!(mo_occ.shape(), &[nmo, nset], "Molecular occupations must have shape (nmo, nset)");
+    assert_eq!(bra_coeff.shape()[0], nao, "Bra coefficients must have shape (nao, nbra)");
+
+    // compress mo_coeff with occupation: keep occupied columns, scale by sqrt(n_i)
+    // -- occ-scaled-coeff -- //
+    let mut occ_coeff_list = vec![];
+    for iset in 0..nset {
+        // generate occ_coeff by sqrt(occupation) * coefficient
+        let occ_mask = rt::gt(mo_occ.i((.., iset)), f64::EPSILON).into_vec();
+        let occ_coeff = mo_coeff.i((.., .., iset)).bool_select(-1, &occ_mask);
+        let occ = mo_occ.i((.., iset)).bool_select(-1, &occ_mask).sqrt();
+        occ_coeff_list.push(occ_coeff * occ.i((None, ..)));
+    }
+
+    // initialize the bra-form result
+    let mut ks_bra = rt::zeros(([nao, nbra, nset].f(), &device));
+
+    // process each auxiliary function
+    (0..naux).step_by(batch_size).for_each(|iaux| {
+        // get and unpack cderi for this auxiliary function
+        // cderi_iaux: (nao, nao, nbatch)
+        let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
+
+        for iset in 0..nset {
+            // half-transformed integrals: (nao, nocc, nbatch)
+            let occ_coeff = &occ_coeff_list[iset];
+            let nocc = occ_coeff.shape()[1];
+            let cderi_half = unsafe { rt::empty(([nao, nocc, nbatch].f(), &device)) };
+            (0..nbatch).into_par_iter().for_each(|p| {
+                // unpack one packed cderi column to the full (nao, nao) M_P
+                let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
+                let cderi_half_iaux = cderi_half.i((.., .., p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                // left half-transform: (mu i, P) = sum_nu M_P[mu, nu] * C[nu, i]
+                // -- half-transform -- //
+                cderi_half_iaux.matmul_from(&cderi_iaux, occ_coeff, 1.0, 0.0);
+            });
+            // accumulate (K @ B)_s += A (A^T B) over this batch, in place of the coeff route's
+            // full (nao, nao) accumulation A A^T
+            // -- accumulate-k-bra -- //
+            let cderi_half = cderi_half.into_shape([nao, nocc * nbatch]);
+            let itm = cderi_half.t() % bra_coeff.view();
+            ks_bra.i_mut((.., .., iset)).matmul_from(&cderi_half, &itm, 1.0, 1.0);
+        }
+    });
+    ks_bra
+}
+
+/* #endregion ri-vk incore coeff bra */
+
 /* #region ri-vk incore dm */
 
 /// Generate Exchange (K) matrix using RI incore method with density matrices.

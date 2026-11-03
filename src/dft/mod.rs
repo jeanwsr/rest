@@ -1,10 +1,12 @@
 #![warn(unused_imports)]
 pub mod libxc_helper;
 pub mod gen_grids;
+pub mod locality;
 pub mod deep_learning;
 pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
+pub mod nlc;
 pub mod parse_xc;
 pub mod response;
 pub mod numint_matmul;
@@ -41,6 +43,36 @@ use serde::{Deserialize, Serialize};
 
 use libxc::prelude::*;
 use crate::dft::libxc_helper::{xc_code_fdqc, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
+/// Temporary XC timing instrumentation, enabled with the environment variable
+/// `REST_XC_TIME=1`. All counters are nanoseconds accumulated across the rayon
+/// chunks, so the per-iteration wall share is the sum divided by the number of
+/// chunks that run in parallel.
+pub mod xc_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static DENSITY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ELEM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SCATTER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALL_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool { std::env::var("REST_XC_TIME").is_ok() }
+
+    pub fn add(c: &AtomicU64, t: Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn report_and_reset() -> Option<(f64, f64, f64, f64, f64)> {
+        if !enabled() { return None; }
+        let d = DENSITY_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let e = ELEM_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let g = GEMM_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let s = SCATTER_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let c = CALL_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        Some((d, e, g, s, c))
+    }
+}
 
 
 #[derive(Clone,Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +109,7 @@ pub struct DFA4REST {
     pub dfa_paramr_pos: Option<Vec<f64>>,
     pub dfa_hybrid_pos: Option<f64>,
     pub dfa_paramr_adv: Option<Vec<f64>>,
+    pub nlc_vv10: Option<(f64, f64)>,
 }
 
 impl DFAFamily {
@@ -140,7 +173,9 @@ impl DFA4REST {
             dfa_compnt_pos: None, 
             dfa_paramr_pos: None, 
             dfa_hybrid_pos: None, 
-            dfa_paramr_adv: None }
+            dfa_paramr_adv: None,
+            nlc_vv10: None,
+        }
     }
     
     pub fn summary(&self, print_level: usize) {
@@ -273,6 +308,7 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
         }
     }
 
@@ -370,12 +406,31 @@ impl DFA4REST {
 
     pub fn parse_scf(name: &str, spin_channel: usize) -> DFA4REST {
         let tmp_name = name.to_lowercase();
-        let dfa_compnt_scf = DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel);
-        let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+        let legacy_nlc_ids: Option<Vec<usize>> = match tmp_name.as_str() {
+            "wb97x-v" => Some(vec![466]),
+            "wb97m-v" => Some(vec![531]),
+            _ => None,
+        };
+        let dfa_compnt_scf = match &legacy_nlc_ids {
+            Some(ids) => ids.clone(),
+            None => DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel),
+        };
+        let mut dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+        // The HF reference carries the full exact exchange:
+        // dfa_hybrid_scf = 1.0 so that every response consumer (TDDFT/
+        // stability matvecs, gradients, hessians, energy components) sees the
+        // correct exchange scaling. Keyed on the requested name ("hf"), not on
+        // the component list. The SCF's own Fock build dispatches on the empty
+        // component list into the dedicated `generate_hf_hamiltonian_*` paths,
+        // which apply the exchange at unit strength directly and do not read
+        // this field.
+        if tmp_name == "hf" {
+            dfa_hybrid_scf = 1.0;
+        }
         let dfa_paramr_scf =  vec![1.0;dfa_compnt_scf.len()];
         let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 
-        DFA4REST {
+        let mut dfa = DFA4REST {
             spin_channel,
             dfa_family_pos: None,
             dfa_compnt_pos: None,
@@ -386,7 +441,16 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
+        };
+        if legacy_nlc_ids.is_some() {
+            dfa.nlc_vv10 = dfa
+                .dfa_compnt_scf
+                .iter()
+                .map(|id| dfa.init_libxc(id))
+                .find_map(|func| func.vv10_coef());
         }
+        dfa
     }
 
     pub fn parse_scf_nonstd(codelist: &Vec<String>, paramlist: &Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
@@ -419,6 +483,7 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf: *dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
         }
     }
 
@@ -468,7 +533,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xygjos") {
             // XYGJ-OS functional
             // Proc. Natl. Acad. Sci. U.S.A. 108, 50, 19896-19900 (2011); https://pnas.org/doi/full/10.1073/pnas.1115123108
@@ -505,7 +571,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xyg7") {
             // XYG7 functional 
             // J. Phys. Chem. Lett. 12, 10, 2638-2644 (2021); https://doi.org/10.1021/acs.jpclett.1c00360
@@ -542,8 +609,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xyg2") {
             // XYG2 functional
             // Yan, W., PhD thesis, Fudan University, Shanghai, China (2022).
@@ -575,7 +642,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xdh-pbe0") {
             // xDH-PBE0 functional
             // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
@@ -609,7 +677,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("zrps") {
             // ZRPS
             // Phys. Rev. Lett. 117, 133002 (2016); https://doi.org/10.1103/PhysRevLett.117.133002
@@ -641,7 +710,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("rpa@b3lyp") {
             let dfa_family_pos = Some(DFAFamily::RPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -667,7 +737,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("rpa@pbe") {
             let dfa_family_pos = Some(DFAFamily::RPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -693,7 +764,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("scsrpa") {
             // scsRPA
             // J. Phys. Chem. Lett. 10, 10, 2617-2623 (2019); https://doi.org/10.1021/acs.jpclett.9b00946
@@ -721,7 +793,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xdh7") {
             // R-xDH7
             // JACS Au 4, 8, 3205-3216 (2024); https://doi.org/10.1021/jacsau.4c00488
@@ -752,7 +825,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -777,7 +851,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("scs-mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -805,7 +880,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("b2plyp") {
             // below are some popular B2PLYP-type DH functionals
             // B2PLYP
@@ -835,7 +911,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("b2gpplyp") {
             // B2GP-PLYP
             // J. Phys. Chem. A 2008, 112, 12868–12886.
@@ -864,7 +941,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("pbe-qidh") {
             // PBE-QIDH
             // J. Chem. Phys. 2014, 141, 031101.
@@ -892,7 +970,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("pbe0dh") {
             // PBE0-DH
             // J. Chem. Phys. 2011, 135, 024106.
@@ -920,7 +999,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg3") {
             // Renormalized XYG3 functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -952,7 +1032,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xygjos") {
             // Renormalized XYGJOS functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -990,7 +1071,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg7") {
             // Renormalized XYG7 functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -1028,7 +1110,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg2") {
             // Renormalized XYG2 functional (experimental)
             let dfa_family_pos = Some(DFAFamily::SBGE2);
@@ -1058,7 +1141,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else {
             None
         }
@@ -1668,9 +1752,16 @@ impl DFA4REST {
         // when at least one grid point in this batch falls below the density
         // threshold. This avoids the thread-count dependency of a percentage-based
         // heuristic when grids are spatially (contiguously) partitioned.
-        let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
-        let num_active = active_mask.iter().filter(|&&x| x).count();
-        let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
+        // `vxc_screen_threshold <= 0.0` disables the screen outright: no mask is
+        // built and the grids are not scanned again.
+        let mut active_mask: Vec<bool> = Vec::new();
+        let mut num_active = num_grids;
+        let mut use_screening = false;
+        if vxc_screen_threshold > 0.0 {
+            active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+            num_active = active_mask.iter().filter(|&&x| x).count();
+            use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
+        }
 
         if print_level >= 1 && use_screening {
             let ratio = num_active as f64 / num_grids as f64 * 100.0;
@@ -2181,6 +2272,7 @@ impl DFA4REST {
     {
         let num_grids = range_grids.len();
         let num_basis = dm[0].size[0];
+        let t_den = if xc_timing::enabled() { Some(std::time::Instant::now()) } else { None };
 
         let mut loc_rho: MatrixFull<f64> = MatrixFull::empty();
         let mut loc_rhop: RIFull<f64> = RIFull::empty();
@@ -2235,15 +2327,23 @@ impl DFA4REST {
         } else {
             MatrixFull::empty()
         };
+        if let Some(t) = t_den { xc_timing::add(&xc_timing::DENSITY_NS, t); }
 
         // Density screening
         // The screening decision is per-batch but entirely local: compact only
         // when at least one grid point in this batch falls below the density
         // threshold. This avoids the thread-count dependency of a percentage-based
         // heuristic when grids are spatially (contiguously) partitioned.
-        let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
-        let num_active = active_mask.iter().filter(|&&x| x).count();
-        let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
+        // `vxc_screen_threshold <= 0.0` disables the screen outright: no mask is
+        // built and the grids are not scanned again.
+        let mut active_mask: Vec<bool> = Vec::new();
+        let mut num_active = num_grids;
+        let mut use_screening = false;
+        if vxc_screen_threshold > 0.0 {
+            active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+            num_active = active_mask.iter().filter(|&&x| x).count();
+            use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
+        }
 
         if print_level >= 1 && use_screening {
             let ratio = num_active as f64 / num_grids as f64 * 100.0;
@@ -3176,8 +3276,15 @@ pub struct Non0Tab {
     pub sparsity_ratio: f64,
     /// Total non-zero ao entries (across all batches)
     pub total_nonzero_ao: usize,
-    /// Total non-zero aop entries
+    /// Kept for compatibility: the AOP block is row-aligned with the AO block, so
+    /// there is no separate gradient mask and this equals `total_stored_aop`.
     pub total_nonzero_aop: usize,
+    /// AOP entries actually written into `CompressedGridAOP`: the block is stored row-aligned
+    /// with the AO block, so it holds all three gradient components of every stored AO row, i.e.
+    /// `3 * total_nonzero_ao`. This is the number that matches the memory footprint, and it is
+    /// larger than `total_nonzero_aop` whenever the gradient mask is sparser in rows than the AO
+    /// mask, which is the usual case for diffuse basis functions.
+    pub total_stored_aop: usize,
     /// Total elements in dense ao (ngrids * nao)
     pub total_elements: usize,
 }
@@ -3296,6 +3403,7 @@ impl Grids {
         let pruning: String = mol.ctrl.pruning.clone();
         let grid_gen_level: usize = mol.ctrl.grid_gen_level;
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
+        let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
         // obtain system-dependent parameters
         //let mass_charge = get_mass_charge(&mol.geom.elem);
@@ -3322,7 +3430,7 @@ impl Grids {
         let mut quadrature_weights: Vec<f64> = vec![];
 
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3335,6 +3443,8 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 grid_gen_level,
+                radii_adjust,
+                mol.ctrl.use_isdf,
             );
             //println!("alpha_min: {:?}, alpha_max: {:6.3}",&value.0, &value.1);
             //println!("rs_atom: {:?}, ws_atom: {:?}",&rs_atom, &ws_atom);
@@ -3402,7 +3512,7 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 grid_gen_level,
-
+                gen_grids::RadiiAdjust::Becke,
             );
             //println!("alpha_min: {:?}, alpha_max: {:6.3}",&value.0, &value.1);
             //println!("rs_atom: {:?}, ws_atom: {:?}",&rs_atom, &ws_atom);
@@ -3448,6 +3558,7 @@ impl Grids {
         let hardness: usize = mol.ctrl.hardness;
         let pruning: String = mol.ctrl.pruning.clone();
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
+        let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
         let mass_charge = get_mass_charge(&mol.geom.rg_elem);
         let proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
@@ -3465,7 +3576,7 @@ impl Grids {
         let mut atm_idx: Vec<usize> = vec![];
         let mut quadrature_weights: Vec<f64> = vec![];
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index, value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3478,6 +3589,8 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 level,
+                radii_adjust,
+                mol.ctrl.use_isdf,
             );
             coordinates.extend(rs_atom.iter().map(|value| [value.0, value.1, value.2]));
             weights.extend(ws_atom);
@@ -3519,7 +3632,9 @@ impl Grids {
         // Clamp to [32, 256]
         let target_bytes = 512 * 1024;
         let blk = target_bytes / (nao.max(1) * 16);
-        blk.max(32).min(256)
+        // Lower bound 256: measured on Rh-complex/110 atoms/1956 bfs/28 cores,
+        // blksize=32 (old lower bound) costs 15.5 s/iter vs 13.1 s at 256.
+        blk.max(256).min(512)
     }
     /// Must be called after `prepare_tabulated_ao`.
     /// If `ao_cutoff <= 0.0`, this is a no-op.
@@ -3646,6 +3761,8 @@ impl Grids {
             sparsity_ratio,
             total_nonzero_ao,
             total_nonzero_aop,
+            // row-aligned with the AO block: three components per stored AO row
+            total_stored_aop: 3 * total_nonzero_ao,
             total_elements,
         });
 
@@ -3782,109 +3899,128 @@ impl Grids {
             })
             .collect();
 
-        // ── Pass 1: scan every batch, build ao/aop masks ──
+        // Geometric pre-screen (shared with the gradient block pipeline, see
+        // `dft::locality`): an atom whose influence radius does not reach the
+        // batch bounding box cannot produce a row that survives the value
+        // screen below, because the radius envelope is a rigorous upper bound
+        // of the spherical GTO magnitude at the same cutoff. Skipping its
+        // evaluation is therefore bit-identical in outcome.
+        let influence_radii = locality::atom_influence_radii(mol, cutoff);
+
+        // ── Single pass: evaluate each batch once, decide the active AO rows from
+        //    the values, and gather those rows straight into the compressed blocks.
+        //    The AOP block is row-aligned with the AO block, so it reuses the AO
+        //    index list and needs no mask of its own. ──
+        type BatchOut = (Vec<usize>, MatrixFull<f64>, Option<[MatrixFull<f64>; 3]>);
         let batch_indices: Vec<usize> = (0..nbatches).collect();
-        let masks: Vec<(Vec<usize>, Vec<usize>)> = batch_indices
+        let batch_outputs: Vec<BatchOut> = batch_indices
             .par_iter()
-            .map(|&ibatch| {
+            .map(|&ibatch| -> BatchOut {
                 omp_set_num_threads_wrapper(1);
                 let g_range = &batch_ranges[ibatch];
                 let nbatch = g_range.len();
 
-                let mut temp_ao = MatrixFull::<f64>::new([nao, nbatch], 0.0);
+                let mut ao_indices: Vec<usize> = Vec::new();
+                let mut ao_vals: Vec<f64> = Vec::new();
+                let mut aop_vals: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+
+                let (bbox_lo, bbox_hi) = locality::block_bbox(&self.coordinates[g_range.clone()]);
+
                 mol.basis4elem
                     .iter()
                     .zip(mol.geom.rg_position.iter_columns_full())
-                    .for_each(|(elem, geom)| {
-                        let start = elem.global_index.0;
-                        let nbas = elem.global_index.1;
-                        let end = start + nbas;
+                    .enumerate()
+                    .for_each(|(iatom, (elem, geom))| {
                         let tmp_geom: [f64; 3] = geom.try_into().unwrap();
+                        // geometric pre-screen: bit-identical, see above
+                        if !locality::atom_reaches_block(&tmp_geom, influence_radii[iatom], &bbox_lo, &bbox_hi) {
+                            return;
+                        }
+                        let start = elem.global_index.0;
                         let tab = gto_value_serial(
                             &self.coordinates[g_range.clone()],
                             &tmp_geom,
                             elem,
                             &mol.ctrl.basis_type,
                         );
-                        temp_ao.copy_from_matr(
-                            start..end, 0..nbatch, &tab, 0..nbas, 0..nbatch,
-                        );
-                    });
-
-                // AO mask
-                let mut ao_mask = vec![false; nao];
-                for mu in 0..nao {
-                    for g in 0..nbatch {
-                        if temp_ao[[mu, g]].abs() > cutoff {
-                            ao_mask[mu] = true;
-                            break;
-                        }
-                    }
-                }
-                let ao_active: Vec<usize> =
-                    (0..nao).filter(|&mu| ao_mask[mu]).collect();
-
-                // AOP mask
-                let aop_active: Vec<usize> = if do_gradient {
-                    let mut temp_aop = [
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                    ];
-                    mol.basis4elem
-                        .iter()
-                        .zip(mol.geom.rg_position.iter_columns_full())
-                        .for_each(|(elem, geom)| {
-                            let start = elem.global_index.0;
-                            let nbas = elem.global_index.1;
-                            let end = start + nbas;
-                            let tmp_geom: [f64; 3] = geom.try_into().unwrap();
-                            let tab_dev = gto_1st_value_serial(
+                        let tab_dev = if do_gradient {
+                            Some(gto_1st_value_serial(
                                 &self.coordinates[g_range.clone()],
                                 &tmp_geom,
                                 elem,
                                 &mol.ctrl.basis_type,
-                            );
-                            for x in 0usize..3usize {
-                                temp_aop[x].copy_from_matr(
-                                    start..end, 0..nbatch,
-                                    &tab_dev[x], 0..nbas, 0..nbatch,
-                                );
+                            ))
+                        } else {
+                            None
+                        };
+                        // Every basis function belongs to exactly one element, so the
+                        // per-row decision can be made here: keep a row when any grid
+                        // point of this batch has |value| above the cutoff (the shared
+                        // predicate, `dft::locality::screen_rows_by_value`). Elements are
+                        // visited in global AO order, so the gathered rows stay ordered.
+                        for &r in &locality::screen_rows_by_value(&tab, nbatch, cutoff) {
+                            ao_indices.push(start + r);
+                            for g in 0..nbatch {
+                                ao_vals.push(tab[[r, g]]);
                             }
-                        });
-                    let mut aop_mask = vec![false; nao];
-                    for mu in 0..nao {
-                        for g in 0..nbatch {
-                            for x in 0usize..3usize {
-                                if temp_aop[x][[mu, g]].abs() > cutoff {
-                                    aop_mask[mu] = true;
-                                    break;
+                            if let Some(dev) = &tab_dev {
+                                for x in 0usize..3usize {
+                                    for g in 0..nbatch {
+                                        aop_vals[x].push(dev[x][[r, g]]);
+                                    }
                                 }
                             }
-                            if aop_mask[mu] {
-                                break;
-                            }
+                        }
+                    });
+
+                let n_active = ao_indices.len();
+                if n_active == 0 {
+                    return (ao_indices, MatrixFull::<f64>::empty(), None);
+                }
+                // The staging above is row-major, but `MatrixFull` is column-major
+                // (`indicing = [1, size[0]]`), so reorder before wrapping the buffer.
+                let transpose = |src: Vec<f64>| -> MatrixFull<f64> {
+                    let mut flat = vec![0.0f64; n_active * nbatch];
+                    for i in 0..n_active {
+                        for g in 0..nbatch {
+                            flat[i + g * n_active] = src[i * nbatch + g];
                         }
                     }
-                    (0..nao).filter(|&mu| aop_mask[mu]).collect()
-                } else {
-                    vec![]
+                    MatrixFull::<f64>::from_vec([n_active, nbatch], flat).unwrap()
                 };
-
-                (ao_active, aop_active)
+                let ao_block = transpose(ao_vals);
+                let [aop_x, aop_y, aop_z] = aop_vals;
+                let aop_block = if do_gradient {
+                    Some([transpose(aop_x), transpose(aop_y), transpose(aop_z)])
+                } else {
+                    None
+                };
+                (ao_indices, ao_block, aop_block)
             })
             .collect();
 
-        // aggregate masks
-        let batch_ao_indices: Vec<Vec<usize>> = masks.iter().map(|m| m.0.clone()).collect();
-        let batch_aop_indices: Vec<Vec<usize>> = masks.iter().map(|m| m.1.clone()).collect();
-        let total_nonzero_ao: usize =
-            batch_ao_indices.iter().map(|v| v.len()).sum::<usize>() * blksize; // upper bound (last batch may be shorter)
-        let total_nonzero_aop: usize = if do_gradient {
-            batch_aop_indices.iter().map(|v| v.len()).sum::<usize>() * blksize
-        } else {
-            0
-        };
+        // split the batch outputs into the index lists and the two compressed blocks
+        let mut batch_ao_indices: Vec<Vec<usize>> = Vec::with_capacity(nbatches);
+        let mut ao_comp_batches: Vec<MatrixFull<f64>> = Vec::with_capacity(nbatches);
+        let mut aop_comp_batches: Vec<[MatrixFull<f64>; 3]> = Vec::with_capacity(nbatches);
+        let mut total_nonzero_ao: usize = 0;
+        for (indices, ao, aop) in batch_outputs {
+            total_nonzero_ao += indices.len() * blksize; // upper bound (last batch may be shorter)
+            batch_ao_indices.push(indices);
+            ao_comp_batches.push(ao);
+            aop_comp_batches.push(aop.unwrap_or_else(|| [
+                MatrixFull::<f64>::empty(),
+                MatrixFull::<f64>::empty(),
+                MatrixFull::<f64>::empty(),
+            ]));
+        }
+        // The AOP block is stored row-aligned with the AO block (see
+        // `contract_response_compressed`), so it holds all three gradient components of
+        // every stored AO row. `total_stored_aop` is therefore the number that matches
+        // the memory footprint, and it is what the log reports.
+        let total_stored_aop: usize = if do_gradient { 3 * total_nonzero_ao } else { 0 };
+        let ao_rows_per_batch =
+            batch_ao_indices.iter().map(|v| v.len()).sum::<usize>() as f64 / nbatches.max(1) as f64;
         let total_elements = ngrids * nao;
         let sparsity_ratio = if total_nonzero_ao > 0 {
             total_nonzero_ao as f64 / total_elements as f64
@@ -3895,22 +4031,24 @@ impl Grids {
         // skip if too dense
         let skip = sparsity_ratio > 0.90 || total_nonzero_ao >= total_elements;
         if mol.ctrl.print_level >= 1 {
-            let aop_sparsity = if total_nonzero_aop > 0 {
-                total_nonzero_aop as f64 / (total_elements * 3) as f64 * 100.0
-            } else {
-                0.0
-            };
             if skip {
                 println!(
                     " [non0tab] cutoff={:.1e}, blksize={}{}, ao-sparsity={:.1}% → skipping (AO too dense), falling back to dense",
                     cutoff, blksize, auto_note, sparsity_ratio * 100.0
                 );
             } else {
+                let stored_aop_sparsity = if total_stored_aop > 0 {
+                    total_stored_aop as f64 / (total_elements * 3) as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let gib = |entries: usize| entries as f64 * 8.0 / (1024.0 * 1024.0 * 1024.0);
                 println!(
-                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao-sparsity={:.1}% ({}/{}), aop-sparsity={:.1}%",
+                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao stored={:.1}% ({} entries, {:.2} GiB), aop stored={:.1}% ({} entries, {:.2} GiB), rows/batch: ao {:.0}/{}",
                     cutoff, blksize, auto_note,
-                    sparsity_ratio * 100.0, total_nonzero_ao, total_elements,
-                    aop_sparsity,
+                    sparsity_ratio * 100.0, total_nonzero_ao, gib(total_nonzero_ao),
+                    stored_aop_sparsity, total_stored_aop, gib(total_stored_aop),
+                    ao_rows_per_batch, nao,
                 );
             }
         }
@@ -3922,122 +4060,23 @@ impl Grids {
             return;
         }
 
-        // ── Pass 2: recompute per batch, extract active rows → compressed ──
-        type BatchPair = (MatrixFull<f64>, Option<[MatrixFull<f64>; 3]>);
-        let batch_results: Vec<BatchPair> = batch_indices
-            .par_iter()
-            .map(|&ibatch| -> BatchPair {
-                omp_set_num_threads_wrapper(1);
-                let g_range = &batch_ranges[ibatch];
-                let nbatch = g_range.len();
-                let indices = &batch_ao_indices[ibatch];
-                let n_active = indices.len();
-
-                if n_active == 0 {
-                    return (MatrixFull::<f64>::empty(), None);
-                }
-
-                // --- compress AO ---
-                let mut temp_ao = MatrixFull::<f64>::new([nao, nbatch], 0.0);
-                mol.basis4elem
-                    .iter()
-                    .zip(mol.geom.rg_position.iter_columns_full())
-                    .for_each(|(elem, geom)| {
-                        let start = elem.global_index.0;
-                        let nbas = elem.global_index.1;
-                        let end = start + nbas;
-                        let tmp_geom: [f64; 3] = geom.try_into().unwrap();
-                        let tab = gto_value_serial(
-                            &self.coordinates[g_range.clone()],
-                            &tmp_geom,
-                            elem,
-                            &mol.ctrl.basis_type,
-                        );
-                        temp_ao.copy_from_matr(
-                            start..end, 0..nbatch, &tab, 0..nbas, 0..nbatch,
-                        );
-                    });
-
-                let mut batch_ao = MatrixFull::<f64>::new([n_active, nbatch], 0.0);
-                for (i_local, &mu_global) in indices.iter().enumerate() {
-                    for g in 0..nbatch {
-                        batch_ao[[i_local, g]] = temp_ao[[mu_global, g]];
-                    }
-                }
-
-                // --- compress AOP ---
-                let aop_opt: Option<[MatrixFull<f64>; 3]> = if do_gradient && n_active > 0 {
-                    let mut temp_aop = [
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
-                    ];
-                    mol.basis4elem
-                        .iter()
-                        .zip(mol.geom.rg_position.iter_columns_full())
-                        .for_each(|(elem, geom)| {
-                            let start = elem.global_index.0;
-                            let nbas = elem.global_index.1;
-                            let end = start + nbas;
-                            let tmp_geom: [f64; 3] = geom.try_into().unwrap();
-                            let tab_dev = gto_1st_value_serial(
-                                &self.coordinates[g_range.clone()],
-                                &tmp_geom,
-                                elem,
-                                &mol.ctrl.basis_type,
-                            );
-                            for x in 0usize..3usize {
-                                temp_aop[x].copy_from_matr(
-                                    start..end, 0..nbatch,
-                                    &tab_dev[x], 0..nbas, 0..nbatch,
-                                );
-                            }
-                        });
-                    let mut comp_aop: [MatrixFull<f64>; 3] = [
-                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
-                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
-                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
-                    ];
-                    for (i_local, &mu_global) in indices.iter().enumerate() {
-                        for g in 0..nbatch {
-                            for x in 0usize..3usize {
-                                comp_aop[x][[i_local, g]] = temp_aop[x][[mu_global, g]];
-                            }
-                        }
-                    }
-                    Some(comp_aop)
-                } else {
-                    None
-                };
-
-                (batch_ao, aop_opt)
-            })
-            .collect();
-
-        // unzip batch results
-        let ao_comp_batches: Vec<MatrixFull<f64>> =
-            batch_results.iter().map(|r| r.0.clone()).collect();
-        let mut aop_comp_batches: Vec<[MatrixFull<f64>; 3]> = if do_gradient {
-            batch_results.iter().map(|r| r.1.clone().unwrap_or([
-                MatrixFull::<f64>::empty(),
-                MatrixFull::<f64>::empty(),
-                MatrixFull::<f64>::empty(),
-            ])).collect()
-        } else {
-            vec![]
-        };
+        // The compressed blocks and the index lists were produced by the single pass
+        // above; there is no second evaluation and no staging array to unzip.
 
         // ── Store results ──
         self.non0tab = Some(Non0Tab {
+            // The AOP block is row-aligned with the AO block, so it shares the AO
+            // index list; the separate gradient mask is no longer computed.
             batch_ao_indices: batch_ao_indices.clone(),
-            batch_aop_indices,
+            batch_aop_indices: batch_ao_indices.clone(),
             blksize,
             ngrids,
             nao,
             ao_cutoff: cutoff,
             sparsity_ratio,
             total_nonzero_ao,
-            total_nonzero_aop,
+            total_nonzero_aop: total_stored_aop,
+            total_stored_aop,
             total_elements,
         });
 
@@ -4054,6 +4093,7 @@ impl Grids {
         if do_gradient && !batch_ao_indices.is_empty() {
             self.aop_compressed = Some(CompressedGridAOP {
                 batches: aop_comp_batches,
+                // row-aligned with the AO block, see `contract_response_compressed`
                 batch_aop_map: batch_ao_indices.clone(),
                 batch_grid_ranges,
                 blksize,
@@ -4179,6 +4219,7 @@ impl Grids {
     ) {
         let ao_c = match &self.ao_compressed { Some(c) => c, None => return };
         let aop_c = self.aop_compressed.as_ref();
+        let t_call = if xc_timing::enabled() { Some(std::time::Instant::now()) } else { None };
 
         let ibatch_start = range_grids.start / ao_c.blksize;
         let ibatch_end = ((range_grids.end + ao_c.blksize - 1) / ao_c.blksize).min(ao_c.batches.len());
@@ -4197,6 +4238,7 @@ impl Grids {
             let n_batch = g_local_end - g_local_start;
             // offset of this batch's first grid within the vrho/vsigma/vtau/rhop arrays
             let pot_offset = g_range.start + g_local_start - range_grids.start;
+            let t_elem = if xc_timing::enabled() { Some(std::time::Instant::now()) } else { None };
 
             // -- LDA: build vxc_ao_comp[n_active, n_batch] from vrho --
             let mut vxc_ao_comp = vec![MatrixFull::new([n_active, n_batch], 0.0); spin_channel];
@@ -4265,6 +4307,8 @@ impl Grids {
                 }
             }
 
+            if let Some(t) = t_elem { xc_timing::add(&xc_timing::ELEM_NS, t); }
+
             // -- Apply weights --
             for i_spin in 0..spin_channel {
                 vxc_ao_comp[i_spin].iter_columns_full_mut().enumerate()
@@ -4277,20 +4321,38 @@ impl Grids {
             // -- GEMM + scatter: ao_comp[n_active, n_batch] × vxc_ao_comp^T → loc_vxc_mat --
             for i_spin in 0..spin_channel {
                 let mut loc_mat_batch = MatrixFull::new([n_active, n_active], 0.0);
+                let t_gemm = if xc_timing::enabled() { Some(std::time::Instant::now()) } else { None };
                 _dgemm(
                     batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
                     &vxc_ao_comp[i_spin], (0..n_active, 0..n_batch), 'T',
                     &mut loc_mat_batch, (0..n_active, 0..n_active), 1.0, 0.0,
                 );
-                // Scatter to global vxc_mat
-                let vxc_mat_s = &mut loc_vxc_mat[i_spin];
-                for i_l in 0..n_active {
-                    let mu = indices[i_l];
+                if let Some(t) = t_gemm { xc_timing::add(&xc_timing::GEMM_NS, t); }
+                let t_sc = if xc_timing::enabled() { Some(std::time::Instant::now()) } else { None };
+                // Scatter to the global vxc matrix. `loc_mat_batch` is symmetric in the
+                // batch-local indices and both matrices are column-major, so with `j_l`
+                // outermost the destination column `nu` is fixed and the inner loop walks
+                // `mu`: source and destination are then both sequential. Measured on
+                // (H2O)10 / PBE0: scatter phase −24%. A per-batch pair gate was tried and
+                // rejected (only ~6-9% of the pairs were skippable while building the
+                // per-AO maxima cost ~3x the scatter phase).
+                // Raw-slice scatter: bypass the Index<[usize;2]> trait chain
+                // (get2d → index2d → contain_of → zip/map/sum → data.get → unwrap),
+                // which costs 4+ function calls and 2 bounds checks per element.
+                // With column-major layout, element (i,j) sits at data[i + j*size[0]].
+                {
+                    let stride = num_basis;
+                    let dst: &mut [f64] = &mut loc_vxc_mat[i_spin].data[..];
+                    let src: &[f64] = &loc_mat_batch.data[..];
                     for j_l in 0..n_active {
-                        let nu = indices[j_l];
-                        vxc_mat_s[[mu, nu]] += loc_mat_batch[[i_l, j_l]];
+                        let dst_col = indices[j_l] * stride;
+                        let src_col = j_l * n_active;
+                        for (i_l, &mu) in indices.iter().enumerate() {
+                            dst[mu + dst_col] += src[i_l + src_col];
+                        }
                     }
                 }
+                if let Some(t) = t_sc { xc_timing::add(&xc_timing::SCATTER_NS, t); }
             }
 
             // -- mGGA: tau contribution --
@@ -4312,12 +4374,16 @@ impl Grids {
                                 &vxc_ao_tau[i_spin], (0..n_active, 0..n_batch), 'T',
                                 &mut loc_mat_batch, (0..n_active, 0..n_active), 1.0, 1.0,
                             );
-                            let vxc_mat_s = &mut loc_vxc_mat[i_spin];
-                            for i_l in 0..n_active {
-                                let mu = indices[i_l];
+                            {
+                                let stride = num_basis;
+                                let dst: &mut [f64] = &mut loc_vxc_mat[i_spin].data[..];
+                                let src: &[f64] = &loc_mat_batch.data[..];
                                 for j_l in 0..n_active {
-                                    let nu = indices[j_l];
-                                    vxc_mat_s[[mu, nu]] += loc_mat_batch[[i_l, j_l]];
+                                    let dst_col = indices[j_l] * stride;
+                                    let src_col = j_l * n_active;
+                                    for (i_l, &mu) in indices.iter().enumerate() {
+                                        dst[mu + dst_col] += src[i_l + src_col];
+                                    }
                                 }
                             }
                             vxc_ao_tau[i_spin].data.iter_mut().for_each(|t| *t = 0.0);
@@ -4326,8 +4392,594 @@ impl Grids {
                 }
             }
         }
+        if let Some(t) = t_call { xc_timing::add(&xc_timing::CALL_NS, t); }
     }
 
+    /// Drop the grid points whose initial-guess density contribution is negligible
+    /// and rebuild the tabulated AO/AOP data, once, before the SCF iterations.
+    ///
+    /// The criterion is `sum_spin |rho_spin| * |w_p| < threshold` (borrowed from
+    /// PyFock's `DFT.grid_pruning_mask`, which drops `|rho * w| < 1e-11`). The
+    /// weight is part of the criterion on purpose: a bare `|rho|` threshold also
+    /// drops far-tail points whose quadrature weight is large.
+    ///
+    /// Returns the number of dropped points; 0 when the feature is off, when fewer
+    /// than 2% of the points would go (the rebuild would not pay off) or when no
+    /// tabulated density is available.
+    pub fn prune_by_density(
+        &mut self,
+        mol: &Molecule,
+        dm: &Vec<MatrixFull<f64>>,
+        spin_channel: usize,
+        threshold: f64,
+    ) -> usize {
+        if threshold <= 0.0 { return 0; }
+        let ngrids = self.coordinates.len();
+        if ngrids == 0 { return 0; }
+        // One grid table per point; a short table would make the survivors of the
+        // compaction below silently mis-aligned (`atm_idx` / quadrature weights are
+        // indexed by the surviving points).
+        assert!(
+            self.atm_idx.len() == ngrids && self.quadrature_weights.len() == ngrids,
+            "prune_by_density: grid tables are not aligned ({} points, {} atom indices, {} quadrature weights)",
+            ngrids, self.atm_idx.len(), self.quadrature_weights.len()
+        );
+
+        if self.ao_compressed.is_none() && self.ao.is_none() {
+            if mol.ctrl.print_level >= 1 {
+                println!(" [grid-prune] threshold {:.1e}: skipped, the grid holds no tabulated AO values", threshold);
+            }
+            return 0;
+        }
+        let t_rho_start = std::time::Instant::now();
+        let default_omp_threads = mol.ctrl.num_threads.unwrap_or(rayon::current_num_threads().max(1));
+        let contributions = self.eval_prune_contributions(dm, spin_channel, default_omp_threads);
+        let t_rho = t_rho_start.elapsed();
+
+        // Per-point density contribution `Σ_s |ρ_s| · |w_p|`, and the two sums that make
+        // the truncation auditable: what the dropped points carried, and what the whole
+        // grid carries. The XC integrand is `ρ·w·e_xc`, so the dropped sum bounds the
+        // missed energy up to `max|e_xc|` (order 1 Ha for GGA); its *share* of the total
+        // is the scale-free number, and it is the one that decides whether an absolute
+        // threshold is loose enough for the system at hand.
+        let mut dropped_sum = 0.0_f64;
+        let mut dropped_max = 0.0_f64;
+        let mut total_sum = 0.0_f64;
+        for p in 0..ngrids {
+            let contribution = contributions[p];
+            total_sum += contribution;
+            if contribution < threshold {
+                dropped_sum += contribution;
+                if contribution > dropped_max { dropped_max = contribution; }
+            }
+        }
+        let keep: Vec<bool> = contributions.iter().map(|&c| c >= threshold).collect();
+        let n_keep = keep.iter().filter(|&&k| k).count();
+        let n_drop = ngrids - n_keep;
+        if n_drop * 50 < ngrids {
+            if mol.ctrl.print_level >= 1 {
+                println!(" [grid-prune] threshold {:.1e}: only {} of {} points would go (<2%), keeping the full grid (they carry {:.3e} of the {:.3e} grid total)",
+                    threshold, n_drop, ngrids, dropped_sum, total_sum);
+            }
+            return 0;
+        }
+
+        let mut coords = Vec::with_capacity(n_keep);
+        let mut weights = Vec::with_capacity(n_keep);
+        let mut atm_idx = Vec::with_capacity(n_keep);
+        let mut quadrature_weights = Vec::with_capacity(n_keep);
+        for p in 0..ngrids {
+            if keep[p] {
+                coords.push(self.coordinates[p]);
+                weights.push(self.weights[p]);
+                atm_idx.push(self.atm_idx.get(p).copied().unwrap_or(usize::MAX));
+                quadrature_weights.push(self.quadrature_weights.get(p).copied().unwrap_or(0.0));
+            }
+        }
+        self.coordinates = coords;
+        self.weights = weights;
+        self.atm_idx = atm_idx;
+        self.quadrature_weights = quadrature_weights;
+        self.parallel_balancing = crate::utilities::balancing(n_keep, rayon::current_num_threads());
+        let t_decide = t_rho_start.elapsed() - t_rho;
+
+        // The kept points are a subset of the points the tables already cover, so the
+        // tabulated AO/AOP values can be copied into the smaller grid instead of being
+        // evaluated again (`compact_tabulated_ao`). That costs about a fifth of a
+        // re-tabulation but needs the old and the new table at once, so
+        // `grid_prune_compact = false` (or a table that cannot be compacted) selects the
+        // re-tabulation, which keeps the peak at one table.
+        let t_compact_start = std::time::Instant::now();
+        let compacted = mol.ctrl.grid_prune_compact && self.compact_tabulated_ao(&keep);
+        if !compacted {
+            // Release the stale tables *before* rebuilding: the old AOP table can be
+            // several GB, and the rebuild below allocates a fresh one.
+            self.ao = None;
+            self.aop = None;
+            self.non0tab = None;
+            self.ao_compressed = None;
+            self.aop_compressed = None;
+            if self.ao_cutoff > 0.0 {
+                self.prepare_tabulated_ao_sparse(mol);
+            } else {
+                self.prepare_tabulated_ao(mol);
+                self.build_non0tab(mol);
+                self.build_compressed_storage();
+            }
+        }
+        let t_compact = t_compact_start.elapsed();
+        if mol.ctrl.print_level >= 1 {
+            println!(" [grid-prune] threshold {:.1e}: dropped {} of {} grid points ({:.1}%), they carried {:.3e} of the {:.3e} total density contribution ({:.2e}), largest dropped term {:.3e}; tabulated AO/AOP {}",
+                threshold, n_drop, ngrids, n_drop as f64 / ngrids as f64 * 100.0,
+                dropped_sum, total_sum,
+                if total_sum > 0.0 { dropped_sum / total_sum } else { 0.0 },
+                dropped_max,
+                if compacted {
+                    "compacted in place"
+                } else if !mol.ctrl.grid_prune_compact {
+                    "rebuilt (grid_prune_compact = false)"
+                } else {
+                    "rebuilt"
+                });
+        }
+        if mol.ctrl.print_level >= 2 {
+            println!(" [grid-prune] timing: rho {:.3} s ({} threads), decide + gather {:.3} s, {} {:.3} s",
+                t_rho.as_secs_f64(), rayon::current_num_threads(),
+                t_decide.as_secs_f64(),
+                if compacted { "compact" } else { "rebuild" },
+                t_compact.as_secs_f64());
+        }
+        n_drop
+    }
+
+    /// Per-point prune criterion `Σ_s |ρ_s(p)| · |w_p|` from the tabulated AOs and
+    /// the initial-guess density, evaluated **without** the gradient density and
+    /// **in parallel** over the grid balancing ranges.
+    ///
+    /// `prepare_tabulated_density_slots_dm_only[_compressed]` compute ρ and ∇ρ on
+    /// one thread over the whole grid: on a 1.3 M-point / 41 k-batch grid that is
+    /// minutes of serial work, three quarters of it (∇ρ, discarded by the caller)
+    /// pure waste. This variant shares the batch math with the compressed branch
+    /// of that routine (same `dm_sub` gather, same GEMM, same dot, so the per-point
+    /// values are bit-identical to the serial evaluation), restricts itself to ρ,
+    /// and distributes the balancing ranges over the rayon pool the SCF hot path
+    /// already uses. Each task returns its range's contributions and they are
+    /// assembled in order, so the result does not depend on the thread count.
+    fn eval_prune_contributions(
+        &self,
+        dm: &Vec<MatrixFull<f64>>,
+        spin_channel: usize,
+        default_omp_threads: usize,
+    ) -> Vec<f64> {
+        use rayon::prelude::*;
+        let ngrids = self.coordinates.len();
+        let mut contributions = vec![0.0_f64; ngrids];
+        if ngrids == 0 { return contributions; }
+        let balancing: Vec<std::ops::Range<usize>> = {
+            let covers = !self.parallel_balancing.is_empty()
+                && self.parallel_balancing.iter().map(|r| r.len()).sum::<usize>() == ngrids
+                && self.parallel_balancing.iter().all(|r| r.end <= ngrids);
+            if covers {
+                self.parallel_balancing.clone()
+            } else {
+                crate::utilities::balancing(ngrids, rayon::current_num_threads().max(1))
+            }
+        };
+        // The small per-batch GEMMs must not recruit the whole BLAS thread pool from
+        // inside every rayon task (the tabulation pass does the same).
+        omp_set_num_threads_wrapper(1);
+        let parts: Vec<(std::ops::Range<usize>, Vec<f64>)> = balancing
+            .par_iter()
+            .filter(|r| r.len() > 0)
+            .map(|range| {
+                let rho = self.eval_rho_range(dm, spin_channel, range.clone());
+                let vals: Vec<f64> = rho
+                    .chunks_exact(spin_channel.max(1))
+                    .zip(range.clone())
+                    .map(|(rho_p, p)| {
+                        let mut rho_sum = 0.0f64;
+                        for s in 0..spin_channel { rho_sum += rho_p[s].abs(); }
+                        rho_sum * self.weights[p].abs()
+                    })
+                    .collect();
+                (range.clone(), vals)
+            })
+            .collect();
+        omp_set_num_threads_wrapper(default_omp_threads);
+        for (range, vals) in parts {
+            contributions[range].copy_from_slice(&vals);
+        }
+        contributions
+    }
+
+    /// ρ on a contiguous grid range from the tabulated AOs, gradient-free.
+    /// Returns `range.len() * spin_channel` values laid out point-major
+    /// (`rho[p * spin_channel + s]`), matching `prepare_tabulated_density_slots_
+    /// dm_only[_compressed]`'s ρ block (batch order, gather and contraction are
+    /// the same, so the values agree bit for bit with the serial full-range call).
+    fn eval_rho_range(
+        &self,
+        dm: &Vec<MatrixFull<f64>>,
+        spin_channel: usize,
+        range: std::ops::Range<usize>,
+    ) -> Vec<f64> {
+        let n_out = range.len();
+        let mut rho = vec![0.0_f64; n_out * spin_channel];
+        if let Some(ao_c) = self.ao_compressed.as_ref() {
+            let blksize = ao_c.blksize.max(1);
+            let ibatch_start = range.start / blksize;
+            let ibatch_end = ((range.end + blksize - 1) / blksize).min(ao_c.batches.len());
+            for ibatch in ibatch_start..ibatch_end {
+                let batch_ao = &ao_c.batches[ibatch];
+                let indices = &ao_c.batch_ao_map[ibatch];
+                let n_active = indices.len();
+                if n_active == 0 { continue; }
+                let g_range = &ao_c.batch_grid_ranges[ibatch];
+                let g_local_start = range.start.saturating_sub(g_range.start);
+                let g_local_end = (range.end.min(g_range.end) - g_range.start).min(batch_ao.size[1]);
+                if g_local_end <= g_local_start { continue; }
+                let n_batch = g_local_end - g_local_start;
+                let g_out_start = g_range.start + g_local_start - range.start;
+
+                // dm_sub gather over the batch's active set, on raw slices: the
+                // `[[i, j]]` indexing of the general routine costs a bounds check
+                // and a stride multiply per element, and this gather is the
+                // dominant serial cost on large grids.
+                let nao = dm[0].size[0];
+                let mut dm_sub = vec![MatrixFull::new([n_active, n_active], 0.0); spin_channel];
+                for i_spin in 0..spin_channel {
+                    let dm_s = &dm[i_spin].data;
+                    let sub = &mut dm_sub[i_spin].data;
+                    for (j_local, &nu_global) in indices.iter().enumerate() {
+                        let src_col = nu_global * nao;
+                        for (i_local, &mu_global) in indices.iter().enumerate() {
+                            sub[i_local + j_local * n_active] = dm_s[mu_global + src_col];
+                        }
+                    }
+                }
+
+                for i_spin in 0..spin_channel {
+                    let mut wao = MatrixFull::new([n_active, n_batch], 0.0);
+                    _dgemm(
+                        &dm_sub[i_spin], (0..n_active, 0..n_active), 'N',
+                        batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
+                        &mut wao, (0..n_active, 0..n_batch), 1.0, 0.0,
+                    );
+                    let ao_data = &batch_ao.data;
+                    let wao_data = &wao.data;
+                    for g in 0..n_batch {
+                        let mut rho_val = 0.0;
+                        let ao_col = &ao_data[(g_local_start + g) * n_active..(g_local_start + g + 1) * n_active];
+                        let wao_col = &wao_data[g * n_active..(g + 1) * n_active];
+                        for i_local in 0..n_active {
+                            rho_val += ao_col[i_local] * wao_col[i_local];
+                        }
+                        rho[(g_out_start + g) * spin_channel + i_spin] = rho_val;
+                    }
+                }
+            }
+        } else if let Some(ao) = self.ao.as_ref() {
+            let num_basis = dm[0].size[0];
+            let ao_data = &ao.data;
+            for i_spin in 0..spin_channel {
+                let mut wao = MatrixFull::new([num_basis, n_out], 0.0);
+                _dgemm(
+                    &dm[i_spin], (0..num_basis, 0..num_basis), 'N',
+                    ao, (0..num_basis, range.clone()), 'N',
+                    &mut wao, (0..num_basis, 0..n_out), 1.0, 0.0,
+                );
+                let wao_data = &wao.data;
+                for g in 0..n_out {
+                    let col = (range.start + g) * num_basis;
+                    let mut rho_val = 0.0;
+                    for mu in 0..num_basis {
+                        rho_val += ao_data[col + mu] * wao_data[g * num_basis + mu];
+                    }
+                    rho[g * spin_channel + i_spin] = rho_val;
+                }
+            }
+        }
+        rho
+    }
+
+    /// Copy the tabulated AO/AOP values of the surviving grid points into a fresh,
+    /// re-chunked batch structure, instead of evaluating every basis function again.
+    ///
+    /// `keep` masks the points the tables were built on (`keep.len()` must equal the number
+    /// of points they cover), and the point arrays must already hold the surviving points in
+    /// ascending order. The compaction walks the kept points in that same order, so the new
+    /// batches are again the contiguous ranges `ib*blksize..(ib+1)*blksize` of the new grid,
+    /// which is the layout the consumers derive from `blksize`
+    /// (see `prepare_tabulated_density_slots_dm_only_compressed`).
+    ///
+    /// Every stored value is copied verbatim, so the compacted table is the one the
+    /// re-tabulation would have produced, up to the rows a contributing old batch had
+    /// dropped: those are the entries whose values are all below `ao_cutoff` in that batch,
+    /// which the compressed storage treats as zero by construction, and they enter the
+    /// merged batch as zeros. Old blocks are released as soon as no later batch can need
+    /// them, so the peak stays at roughly the old table's size rather than old + new.
+    ///
+    /// Returns `false`, leaving the object untouched, when there is nothing to compact:
+    /// no tabulated values, inconsistent bookkeeping, or an empty surviving set.
+    pub fn compact_tabulated_ao(&mut self, keep: &[bool]) -> bool {
+        use rayon::prelude::*;
+        let old_ngrids = keep.len();
+        let n_keep = keep.iter().filter(|&&k| k).count();
+        if n_keep == 0 {
+            // an empty surviving set is refused here; the caller guards it (see
+            // the `n_drop`/`n_keep` checks in `prune_by_density`)
+            return false;
+        }
+        if n_keep == old_ngrids {
+            // nothing was dropped, so the tables already match the grid
+            return true;
+        }
+        let mut new2old: Vec<usize> = Vec::with_capacity(n_keep);
+        for (p, &k) in keep.iter().enumerate() {
+            if k { new2old.push(p); }
+        }
+
+        // ── compressed path (the default, `ao_cutoff > 0`) ──
+        if let Some(ao_c) = self.ao_compressed.as_ref() {
+            let aop_c = self.aop_compressed.as_ref();
+            let blksize = ao_c.blksize.max(1);
+            let nao = ao_c.nao_total;
+            if ao_c.ngrids != old_ngrids
+                || ao_c.batches.len() != ao_c.batch_grid_ranges.len()
+                || ao_c.batches.len() != ao_c.batch_ao_map.len()
+                || ao_c.batches.is_empty()
+                || aop_c.map_or(false, |c| {
+                    c.ngrids != old_ngrids
+                        || c.batches.len() != ao_c.batches.len()
+                        || c.batch_aop_map.len() != ao_c.batches.len()
+                })
+            {
+                return false;
+            }
+            let ao_cutoff = self.non0tab.as_ref().map_or(0.0, |n| n.ao_cutoff);
+
+            // take ownership of the blocks so each old batch can be freed as it is consumed
+            let CompressedGridAO { batches: mut old_ao, batch_ao_map: old_map, blksize: _, .. } =
+                self.ao_compressed.take().unwrap();
+            let mut old_aop = self.aop_compressed.take().map(|c| c.batches);
+
+            let nbatches_new = (n_keep + blksize - 1) / blksize;
+            let want_aop = old_aop.is_some();
+            let mut new_batches: Vec<MatrixFull<f64>> = Vec::with_capacity(nbatches_new);
+            let mut new_aop_batches: Vec<[MatrixFull<f64>; 3]> = Vec::with_capacity(nbatches_new);
+            let mut new_maps: Vec<Vec<usize>> = Vec::with_capacity(nbatches_new);
+            let mut new_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(nbatches_new);
+            let mut freed_upto = 0usize;
+
+            // The new batches are built in parallel, in chunks. Inside a chunk the
+            // batches are independent: each reads only the old blocks of its own
+            // window (kept points are ascending, so the windows of one chunk overlap
+            // at most at their edges, read-only), writes its own fresh block, and
+            // carries a thread-local `row_of` scratch. The chunks themselves stay
+            // sequential so the old blocks can keep being released after each chunk
+            // at the same granularity of a few hundred batches: the peak stays at
+            // roughly the old table's size plus one chunk of the new one, as in the
+            // batch-at-a-time release.
+            let nthreads = rayon::current_num_threads().max(1);
+            let nchunks = (nthreads * 4).clamp(1, nbatches_new);
+            for c in 0..nchunks {
+                let b0 = c * nbatches_new / nchunks;
+                let b1 = ((c + 1) * nbatches_new / nchunks).max(b0 + 1).min(nbatches_new);
+                let built: Vec<(usize, MatrixFull<f64>, [MatrixFull<f64>; 3], Vec<usize>)> =
+                    (b0..b1).into_par_iter().map_init(
+                        || vec![usize::MAX; nao],
+                        |row_of, ib| {
+                            let gs = ib * blksize;
+                            let ge = (gs + blksize).min(n_keep);
+                            let nb = ge - gs;
+
+                            // the kept points of this batch, grouped by the old batch they
+                            // came from (ascending, because `new2old` is ascending)
+                            let mut groups: Vec<(usize, usize, usize)> = Vec::new(); // (old batch, first col, end col)
+                            for g in gs..ge {
+                                let p = new2old[g];
+                                let ob = p / blksize;
+                                debug_assert!(ob < old_ao.len());
+                                match groups.last_mut() {
+                                    Some((last, _, end)) if *last == ob => *end = p - ob * blksize + 1,
+                                    _ => groups.push((ob, p - ob * blksize, p - ob * blksize + 1)),
+                                }
+                            }
+
+                            // the merged active-row set of this batch, ascending
+                            let mut map: Vec<usize> = Vec::new();
+                            for &(ob, _, _) in &groups {
+                                for &mu in old_map[ob].iter() {
+                                    if row_of[mu] == usize::MAX {
+                                        row_of[mu] = map.len();
+                                        map.push(mu);
+                                    }
+                                }
+                            }
+                            map.sort_unstable();
+                            for (r, &mu) in map.iter().enumerate() {
+                                row_of[mu] = r;
+                            }
+
+                            // An entirely inactive batch is stored as an empty block, exactly
+                            // as the re-tabulation stores it (`n_active == 0`).
+                            let empty_block = || MatrixFull::<f64>::empty();
+                            let mut ao_block = if map.is_empty() {
+                                empty_block()
+                            } else {
+                                MatrixFull::new([map.len(), nb], 0.0)
+                            };
+                            let mut aop_block = [
+                                MatrixFull::<f64>::empty(),
+                                MatrixFull::<f64>::empty(),
+                                MatrixFull::<f64>::empty(),
+                            ];
+                            if want_aop && !map.is_empty() {
+                                for x in 0..3 {
+                                    aop_block[x] = MatrixFull::new([map.len(), nb], 0.0);
+                                }
+                            }
+                            if !map.is_empty() {
+                                for g in gs..ge {
+                                    let p = new2old[g];
+                                    let ob = p / blksize;
+                                    // a contributing old batch whose own row set is empty stores
+                                    // no values at all (its points were below the cutoff for
+                                    // every AO)
+                                    if old_map[ob].is_empty() {
+                                        continue;
+                                    }
+                                    let col = p - ob * blksize;
+                                    let gcol = g - gs;
+                                    let src = old_ao[ob].slice_column(col);
+                                    let dst = ao_block.slice_column_mut(gcol);
+                                    for (r_old, &mu) in old_map[ob].iter().enumerate() {
+                                        dst[row_of[mu]] = src[r_old];
+                                    }
+                                    if want_aop {
+                                        let src_aop = &old_aop.as_ref().unwrap()[ob];
+                                        for x in 0..3 {
+                                            let s = src_aop[x].slice_column(col);
+                                            let d = aop_block[x].slice_column_mut(gcol);
+                                            for (r_old, &mu) in old_map[ob].iter().enumerate() {
+                                                d[row_of[mu]] = s[r_old];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for &mu in map.iter() {
+                                row_of[mu] = usize::MAX;
+                            }
+                            (ib, ao_block, aop_block, map)
+                        },
+                    )
+                    .collect();
+                for (ib, ao_block, aop_block, map) in built {
+                    let gs = ib * blksize;
+                    let ge = (gs + blksize).min(n_keep);
+                    new_batches.push(ao_block);
+                    if want_aop {
+                        new_aop_batches.push(aop_block);
+                    }
+                    new_maps.push(map);
+                    new_ranges.push(gs..ge);
+                }
+
+                // Release the old blocks that no later chunk can reach: the kept points
+                // are ascending, so nothing below the next chunk's first old batch can
+                // come back.
+                let next_first = if b1 < nbatches_new {
+                    (new2old[b1 * blksize] / blksize).min(old_ao.len())
+                } else {
+                    old_ao.len()
+                };
+                while freed_upto < next_first {
+                    old_ao[freed_upto] = MatrixFull::empty();
+                    if let Some(v) = old_aop.as_mut() {
+                        v[freed_upto] = [
+                            MatrixFull::empty(),
+                            MatrixFull::empty(),
+                            MatrixFull::empty(),
+                        ];
+                    }
+                    freed_upto += 1;
+                }
+            }
+            debug_assert!(freed_upto <= old_ao.len());
+
+            // bookkeeping: same statistics the re-tabulation reports
+            let total_stored_ao: usize = new_maps
+                .iter()
+                .zip(new_ranges.iter())
+                .map(|(m, r)| m.len() * r.len())
+                .sum();
+            let total_elements = n_keep * nao;
+            let sparsity_ratio = if total_elements > 0 {
+                total_stored_ao as f64 / total_elements as f64
+            } else {
+                1.0
+            };
+            let do_gradient = !new_aop_batches.is_empty();
+            let total_stored_aop = if do_gradient { 3 * total_stored_ao } else { 0 };
+
+            self.ao_compressed = Some(CompressedGridAO {
+                batches: new_batches,
+                batch_ao_map: new_maps.clone(),
+                batch_grid_ranges: new_ranges.clone(),
+                blksize,
+                nao_total: nao,
+                ngrids: n_keep,
+            });
+            self.aop_compressed = if do_gradient {
+                Some(CompressedGridAOP {
+                    batches: new_aop_batches,
+                    batch_aop_map: new_maps.clone(),
+                    batch_grid_ranges: new_ranges,
+                    blksize,
+                    nao_total: nao,
+                    ngrids: n_keep,
+                })
+            } else {
+                None
+            };
+            self.non0tab = Some(Non0Tab {
+                batch_ao_indices: new_maps.clone(),
+                batch_aop_indices: new_maps,
+                blksize,
+                ngrids: n_keep,
+                nao,
+                ao_cutoff,
+                sparsity_ratio,
+                total_nonzero_ao: total_stored_ao,
+                total_nonzero_aop: total_stored_aop,
+                total_stored_aop,
+                total_elements,
+            });
+            // A dense copy that was decompressed from the old storage no longer matches
+            // the grid; drop it so `ensure_dense_ao`/`ensure_dense_aop` rebuild it from the
+            // compacted storage on demand (this is what the re-tabulation path did too).
+            self.ao = None;
+            self.aop = None;
+            return true;
+        }
+
+        // ── dense path (`ao_cutoff = 0`): keep the surviving columns ──
+        if self.ao.is_some() {
+            let nao = self.ao.as_ref().unwrap().size[0];
+            if self.ao.as_ref().unwrap().size[1] != old_ngrids {
+                return false;
+            }
+            let old_ao = self.ao.take().unwrap();
+            let mut ao = MatrixFull::new([nao, n_keep], 0.0);
+            ao.data
+                .par_chunks_exact_mut(nao)
+                .zip(new2old.par_iter())
+                .for_each(|(dst_col, &g_old)| {
+                    dst_col.copy_from_slice(&old_ao.data[g_old * nao..(g_old + 1) * nao]);
+                });
+            self.ao = Some(ao);
+            if let Some(old_aop) = self.aop.take() {
+                let mut aop = RIFull::<f64>::new([nao, n_keep, 3], 0.0);
+                for x in 0..3 {
+                    let src = old_aop.get_reducing_matrix(x).unwrap();
+                    let dst = aop.get_reducing_matrix_mut(x).unwrap();
+                    // column-major slab [nao, ngrids]: column g is the contiguous run
+                    // `g*nao .. (g+1)*nao` (same layout `decompress_aop` writes)
+                    dst.data
+                        .par_chunks_exact_mut(nao)
+                        .zip(new2old.par_iter())
+                        .for_each(|(dst_col, &g_old)| {
+                            dst_col.copy_from_slice(&src.data[g_old * nao..(g_old + 1) * nao]);
+                        });
+                }
+                self.aop = Some(aop);
+            }
+            return true;
+        }
+
+        false
+    }
     pub fn prepare_tabulated_ao_rayon_v02(&mut self, mol: &Molecule) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
@@ -4833,29 +5485,33 @@ impl Grids {
             let n_batch = g_local_end - g_local_start;
             let g_out_start = g_range.start + g_local_start - range_grids.start;
 
-            let mut dm_sub = vec![MatrixFull::new([nao, n_active], 0.0); spin_channel];
+            // The contraction runs over the batch's active AO set only, so both
+            // indices of `dm_sub` are restricted to it: the gather and the GEMM
+            // shrink by `nao / n_active` with no change to the summed expression
+            // (the rows outside the active set were computed but never read).
+            let mut dm_sub = vec![MatrixFull::new([n_active, n_active], 0.0); spin_channel];
             for i_spin in 0..spin_channel {
                 let dm_s = &dm[i_spin];
                 let dm_sub_s = &mut dm_sub[i_spin];
-                for mu in 0..nao {
-                    for (i_local, &nu_global) in indices.iter().enumerate() {
-                        dm_sub_s[[mu, i_local]] = dm_s[[mu, nu_global]];
+                for (j_local, &nu_global) in indices.iter().enumerate() {
+                    for (i_local, &mu_global) in indices.iter().enumerate() {
+                        dm_sub_s[[i_local, j_local]] = dm_s[[mu_global, nu_global]];
                     }
                 }
             }
 
             for i_spin in 0..spin_channel {
-                let mut wao = MatrixFull::new([nao, n_batch], 0.0);
+                let mut wao = MatrixFull::new([n_active, n_batch], 0.0);
                 _dgemm(
-                    &dm_sub[i_spin], (0..nao, 0..n_active), 'N',
+                    &dm_sub[i_spin], (0..n_active, 0..n_active), 'N',
                     batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
-                    &mut wao, (0..nao, 0..n_batch), 1.0, 0.0,
+                    &mut wao, (0..n_active, 0..n_batch), 1.0, 0.0,
                 );
 
                 for g in 0..n_batch {
                     let mut rho_val = 0.0;
-                    for (i_local, &mu_global) in indices.iter().enumerate() {
-                        rho_val += batch_ao[[i_local, g_local_start + g]] * wao[[mu_global, g]];
+                    for i_local in 0..n_active {
+                        rho_val += batch_ao[[i_local, g_local_start + g]] * wao[[i_local, g]];
                     }
                     cur_rho[[g_out_start + g, i_spin]] = rho_val;
                 }
@@ -4886,14 +5542,18 @@ impl Grids {
 
                     let ao_batch = &ao_c.batches[ibatch];
                     let ao_indices = &ao_c.batch_ao_map[ibatch];
+                    let n_active_ao = ao_indices.len();
 
-                    // dm_sub using AOP indices (for aop × dm contraction)
-                    let mut dm_sub = vec![MatrixFull::new([nao, n_active_aop], 0.0); spin_channel];
+                    // same row/column restriction as the ρ part: rows are the set the
+                    // final contraction sums over (`ao_indices`), columns are the AOP
+                    // block's active set (`aop_indices`, equal to `ao_indices` by the
+                    // row-aligned storage).
+                    let mut dm_sub = vec![MatrixFull::new([n_active_ao, n_active_aop], 0.0); spin_channel];
                     for i_spin in 0..spin_channel {
                         let dm_s = &dm[i_spin];
-                        for mu in 0..nao {
-                            for (i_local, &nu_global) in aop_indices.iter().enumerate() {
-                                dm_sub[i_spin][[mu, i_local]] = dm_s[[mu, nu_global]];
+                        for (j_local, &nu_global) in aop_indices.iter().enumerate() {
+                            for (i_local, &mu_global) in ao_indices.iter().enumerate() {
+                                dm_sub[i_spin][[i_local, j_local]] = dm_s[[mu_global, nu_global]];
                             }
                         }
                     }
@@ -4901,19 +5561,18 @@ impl Grids {
                     for i_spin in 0..spin_channel {
                         for x in 0usize..3usize {
                             let aop_x_batch = &aop_c.batches[ibatch][x];
-                            let mut wao = MatrixFull::new([nao, n_batch], 0.0);
+                            let mut wao = MatrixFull::new([n_active_ao, n_batch], 0.0);
                             _dgemm(
-                                &dm_sub[i_spin], (0..nao, 0..n_active_aop), 'N',
+                                &dm_sub[i_spin], (0..n_active_ao, 0..n_active_aop), 'N',
                                 aop_x_batch, (0..n_active_aop, g_local_start..g_local_end), 'N',
-                                &mut wao, (0..nao, 0..n_batch), 1.0, 0.0,
+                                &mut wao, (0..n_active_ao, 0..n_batch), 1.0, 0.0,
                             );
 
                             let mut rhop_s = cur_rhop.get_reducing_matrix_mut(i_spin).unwrap();
                             for g in 0..n_batch {
                                 let mut rhop_val = 0.0;
-                                for (i_local, &mu_global) in ao_indices.iter().enumerate() {
-                                    rhop_val += ao_batch[[i_local, g_local_start + g]]
-                                        * wao[[mu_global, g]];
+                                for i_local in 0..n_active_ao {
+                                    rhop_val += ao_batch[[i_local, g_local_start + g]] * wao[[i_local, g]];
                                 }
                                 let col = rhop_s.get_column_mut(x);
                                 col[g_out_start + g] = 2.0 * rhop_val;
@@ -5114,12 +5773,15 @@ impl Grids {
             let n_batch = g_local_end - g_local_start;
             let g_out_start = g_range.start + g_local_start - range_grids.start;
 
-            let mut dm_sub_ao = vec![MatrixFull::new([nao, n_active_ao], 0.0); spin_channel];
+            // Both indices are restricted to the batch's active set (see the note in
+            // `prepare_tabulated_density_slots_dm_only_compressed`); the AOP block is
+            // row-aligned with the AO block, so its rows use `ao_indices` as well.
+            let mut dm_sub_ao = vec![MatrixFull::new([n_active_ao, n_active_ao], 0.0); spin_channel];
             for i_spin in 0..spin_channel {
                 let dm_s = &dm[i_spin];
-                for mu in 0..nao {
-                    for (i_local, &nu_global) in ao_indices.iter().enumerate() {
-                        dm_sub_ao[i_spin][[mu, i_local]] = dm_s[[mu, nu_global]];
+                for (j_local, &nu_global) in ao_indices.iter().enumerate() {
+                    for (i_local, &mu_global) in ao_indices.iter().enumerate() {
+                        dm_sub_ao[i_spin][[i_local, j_local]] = dm_s[[mu_global, nu_global]];
                     }
                 }
             }
@@ -5128,12 +5790,13 @@ impl Grids {
             if order >= 1 {
                 if let Some(aop_indices) = aop_indices_opt {
                     if n_active_aop > 0 {
-                        let mut tmp = vec![MatrixFull::new([nao, n_active_aop], 0.0); spin_channel];
+                        debug_assert_eq!(n_active_aop, n_active_ao);
+                        let mut tmp = vec![MatrixFull::new([n_active_ao, n_active_aop], 0.0); spin_channel];
                         for i_spin in 0..spin_channel {
                             let dm_s = &dm[i_spin];
-                            for mu in 0..nao {
-                                for (i_local, &nu_global) in aop_indices.iter().enumerate() {
-                                    tmp[i_spin][[mu, i_local]] = dm_s[[mu, nu_global]];
+                            for (j_local, &nu_global) in aop_indices.iter().enumerate() {
+                                for (i_local, &mu_global) in ao_indices.iter().enumerate() {
+                                    tmp[i_spin][[i_local, j_local]] = dm_s[[mu_global, nu_global]];
                                 }
                             }
                         }
@@ -5144,24 +5807,24 @@ impl Grids {
 
             for i_spin in 0..spin_channel {
                 // rho
-                let mut wao = MatrixFull::new([nao, n_batch], 0.0);
+                let mut wao = MatrixFull::new([n_active_ao, n_batch], 0.0);
                 _dgemm(
                     &dm_sub_ao[i_spin],
-                    (0..nao, 0..n_active_ao),
+                    (0..n_active_ao, 0..n_active_ao),
                     'N',
                     ao_batch,
                     (0..n_active_ao, g_local_start..g_local_end),
                     'N',
                     &mut wao,
-                    (0..nao, 0..n_batch),
+                    (0..n_active_ao, 0..n_batch),
                     1.0,
                     0.0,
                 );
 
                 for g in 0..n_batch {
                     let mut rho_val = 0.0;
-                    for (i_local, &mu_global) in ao_indices.iter().enumerate() {
-                        rho_val += ao_batch[[i_local, g_local_start + g]] * wao[[mu_global, g]];
+                    for i_local in 0..n_active_ao {
+                        rho_val += ao_batch[[i_local, g_local_start + g]] * wao[[i_local, g]];
                     }
                     cur_rho[[g_out_start + g, i_spin]] = rho_val;
                 }
@@ -5172,16 +5835,16 @@ impl Grids {
                     {
                         for x in 0usize..3usize {
                             let aop_x_batch = &aop_batches[x];
-                            let mut wao_p = MatrixFull::new([nao, n_batch], 0.0);
+                            let mut wao_p = MatrixFull::new([n_active_ao, n_batch], 0.0);
                             _dgemm(
                                 &dm_sub_aop[i_spin],
-                                (0..nao, 0..n_active_aop),
+                                (0..n_active_ao, 0..n_active_aop),
                                 'N',
                                 aop_x_batch,
                                 (0..n_active_aop, g_local_start..g_local_end),
                                 'N',
                                 &mut wao_p,
-                                (0..nao, 0..n_batch),
+                                (0..n_active_ao, 0..n_batch),
                                 1.0,
                                 0.0,
                             );
@@ -5191,8 +5854,8 @@ impl Grids {
                                 let col = rhop_s.get_column_mut(x);
                                 for g in 0..n_batch {
                                     let mut rhop_val = 0.0;
-                                    for (i_local, &mu_global) in ao_indices.iter().enumerate() {
-                                        rhop_val += ao_batch[[i_local, g_local_start + g]] * wao_p[[mu_global, g]];
+                                    for i_local in 0..n_active_ao {
+                                        rhop_val += ao_batch[[i_local, g_local_start + g]] * wao_p[[i_local, g]];
                                     }
                                     col[g_out_start + g] = 2.0 * rhop_val;
                                 }
@@ -5201,8 +5864,8 @@ impl Grids {
                             if order == 2 {
                                 for g in 0..n_batch {
                                     let mut tau_val = 0.0;
-                                    for (i_local, &mu_global) in aop_indices.iter().enumerate() {
-                                        tau_val += aop_x_batch[[i_local, g_local_start + g]] * wao_p[[mu_global, g]];
+                                    for i_local in 0..n_active_aop {
+                                        tau_val += aop_x_batch[[i_local, g_local_start + g]] * wao_p[[i_local, g]];
                                     }
                                     cur_tau[[g_out_start + g, i_spin]] += 0.5 * tau_val;
                                 }
@@ -5369,6 +6032,34 @@ impl Grids {
 
         let mut cur_rho = RIFull::new([num_grids, spin_channel, nvar], 0.0);
 
+        // The occupation weights and the scaled MO coefficients do not depend on the
+        // grid batch, so build them once per spin instead of in every batch.
+        let nao = mo[0].size[0];
+        let wmo_scaled: Vec<(Vec<f64>, MatrixFull<f64>)> = (0..spin_channel)
+            .map(|i_spin| {
+                let mo_s = &mo[i_spin];
+                let homo_s = occ[i_spin]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, occ)| **occ >= 1.0e-6)
+                    .map(|(i, _)| i)
+                    .max();
+                let occ_s: Vec<f64> = if let Some(homo_s) = homo_s {
+                    occ[i_spin][0..homo_s + 1].iter().map(|occ| occ.sqrt()).collect()
+                } else {
+                    vec![]
+                };
+                let nocc = occ_s.len();
+                let mut mo_scaled = MatrixFull::new([nao, nocc], 0.0);
+                for mu in 0..nao {
+                    for j in 0..nocc {
+                        mo_scaled[[mu, j]] = mo_s[[mu, j]] * occ_s[j];
+                    }
+                }
+                (occ_s, mo_scaled)
+            })
+            .collect();
+
         let ibatch_start = range_grids.start / ao_c.blksize;
         let ibatch_end = ((range_grids.end + ao_c.blksize - 1) / ao_c.blksize).min(ao_c.batches.len());
 
@@ -5407,28 +6098,17 @@ impl Grids {
             let g_out_start = g_range.start + g_local_start - range_grids.start;
 
             for i_spin in 0..spin_channel {
-                let mo_s = &mo[i_spin];
-                let homo_s = occ[i_spin]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, occ)| **occ >= 1.0e-6)
-                    .map(|(i, _)| i)
-                    .max();
-                let occ_s: Vec<f64> = if let Some(homo_s) = homo_s {
-                    occ[i_spin][0..homo_s + 1].iter().map(|occ| occ.sqrt()).collect()
-                } else {
-                    vec![]
-                };
+                let (occ_s, mo_scaled) = &wmo_scaled[i_spin];
                 let nocc = occ_s.len();
                 if nocc == 0 {
                     continue;
                 }
 
-                // wmo_ao[n_active_ao, nocc] = mo_sub × sqrt(occ)
+                // wmo_ao[n_active_ao, nocc] = mo_sub × sqrt(occ), pre-scaled per spin
                 let mut wmo_ao = MatrixFull::new([n_active_ao, nocc], 0.0);
                 for (i_local, &mu_global) in ao_indices.iter().enumerate() {
                     for j in 0..nocc {
-                        wmo_ao[[i_local, j]] = mo_s[[mu_global, j]] * occ_s[j];
+                        wmo_ao[[i_local, j]] = mo_scaled[[mu_global, j]];
                     }
                 }
 
@@ -5462,20 +6142,17 @@ impl Grids {
                             continue;
                         }
 
-                        // wmo_aop[n_active_aop, nocc] = mo_sub × sqrt(occ)
-                        let mut wmo_aop = MatrixFull::new([n_active_aop, nocc], 0.0);
-                        for (i_local, &mu_global) in aop_indices.iter().enumerate() {
-                            for j in 0..nocc {
-                                wmo_aop[[i_local, j]] = mo_s[[mu_global, j]] * occ_s[j];
-                            }
-                        }
+                        // The AOP block is row-aligned with the AO block, so it shares
+                        // the same scaled MO matrix; `wmo_ao` is reused rather than
+                        // rebuilding a duplicate here.
+                        debug_assert_eq!(aop_indices.len(), ao_indices.len());
 
                         for ic in 0usize..3usize {
                             let aop_ic_batch = &aop_batches[ic];
                             let mut tmop = MatrixFull::new([nocc, n_batch], 0.0);
                             _dgemm(
-                                &wmo_aop,
-                                (0..n_active_aop, 0..nocc),
+                                &wmo_ao,
+                                (0..n_active_ao, 0..nocc),
                                 'T',
                                 aop_ic_batch,
                                 (0..n_active_aop, g_local_start..g_local_end),
@@ -5626,7 +6303,39 @@ impl Grids {
         let ibatch_start = range_grids.start / ao_c.blksize;
         let ibatch_end = ((range_grids.end + ao_c.blksize - 1) / ao_c.blksize).min(ao_c.batches.len());
 
+        // The occupation weights and the scaled MO coefficients do not depend on the
+        // grid batch, so build them once per spin instead of in every batch.
+        let wmo_scaled: Vec<(Vec<f64>, MatrixFull<f64>)> = (0..spin_channel)
+            .map(|i_spin| {
+                let mo_s = &mo[i_spin];
+                let homo_s = occ[i_spin].iter().enumerate()
+                    .filter(|(_, o)| **o >= 1.0e-6).map(|(i, _)| i).max();
+                let occ_s: Vec<f64> = if let Some(h) = homo_s {
+                    occ[i_spin][0..=h].iter().map(|o| o.sqrt()).collect()
+                } else { vec![] };
+                let nocc = occ_s.len();
+                let mut mo_scaled = MatrixFull::new([nao, nocc], 0.0);
+                for mu in 0..nao {
+                    for j in 0..nocc {
+                        mo_scaled[[mu, j]] = mo_s[[mu, j]] * occ_s[j];
+                    }
+                }
+                (occ_s, mo_scaled)
+            })
+            .collect();
+
+        // ρ and ∇ρ are assembled in a single pass over the batches: the scaled-MO
+        // matrix `wmo` and the intermediate `tmo = wmoᵀ·ao` are shared by both, and
+        // the AOP block is row-aligned with the AO block so its index list and its
+        // scaled MO matrix are the same. The pre-merge code ran a second loop over
+        // the batches for ∇ρ and rebuilt both intermediates there (measured: −26% of
+        // the density/∇ρ assembly on (H2O)30 / B3LYP / def2-SVP / 4 threads).
+        let need_rhop = aop_c.is_some() && spin_channel > 0;
         let mut cur_rho = MatrixFull::new([n_grids_total, spin_channel], 0.0);
+        let mut cur_rhop = if need_rhop {
+            RIFull::new([n_grids_total, 3, spin_channel], 0.0)
+        } else { RIFull::empty() };
+
         for ibatch in ibatch_start..ibatch_end {
             let batch_ao = &ao_c.batches[ibatch];
             let indices = &ao_c.batch_ao_map[ibatch];
@@ -5640,20 +6349,17 @@ impl Grids {
             let g_out_start = g_range.start + g_local_start - range_grids.start;
 
             for i_spin in 0..spin_channel {
-                let mo_s = &mo[i_spin];
-                let homo_s = occ[i_spin].iter().enumerate()
-                    .filter(|(_, o)| **o >= 1.0e-6).map(|(i, _)| i).max();
-                let occ_s: Vec<f64> = if let Some(h) = homo_s {
-                    occ[i_spin][0..=h].iter().map(|o| o.sqrt()).collect()
-                } else { vec![] };
+                let (occ_s, mo_scaled) = &wmo_scaled[i_spin];
                 let nocc = occ_s.len();
                 if nocc == 0 { continue; }
 
-                // wmo[n_active, nocc] = mo_sub × √occ
+                // wmo[n_active, nocc] = mo_sub × √occ (pre-scaled per spin)
+                // Both matrices are column-major: running the inner index over
+                // `indices` keeps the source and the destination sequential.
                 let mut wmo = MatrixFull::new([n_active, nocc], 0.0);
-                for (i_local, &mu_global) in indices.iter().enumerate() {
-                    for j in 0..nocc {
-                        wmo[[i_local, j]] = mo_s[[mu_global, j]] * occ_s[j];
+                for j in 0..nocc {
+                    for (i_local, &mu_global) in indices.iter().enumerate() {
+                        wmo[[i_local, j]] = mo_scaled[[mu_global, j]];
                     }
                 }
 
@@ -5667,79 +6373,28 @@ impl Grids {
                     let rho_val: f64 = (0..nocc).map(|i| tmo[[i, g]] * tmo[[i, g]]).sum();
                     cur_rho[[g_out_start + g, i_spin]] = rho_val;
                 }
-            }
-        }
 
-        // ---- rhop ----
-        let need_rhop = aop_c.is_some() && spin_channel > 0;
-        let mut cur_rhop = if need_rhop {
-            RIFull::new([n_grids_total, 3, spin_channel], 0.0)
-        } else { RIFull::empty() };
-
-        if let Some(aop_c) = aop_c {
-            if need_rhop && !aop_c.batch_aop_map.is_empty() {
-                for ibatch in ibatch_start..ibatch_end {
-                    let batch_ao = &ao_c.batches[ibatch];
-                    let ao_indices = &ao_c.batch_ao_map[ibatch];
-                    let n_active_ao = ao_indices.len();
-                    if n_active_ao == 0 { continue; }
-                    let aop_indices = &aop_c.batch_aop_map[ibatch];
-                    let n_active_aop = aop_indices.len();
+                // ---- ∇ρ from the same wmo/tmo ----
+                if need_rhop {
+                    let aop_c = aop_c.unwrap();
+                    let n_active_aop = aop_c.batch_aop_map[ibatch].len();
                     if n_active_aop == 0 { continue; }
-                    let g_range = &ao_c.batch_grid_ranges[ibatch];
-                    let g_local_start = (range_grids.start.saturating_sub(g_range.start));
-                    let g_local_end = (range_grids.end.min(g_range.end) - g_range.start)
-                        .min(aop_c.batches.get(ibatch).map(|b| b[0].size[1]).unwrap_or(0));
-                    if g_local_end <= g_local_start { continue; }
-                    let n_batch = g_local_end - g_local_start;
-                    let g_out_start = g_range.start + g_local_start - range_grids.start;
+                    let aop_batch = &aop_c.batches[ibatch];
+                    debug_assert_eq!(n_active_aop, n_active);
+                    debug_assert_eq!(aop_batch[0].size[1], batch_ao.size[1]);
 
-                    for i_spin in 0..spin_channel {
-                        let mo_s = &mo[i_spin];
-                        let homo_s = occ[i_spin].iter().enumerate()
-                            .filter(|(_, o)| **o >= 1.0e-6).map(|(i, _)| i).max();
-                        let occ_s: Vec<f64> = if let Some(h) = homo_s {
-                            occ[i_spin][0..=h].iter().map(|o| o.sqrt()).collect()
-                        } else { vec![] };
-                        let nocc = occ_s.len();
-                        if nocc == 0 { continue; }
+                    for x in 0usize..3usize {
+                        let mut tmop = MatrixFull::new([nocc, n_batch], 0.0);
+                        _dgemm(&wmo, (0..n_active_aop, 0..nocc), 'T',
+                               &aop_batch[x], (0..n_active_aop, g_local_start..g_local_end), 'N',
+                               &mut tmop, (0..nocc, 0..n_batch), 1.0, 0.0);
 
-                        // wmo using AO indices (for tmo/rho)
-                        let mut wmo = MatrixFull::new([n_active_ao, nocc], 0.0);
-                        for (i_local, &mu_global) in ao_indices.iter().enumerate() {
-                            for j in 0..nocc {
-                                wmo[[i_local, j]] = mo_s[[mu_global, j]] * occ_s[j];
-                            }
-                        }
-
-                        // tmo from ao (for rho contraction reference)
-                        let mut tmo = MatrixFull::new([nocc, n_batch], 0.0);
-                        _dgemm(&wmo, (0..n_active_ao, 0..nocc), 'T',
-                               batch_ao, (0..n_active_ao, g_local_start..g_local_end), 'N',
-                               &mut tmo, (0..nocc, 0..n_batch), 1.0, 0.0);
-
-                        // wmo using AOP indices (for tmop/rhop)
-                        let mut wmo_aop = MatrixFull::new([n_active_aop, nocc], 0.0);
-                        for (i_local, &mu_global) in aop_indices.iter().enumerate() {
-                            for j in 0..nocc {
-                                wmo_aop[[i_local, j]] = mo_s[[mu_global, j]] * occ_s[j];
-                            }
-                        }
-
-                        for x in 0usize..3usize {
-                            let aop_x_batch = &aop_c.batches[ibatch][x];
-                            let mut tmop = MatrixFull::new([nocc, n_batch], 0.0);
-                            _dgemm(&wmo_aop, (0..n_active_aop, 0..nocc), 'T',
-                                   aop_x_batch, (0..n_active_aop, g_local_start..g_local_end), 'N',
-                                   &mut tmop, (0..nocc, 0..n_batch), 1.0, 0.0);
-
-                            let mut rhop_s = cur_rhop.get_reducing_matrix_mut(i_spin).unwrap();
-                            for g in 0..n_batch {
-                                let rhop_val: f64 = (0..nocc)
-                                    .map(|i| tmop[[i, g]] * tmo[[i, g]]).sum();
-                                let col = rhop_s.get_column_mut(x);
-                                col[g_out_start + g] = 2.0 * rhop_val;
-                            }
+                        let mut rhop_s = cur_rhop.get_reducing_matrix_mut(i_spin).unwrap();
+                        for g in 0..n_batch {
+                            let rhop_val: f64 = (0..nocc)
+                                .map(|i| tmop[[i, g]] * tmo[[i, g]]).sum();
+                            let col = rhop_s.get_column_mut(x);
+                            col[g_out_start + g] = 2.0 * rhop_val;
                         }
                     }
                 }
@@ -5987,6 +6642,7 @@ fn test_non0tab_build() {
         sparsity_ratio: 0.25,
         total_nonzero_ao: 640,
         total_nonzero_aop: 640,
+        total_stored_aop: 640,
         total_elements: 2560,
     };
     assert_eq!(nt.batch_ao_indices.len(), 2);
@@ -6046,6 +6702,7 @@ fn test_non0tab_clone() {
         sparsity_ratio: 1.0,
         total_nonzero_ao: 512,
         total_nonzero_aop: 512,
+        total_stored_aop: 512,
         total_elements: 512,
     };
     let nt2 = nt.clone();
@@ -6082,6 +6739,7 @@ fn test_non0tab_compress_roundtrip() {
         sparsity_ratio: 0.5,
         total_nonzero_ao: nao * ngrids / 2,
         total_nonzero_aop: 0,
+        total_stored_aop: 0,
         total_elements: nao * ngrids,
     };
 

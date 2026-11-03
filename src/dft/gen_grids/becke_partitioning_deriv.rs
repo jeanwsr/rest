@@ -17,6 +17,7 @@ use rest_libcint::gto::deriv_util::FpSimd;
 use rayon::prelude::*;
 use std::sync::Mutex;
 
+use super::becke_partitioning::RadiiAdjust;
 use super::bragg;
 use super::parameters;
 
@@ -239,17 +240,21 @@ impl BeckeMolTables {
 /// `[-0.5, 0.5]`; pairs of equal radii (within [`parameters::SMALL`]) get 0, so that
 /// `nu_ab = mu_ab`.  The matrix is anti-symmetric with a zero diagonal, the same
 /// convention the switch-function passes read `adjustment_factor[A][B]` for `B < A`.
-pub fn gen_adjustment_factor(proton_charges: &[i32]) -> Vec<Vec<f64>> {
+///
+/// `radii_adjust` selects whether the Bragg radii themselves (Becke, 1988) or their
+/// square roots (Treutler-Ahlrichs, 1995, the PySCF/PyFock default) enter `u_ab`. It must
+/// match the scheme used when the grid weights were built, otherwise the grid-shift terms
+/// would be inconsistent with the energy.
+pub fn gen_adjustment_factor(proton_charges: &[i32], radii_adjust: RadiiAdjust) -> Vec<Vec<f64>> {
     let natm = proton_charges.len();
     let radii: Vec<f64> = proton_charges.iter().map(|&c| bragg::get_bragg_angstrom(c)).collect();
     let mut adjustment_factor = vec![vec![0.0; natm]; natm];
     for A in 0..natm {
         for B in 0..A {
             if (radii[A] - radii[B]).abs() > parameters::SMALL {
-                let u_ab = (radii[A] + radii[B]) / (radii[B] - radii[A]);
-                let a_ab = u_ab / (u_ab * u_ab - 1.0);
-                adjustment_factor[A][B] = a_ab.min(0.5).max(-0.5);
-                adjustment_factor[B][A] = -adjustment_factor[A][B];
+                let a_ab = radii_adjust.factor(radii[A], radii[B]);
+                adjustment_factor[A][B] = a_ab;
+                adjustment_factor[B][A] = -a_ab;
             }
         }
     }

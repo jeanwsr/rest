@@ -288,6 +288,15 @@ fn dscal_n(n: usize, a: f64, x: &mut [f64]) {
     for v in &mut x[..n] { *v *= a; }
 }
 
+/// DAREAL E4 final solid-angle assembly (Fortran: `AREA = FOURPI - ASLICE - MOD(APOLY,FOURPI)`).
+///
+/// Uses Rust `%` (remainder, truncating toward zero) to match Fortran `MOD`.
+/// `rem_euclid` is NOT equivalent for negative `apoly` (differs by 4π).
+#[inline(always)]
+fn area0_from_apoly(fourpi: f64, aslice: f64, apoly: f64) -> f64 {
+    fourpi - aslice - apoly % fourpi
+}
+
 // ============================================================================
 //  3. Solvent-Specific Sigma Assignment
 // ============================================================================
@@ -1789,7 +1798,7 @@ fn dareal(
         apoly += (npoly as isize - nfree as isize) as f64 * twopi;
         // Fortran MOD truncates toward zero; Rust's % (rem) does the same.
         // rem_euclid would give the positive remainder, which differs by 4π for negative APOLY.
-        area0 = fourpi - aslice - apoly % fourpi;
+        area0 = area0_from_apoly(fourpi, aslice, apoly);
 
         if cds_debug_enabled() {
             println!("CDS_DEBUG| dareal k={} Phase E done: nfree={} npoly={} aslice={:.6e} apoly={:.6e} area0={:.6e}",
@@ -2170,4 +2179,213 @@ pub fn compute_cds(
     let gcds = gcds_kcal / TO_KCAL;
 
     (gcds, tarea, dcds)
+}
+
+// ============================================================================
+//  Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- sigma tables (water / ICDS=1) ----
+
+    /// 钉住 SIGMA_AQ 关键索引；s[110] 等非水表历史 bug 见 `build_sigma_tables`。
+    #[test]
+    fn test_sigma_aq_water_values() {
+        assert_eq!(SIGMA_AQ[1], 48.69);    // H
+        assert_eq!(SIGMA_AQ[6], 129.74);   // C
+        assert_eq!(SIGMA_AQ[9], 38.18);    // F
+        assert_eq!(SIGMA_AQ[16], -9.10);   // S
+        assert_eq!(SIGMA_AQ[17], 9.82);    // Cl
+        assert_eq!(SIGMA_AQ[35], -8.72);   // Br
+        assert_eq!(SIGMA_AQ[101], -72.95); // C–C
+        assert_eq!(SIGMA_AQ[103], 68.69);  // O–C
+        assert_eq!(SIGMA_AQ[105], -48.22); // N–C
+        assert_eq!(SIGMA_AQ[106], 121.98); // O–N
+        assert_eq!(SIGMA_AQ[114], 68.85);  // O–P
+        assert_eq!(SIGMA_AQ[116], 84.10);  // N–C(3)
+        for i in [0, 2, 8, 100, 102, 110, 150] {
+            assert_eq!(SIGMA_AQ[i], 0.0, "SIGMA_AQ[{i}] should be 0");
+        }
+    }
+
+    #[test]
+    fn test_hsigma_aq_only_hc() {
+        assert_eq!(HSIGMA_AQ[6], -60.77);
+        let nonzero: Vec<usize> = (0..151).filter(|&i| HSIGMA_AQ[i] != 0.0).collect();
+        assert_eq!(nonzero, vec![6], "HSIGMA_AQ 只应有 H–C 一项非零");
+    }
+
+    // ---- sigma basis tables (non-aqueous / ICDS=2) ----
+
+    /// s[110]（非水 C–N 修正）历史 bug：曾错写为 s[109]，导致非水溶剂静默归零。
+    #[test]
+    fn test_build_sigma_tables() {
+        assert_eq!(SIGMA_N_DATA[110], -99.76);
+        assert_eq!(SIGMA_A_DATA[110], 152.20);
+        assert_eq!(SIGMA_N_DATA[6], 58.10);
+        assert_eq!(SIGMA_N_DATA[16], -33.17);
+        assert_eq!(SIGMA_N_DATA[17], -24.31);
+        assert_eq!(SIGMA_N_DATA[35], -35.42);
+        assert_eq!(SIGMA_N_DATA[101], -62.05);
+        assert_eq!(SIGMA_N_DATA[103], -15.70);
+        assert_eq!(SIGMA_A_DATA[6], 48.10);
+        assert_eq!(SIGMA_A_DATA[8], 193.06);
+        assert_eq!(SIGMA_A_DATA[103], 95.99);
+        assert_eq!(SIGMA_A_DATA[105], -41.00);
+        assert_eq!(SIGMA_B_DATA[6], 32.87);
+        assert_eq!(SIGMA_B_DATA[8], -43.79);
+        assert_eq!(SIGMA_B_DATA[104], -128.16);
+        assert_eq!(SIGMA_B_DATA[106], 79.13);
+        assert_eq!(HSIGMA_N_DATA[6], -36.37);
+        assert_eq!(HSIGMA_N_DATA[8], -19.39);
+        // 未使用索引为 0，防误填
+        assert_eq!(SIGMA_N_DATA[9], 0.0);
+        assert_eq!(SIGMA_A_DATA[9], 0.0);
+        assert_eq!(SIGMA_B_DATA[110], 0.0);
+    }
+
+    #[test]
+    fn test_smd_cds_aq_copies_water_tables() {
+        let mut sigma = [0.0f64; 151];
+        let mut hsigma = [0.0f64; 151];
+        let cssigm = smd_cds_aq(&mut sigma, &mut hsigma);
+        assert_eq!(cssigm, 0.0, "water 的 cssigm 已吸收进 sigma 表，应为 0");
+        assert_eq!(sigma, SIGMA_AQ);
+        assert_eq!(hsigma, HSIGMA_AQ);
+    }
+
+    #[test]
+    fn test_smd_cds_naq_linear_combination() {
+        let mut sigma = [0.0f64; 151];
+        let mut hsigma = [0.0f64; 151];
+        // acetonitrile: n=1.3442, α=0.07, β=0.32, γ=41.25, φ=ψ=0
+        let (sola, solb, solc, solg, solh, soln) = (0.07, 0.32, 0.0, 41.25, 0.0, 1.3442);
+        let cssigm = smd_cds_naq(&mut sigma, &mut hsigma, sola, solb, solc, solg, solh, soln);
+        // σ(6) = σ_N·n + σ_A·α + σ_B·β
+        let expect_c = 58.10 * soln + 48.10 * sola + 32.87 * solb;
+        assert!((sigma[6] - expect_c).abs() < 1e-12);
+        // 键修正索引同样参与线性组合：σ(101) = -62.05·n
+        assert!((sigma[101] - (-62.05 * soln)).abs() < 1e-12);
+        // hσ(6) = -36.37·n
+        assert!((hsigma[6] - (-36.37 * soln)).abs() < 1e-12);
+        // cssigm = 0.35γ − 4.19φ² − 6.68ψ²
+        let expect_cssigm = 0.35 * solg - 4.19 * solc * solc - 6.68 * solh * solh;
+        assert!((cssigm - expect_cssigm).abs() < 1e-12);
+    }
+
+    // ---- geometry / mapping primitives ----
+
+    #[test]
+    fn test_rkkval_symmetric_and_known_values() {
+        assert_eq!(rkkval(1, 2), 1.55); // H–C
+        assert_eq!(rkkval(2, 2), 1.84); // C–C
+        assert_eq!(rkkval(2, 3), 1.84); // C–N
+        assert_eq!(rkkval(2, 4), 1.84); // C–O
+        assert_eq!(rkkval(4, 4), 2.75); // O–O
+        for i in 1..=11 {
+            for j in 1..=11 {
+                assert_eq!(rkkval(i, j), rkkval(j, i), "rkkval({i},{j}) 不对称");
+            }
+        }
+        // 越界 / 未参数化 → 0
+        assert_eq!(rkkval(0, 2), 0.0);
+        assert_eq!(rkkval(2, 0), 0.0);
+        assert_eq!(rkkval(12, 2), 0.0);
+        assert_eq!(rkkval(2, 12), 0.0);
+    }
+
+    #[test]
+    fn test_cot_val_boundary_and_derivative() {
+        let (r0, d) = (1.55, 0.30);
+        // r = R₀ → exp(-1)
+        let (c, dc) = cot_val(r0, r0, d);
+        assert!((c - (-1.0f64).exp()).abs() < 1e-14);
+        assert!(dc < 0.0, "dCOT/dr 应为负");
+        // r ≥ R₀+δ → (0, 0)
+        assert_eq!(cot_val(r0 + d, r0, d), (0.0, 0.0));
+        assert_eq!(cot_val(r0 + d + 0.5, r0, d), (0.0, 0.0));
+        // 0 < COT < 1，且随 r 增大而减小
+        let (c1, _) = cot_val(r0 + 0.1, r0, d);
+        let (c2, _) = cot_val(r0 + 0.2, r0, d);
+        assert!(c1 > c2 && c2 > 0.0 && c1 < 1.0);
+    }
+
+    #[test]
+    fn test_ij0_compressed_index() {
+        assert_eq!(ij0(0, 0), 0);
+        assert_eq!(ij0(0, 1), 1);
+        assert_eq!(ij0(1, 1), 2);
+        assert_eq!(ij0(0, 2), 3);
+        assert_eq!(ij0(1, 2), 4);
+        assert_eq!(ij0(2, 2), 5);
+        for i in 0..10 {
+            for j in 0..10 {
+                assert_eq!(ij0(i, j), ij0(j, i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_natcnv_mapping() {
+        assert_eq!(natcnv(1), 1);   // H
+        assert_eq!(natcnv(6), 2);   // C
+        assert_eq!(natcnv(7), 3);   // N
+        assert_eq!(natcnv(8), 4);   // O
+        assert_eq!(natcnv(9), 5);   // F
+        assert_eq!(natcnv(16), 6);  // S
+        assert_eq!(natcnv(17), 7);  // Cl
+        assert_eq!(natcnv(35), 8);  // Br
+        assert_eq!(natcnv(15), 9);  // P
+        assert_eq!(natcnv(53), 10); // I
+        assert_eq!(natcnv(14), 11); // Si
+        // 未参数化
+        assert_eq!(natcnv(0), 0);
+        assert_eq!(natcnv(2), 0);   // He
+        assert_eq!(natcnv(54), 0);  // Xe
+    }
+
+    #[test]
+    fn test_bondi_radii_table() {
+        assert_eq!(BONDI[1], 1.20);
+        assert_eq!(BONDI[6], 1.70);
+        assert_eq!(BONDI[7], 1.55);
+        assert_eq!(BONDI[8], 1.52);
+        assert_eq!(BONDI[9], 1.47);
+        assert_eq!(BONDI[16], 1.80);
+        // Z≥55 未使用，置 0（与 PySCF/mnsol 的差异点）
+        for z in 55..=102 {
+            assert_eq!(BONDI[z], 0.0, "BONDI[{z}] 应为 0");
+        }
+    }
+
+    // ---- DAREAL / workspace regressions ----
+
+    /// E4 面积公式必须用 Rust `%`（等价 Fortran MOD），不能用 `rem_euclid`。
+    #[test]
+    fn test_area0_from_apoly_fortran_mod() {
+        let fourpi = 4.0 * std::f64::consts::PI;
+        // 正 APOLY：两者一致
+        let a = area0_from_apoly(fourpi, 1.0, fourpi + 0.5);
+        assert!((a - (fourpi - 1.5)).abs() < 1e-12);
+        // 负 APOLY：% 保留被除数符号 → 加 0.5
+        let b = area0_from_apoly(fourpi, 1.0, -0.5);
+        assert!((b - (fourpi - 0.5)).abs() < 1e-12);
+        // rem_euclid 语义会得到 -0.5，与正确值差 4π
+        let wrong = fourpi - 1.0 - (-0.5f64).rem_euclid(fourpi);
+        assert!((b - wrong).abs() > 1.0);
+    }
+
+    /// 历史 bug：ncnct 曾用 `[ncross+1, ncross]`，装不下 2*(ncross-1) 个自由交点。
+    #[test]
+    fn test_dareal_ws_ncnct_shape() {
+        for ncross in 1..8 {
+            let ws = DarealWs::new(ncross);
+            assert_eq!(ws.ncnct.size, [2 * (ncross - 1) + 1, ncross]);
+            assert_eq!(ws.cosn.size, [3, ncross]);
+            assert_eq!(ws.ctheta.size, [ncross, ncross]);
+        }
+    }
 }

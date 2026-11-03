@@ -443,6 +443,11 @@ pub fn switch_h(x: f64) -> f64 {
 
 /// Solve V·x = b where V is symmetric positive definite, using Cholesky decomposition.
 /// Uses LAPACK's dpotrf (Cholesky) + forward/backward substitution.
+///
+/// This factors `V` on every call. When the same `V` is solved repeatedly (the
+/// RI-PCM path solves the auxiliary-basis metric on every SCF iteration), factor
+/// it once and use [`solve_cholesky_factorized`] instead: an `naux × naux`
+/// factorization dominates the solve and is geometry-only.
 pub fn solve_cholesky(v: &MatrixFull<f64>, b: &[f64]) -> Vec<f64> {
     let n = v.size[0];
     assert!(v.size[1] == n && b.len() == n, "solve_cholesky: dimension mismatch");
@@ -453,26 +458,39 @@ pub fn solve_cholesky(v: &MatrixFull<f64>, b: &[f64]) -> Vec<f64> {
     // Cholesky factorization: V = L·L^T (L stored in lower triangle)
     v_work.to_matrixfullslicemut().lapack_dpotrf(b'L');
 
+    solve_cholesky_factorized(&v_work, b)
+}
+
+/// Solve V·x = b from an **already computed** lower Cholesky factor of V.
+///
+/// `chol` must be the output of `lapack_dpotrf(b'L')` applied to V, i.e. V = L·Lᵀ
+/// with L in the lower triangle; only that triangle is read. The two triangular
+/// substitutions below are the same ones [`solve_cholesky`] performs, so the
+/// result is bit-identical to factor-and-solve on the same V.
+pub fn solve_cholesky_factorized(chol: &MatrixFull<f64>, b: &[f64]) -> Vec<f64> {
+    let n = chol.size[0];
+    assert!(chol.size[1] == n && b.len() == n, "solve_cholesky_factorized: dimension mismatch");
+
     let mut x = b.to_vec();
 
     // Forward substitution: L·y = b
-    // L[i,j] = v_work[(i, j)] for j <= i (lower triangle)
+    // L[i,j] = chol[(i, j)] for j <= i (lower triangle)
     for i in 0..n {
         let mut sum = 0.0;
         for j in 0..i {
-            sum += v_work[(i, j)] * x[j];
+            sum += chol[(i, j)] * x[j];
         }
-        x[i] = (x[i] - sum) / v_work[(i, i)];
+        x[i] = (x[i] - sum) / chol[(i, i)];
     }
 
     // Backward substitution: L^T·x = y
-    // L^T[i,j] = L[j,i] = v_work[(j, i)]
+    // L^T[i,j] = L[j,i] = chol[(j, i)]
     for i in (0..n).rev() {
         let mut sum = 0.0;
         for j in i+1..n {
-            sum += v_work[(j, i)] * x[j];
+            sum += chol[(j, i)] * x[j];
         }
-        x[i] = (x[i] - sum) / v_work[(i, i)];
+        x[i] = (x[i] - sum) / chol[(i, i)];
     }
 
     x
@@ -506,7 +524,10 @@ pub fn solve_lu(a: &MatrixFull<f64>, a_ipiv: &Vec<i32>, b: &[f64]) -> Option<Vec
             sum += a[(i,j)] * x[j];
         }
         if a[(i,i)].abs() < 1e-15 {
-            println!("Singular matrix detected at diagonal element {}", i);
+            println!(
+                "Singular matrix detected in solve_lu: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                n, i, a[(i,i)].abs()
+            );
             return None;
         }
         x[i] = (x[i] - sum) / a[(i,i)];
@@ -531,7 +552,13 @@ pub fn solve_lu_transpose(
         for j in 0..i {
             sum += lu[(j, i)] * x[j];
         }
-        if lu[(i, i)].abs() < 1e-15 { return None; }
+        if lu[(i, i)].abs() < 1e-15 {
+            println!(
+                "Singular matrix detected in solve_lu_transpose: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                n, i, lu[(i, i)].abs()
+            );
+            return None;
+        }
         x[i] = (x[i] - sum) / lu[(i, i)];
     }
 
@@ -554,4 +581,68 @@ pub fn solve_lu_transpose(
     }
 
     Some(x)
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_radius_scheme_scales_and_parsing() {
+        assert_eq!(RadiusScheme::Bondi.default_vdw_scale(), 1.2);
+        assert_eq!(RadiusScheme::UFF.default_vdw_scale(), 1.1);
+        assert_eq!(serde_json::from_str::<RadiusScheme>("\"bondi\"").unwrap(), RadiusScheme::Bondi);
+        assert_eq!(serde_json::from_str::<RadiusScheme>("\"uff\"").unwrap(), RadiusScheme::UFF);
+        assert!(serde_json::from_str::<RadiusScheme>("\"smd\"").is_err());
+    }
+
+    #[test]
+    fn test_smd_cavity_radii_parsing() {
+        assert_eq!(
+            serde_json::from_str::<SmdCavityRadii>("\"bondi\"").unwrap(),
+            SmdCavityRadii::Bondi
+        );
+        assert_eq!(
+            serde_json::from_str::<SmdCavityRadii>("\"uff_mixed\"").unwrap(),
+            SmdCavityRadii::BondiUff
+        );
+        assert!(serde_json::from_str::<SmdCavityRadii>("\"bogus\"").is_err());
+    }
+
+    /// R_O(α) 分段：α ≥ 0.43 → 1.52 Å；否则 1.52 + 1.8×(0.43−α)。返回值为 Bohr。
+    #[test]
+    fn test_smd_radii_oxygen_alpha_dependence() {
+        let r = smd_radii(0.43, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - 1.52 / BOHR).abs() < 1e-12);
+        let r = smd_radii(0.35, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - (1.52 + 1.8 * 0.08) / BOHR).abs() < 1e-12);
+        let r = smd_radii(0.0, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - (1.52 + 1.8 * 0.43) / BOHR).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_smd_radii_special_elements() {
+        let r = smd_radii(0.82, &[1, 6, 7, 9, 15, 16, 17], SmdCavityRadii::Bondi);
+        assert!((r[0] - 1.20 / BOHR).abs() < 1e-12); // H
+        assert!((r[1] - 1.85 / BOHR).abs() < 1e-12); // C
+        assert!((r[2] - 1.89 / BOHR).abs() < 1e-12); // N
+        assert!((r[3] - 1.73 / BOHR).abs() < 1e-12); // F
+        assert!((r[4] - 2.12 / BOHR).abs() < 1e-12); // P
+        assert!((r[5] - 2.49 / BOHR).abs() < 1e-12); // S
+        assert!((r[6] - 2.38 / BOHR).abs() < 1e-12); // Cl
+    }
+
+    /// 非 eq.16 元素按 scheme 走不同 fallback 表（Be 两表取值不同）。
+    #[test]
+    fn test_smd_radii_fallback_scheme() {
+        let r_bondi = smd_radii(0.5, &[4], SmdCavityRadii::Bondi);
+        let r_uff = smd_radii(0.5, &[4], SmdCavityRadii::BondiUff);
+        assert!((r_bondi[0] - data::VDW_RADII[4]).abs() < 1e-12);
+        assert!((r_uff[0] - data::BONDI_UFF_RADII[4]).abs() < 1e-12);
+        assert!((r_bondi[0] - r_uff[0]).abs() > 0.1, "两套 fallback 表应显著不同");
+    }
 }
