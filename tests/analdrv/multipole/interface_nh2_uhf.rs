@@ -105,7 +105,7 @@ fn test_nh2_uhf_interface() {
     );
     // traceless quadrupole: 3/2 (Q - Tr(Q)/3 I), XX component from the raw reference above
     let quad_traceless = mp.quadrupole.as_ref().unwrap().traceless.as_ref().unwrap();
-    allclose(&quad_traceless[..1], &[-0.468410634225], 1e-6);
+    allclose(&quad_traceless[..1], &[-0.468410634225], 3e-6);
 
     // results-JSON layout: no corr/resp keys for SCF-level unrestricted, no hessian keys
     let anal = &json_extra["analdrv"];

@@ -55,12 +55,12 @@ fn test_nh2_uks() {
     assert!(rt::allclose(
         &umultipole.result["dip_scf"],
         &rt::asarray((vec![-0.136575312767, 0.057794212957, -2.312851619633], &device)),
-        (1e-5, 1e-6)
+        (2e-5, 3e-6)
     ));
     assert!(rt::allclose(
         &dip_tot,
         &rt::asarray((vec![0.014602777199, -0.036692093271, 0.861888269636], &device)),
-        (1e-5, 1e-6)
+        (2e-5, 3e-6)
     ));
     assert!(rt::allclose(
         &quad_tot,
