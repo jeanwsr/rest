@@ -19,6 +19,7 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, check_memory_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -32,11 +33,13 @@ use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-
 use crate::utilities::memory_batch::{detect_available_memory_mb};
-
 #[cfg(feature = "mpi")]
 pub mod pt2_25d;
+#[cfg(feature = "mpi")]
+pub mod pt2_ASlide;
+#[cfg(feature = "mpi")]
+pub mod serviceportal;
 
 pub mod sbge2;
 pub mod sbge2_25d;
@@ -409,9 +412,14 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count_start("c_r5dft");
 
         #[cfg(feature = "mpi")]
-        let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
+        //let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
+        let use_25d = false;
+        #[cfg(feature = "mpi")]
+        let use_ASlide = check_conditions_ASlide(&scf_data, mpi_operator, &dfa_family_pos);
         #[cfg(not(feature = "mpi"))]
         let use_25d = false;
+        #[cfg(not(feature = "mpi"))]
+        let use_ASlide = false;
 
         #[cfg(feature = "mpi")]
         if use_25d {
@@ -436,7 +444,29 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-        if !use_25d {
+        else if (!use_25d) && use_ASlide {
+            pt2_c = match scf_data.scftype {
+                SCFType::RHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_aslide(scf_data,mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::UHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::ROHF => match dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                }
+            };
+        }
+        else {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
@@ -458,7 +488,6 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-
         timerecords.count("c_r5dft");
     } else {
         // Phase-0 guard (P0-1): the primitive path below implements ONLY the PT2 kernel.
@@ -3480,4 +3509,338 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
 
     omp_set_num_threads_wrapper(default_omp_num_threads);
     Ok([e_mp2_ss + e_mp2_os + e_single, e_mp2_os, e_mp2_ss])
+}
+
+#[cfg(feature = "mpi")]
+fn check_conditions_ASlide(
+    scf_data: &SCF,
+    mpi_operator: &Option<MPIOperator>,
+    dfa_family_pos: &crate::dft::DFAFamily,
+) -> bool {
+    // ASlide only implements the PT2 kernels today.
+    if !matches!(dfa_family_pos, crate::dft::DFAFamily::PT2) {
+        return false;
+    }
+    let mut use_ASlide = true;
+    
+    let (mpi_op, mpi_ix) = match (&mpi_operator, &scf_data.mol.mpi_data) {
+        (Some(op), Some(ix)) => (op, ix),
+        _ => return false,
+    };
+
+    let my_rank = mpi_ix.rank;
+
+    let local_n0_range = match &mpi_ix.auxbas {
+        Some(loc_auxbas) => loc_auxbas[my_rank].clone(),
+        None => {
+            eprintln!("Auxiliary basis distribution not initialized");
+            return false;
+        }
+    };
+
+    let ri3mo_vec = match &scf_data.ri3mo {
+        Some(vec) => vec,
+        None => {
+            eprintln!("RI3MO not initialized, fallback to primitive PT2");
+            return false;
+        }
+    };
+
+    let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+    let n0_local = rimo.size[0];
+    let n1_global = rimo.size[1];
+    let n2_global = rimo.size[2];
+
+    if n0_local != local_n0_range.len()
+        || n1_global != vir_range.len()
+        || n2_global != occ_range.len()
+    {
+        eprintln!("Inconsistent RI3MO dimensions, fallback to primitive PT2");
+        return false;
+    }
+
+    if n2_global < 20 {
+        eprintln!("num_occ smaller than 20, fallback to primitive PT2");
+        use_ASlide = false;
+    }
+    
+    // Hard lower bound from initialize_metadata_ASlide (k >= 2, num_block = k*grid_mult).
+    let P = mpi_op.size as usize;
+    let mut r = (P as f64).sqrt() as usize;
+    while P % r != 0 { r -= 1; }
+    let c = P / r;
+    let grid_mult = if r == c { r } else { P };
+    let min_n2 = 2 * grid_mult;
+    if n2_global < min_n2 {
+        eprintln!(
+            "ASlide needs n2_global >= {} (2 * grid_mult for P={}), got {}; \
+                fallback to primitive PT2",
+            min_n2, P, n2_global
+        );
+        use_ASlide = false;
+    }
+
+    if use_ASlide {
+        let mut n0_global_tmp: u64 = 0;
+        mpi_op.world.all_reduce_into( &(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+        let n0_global = n0_global_tmp as usize;
+        use_ASlide = check_memory_ASlide(mpi_op, n0_global, n1_global, n2_global);
+    }
+
+    let mut global_use_ASlide = false;
+    mpi_op.world.all_reduce_into(
+        &use_ASlide,
+        &mut global_use_ASlide,
+        &SystemOperation::logical_and(),
+    );
+    
+    global_use_ASlide
+}
+
+
+// Note on MPI safety: only a single sliding phase runs here (no αα/ββ/OS
+// split), there is exactly one block store, and the two Allreduce calls
+// below act as a hard synchronization point at function exit.  No barrier
+// between phases is needed.  This is NOT true for the open-shell driver,
+// which runs three phases and requires barriers (or disjoint virtual IDs)
+// between them.
+#[cfg(feature = "mpi")]
+pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+                }
+            let eigenvector = scf_data.eigenvectors.get(0).unwrap();
+            let eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let occupation = scf_data.occupation.get(0).unwrap();
+
+            let homo = scf_data.homo.get(0).unwrap().clone();
+            let lumo = scf_data.lumo.get(0).unwrap().clone();
+            let num_basis = eigenvector.size.get(0).unwrap().clone();
+
+            let num_state = eigenvector.size.get(1).unwrap().clone();
+            let start_mo: usize = scf_data.mol.start_mo;
+
+            let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
+            let (rimo, vir_range, occ_range) = &mut ri3mo_vec[0];
+            let n0_local = rimo.size[0];
+            let n1_global = rimo.size[1];
+            let n2_global = rimo.size[2];
+
+            //println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, n0_local, n1_global, n2_global, local_n0_range);
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, true);
+            // Mutable destructuring
+            let redistributed_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, rimo, n0_global, &local_n0_range);
+            assert_eq!(rimo.data.len(), 0);
+            let (local_os, local_ss) = computation_close_shell_aslide(mpi_op, &redistributed_rimo, &ctx, n0_global, n1_global, n2_global,
+                                                                    eigenvalues, occupation, occ_range.start, vir_range.start);
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
+}
+
+// All three phases (αα, ββ, OS) generate schedules with their own virtual-ID
+// space.  αα and ββ both use IDs 0..num_block, and ββ's portal cannot resolve
+// OS's num_block..2*num_block range.  Barrier between phases so no rank
+// enters phase N+1 while a peer is still answering phase N.  See commit
+// message for the failure modes (silent wrong energy αα→ββ, MPI_Abort ββ→OS).
+#[cfg(feature = "mpi")]
+pub fn open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() || ri3mo_vec[1].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+            }
+
+            let alpha_eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = scf_data.eigenvalues.get(1).unwrap();
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (left, right) = ri3mo_vec.split_at_mut(1);
+            let (alpha_rimo, vir_range, occ_range) = &mut left[0];
+            let (beta_rimo, _, _)                  = &mut right[0];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            assert_eq!(
+                alpha_rimo.size, beta_rimo.size,
+                "ASlide requires α and β rimo to share [n0, n1, n2]"
+            );
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, false);
+
+            // Mutable destructuring
+            let redistributed_alpha_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, alpha_rimo, n0_global, &local_n0_range);
+            assert_eq!(alpha_rimo.data.len(), 0);
+            let redistributed_beta_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, beta_rimo, n0_global, &local_n0_range);
+            assert_eq!(beta_rimo.data.len(), 0);
+
+            let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            mpi_op.world.barrier();
+            let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            mpi_op.world.barrier();
+            let local_ss = term_aa + term_bb;
+            let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
+                                                occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+            mpi_op.world.barrier();
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
+}
+
+#[cfg(feature = "mpi")]
+pub fn restricted_open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() || ri3mo_vec[1].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+            }
+
+            let alpha_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[0];
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[1];
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (left, right) = ri3mo_vec.split_at_mut(1);
+            let (alpha_rimo, vir_range, occ_range) = &mut left[0];
+            let (beta_rimo, _, _)                  = &mut right[0];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            assert_eq!(
+                alpha_rimo.size, beta_rimo.size,
+                "ASlide requires α and β rimo to share [n0, n1, n2]"
+            );
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, false);
+
+            // Mutable destructuring
+            let redistributed_alpha_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, alpha_rimo, n0_global, &local_n0_range);
+            assert_eq!(alpha_rimo.data.len(), 0);
+            let redistributed_beta_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, beta_rimo, n0_global, &local_n0_range);
+            assert_eq!(beta_rimo.data.len(), 0);
+
+            let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            mpi_op.world.barrier();
+            let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            mpi_op.world.barrier();
+            let local_ss = term_aa + term_bb;
+            let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
+                                                occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+            mpi_op.world.barrier();
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
 }
