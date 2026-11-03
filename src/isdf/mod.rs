@@ -750,6 +750,8 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             ao_compressed: None,
             aop_compressed: None,
             atm_idx: vec![center_index; ngrids],
+            ao_atm: Vec::new(),
+            atm_coords: Vec::new(),
             quadrature_weights: quad_r,
         };
         atom_grids.push(ao_grid)

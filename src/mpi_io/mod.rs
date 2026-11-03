@@ -219,6 +219,8 @@ impl MPIData {
             aop_compressed: None,
             atm_idx: local_atm_idx,
             quadrature_weights: local_quadrature_weights,
+            ao_atm: Vec::new(),
+            atm_coords: Vec::new(),
         }
         
     }

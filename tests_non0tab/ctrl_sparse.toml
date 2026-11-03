@@ -1,0 +1,25 @@
+[ctrl]
+xc = "b3lyp"
+basis_path = "cc-pvdz"
+eri_type = "ri-v"
+basis_type = "Spheric"
+spin = 1
+charge = 0
+print_level = 2
+num_threads = 4
+max_scf_cycle = 300
+scf_acc_rho = 1.0e-7
+scf_acc_eev = 1.0e-5
+ao_cutoff = 1.0e-8
+drop_dense_ao = false
+vxc_screen_threshold = 0.0
+use_dm_only = false
+[geom]
+elem = "O,H,H,O,H,H"
+position = """
+O     0.000000    0.000000    0.000000
+H     0.758602    0.000000    0.504284
+H     0.758602    0.000000   -0.504284
+O     0.000000    0.000000   15.000000
+H     0.758602    0.000000   15.504284
+H     0.758602    0.000000   14.495716"""

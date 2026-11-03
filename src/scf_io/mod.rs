@@ -46,6 +46,7 @@ use crate::initial_guess::sad::initial_guess_from_sad;
 use crate::dftd::energy::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+pub mod incremental;
 use crate::x2c::RelativisticMethod;
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
@@ -2184,7 +2185,7 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => if self.mol.ctrl.incremental_fock { incremental::cached_vj(self, mpi_operator) } else { self.generate_vj_with_ri_v_sync(1.0, mpi_operator) },
                 AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
                 AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
@@ -2204,7 +2205,7 @@ impl SCF {
             self.generate_vk_with_isdf_new(scaling_factor)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => if self.mol.ctrl.incremental_fock { incremental::cached_vk(self, scaling_factor, mpi_operator) } else { self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator) },
                 AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
@@ -2393,7 +2394,7 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-            AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => if self.mol.ctrl.incremental_fock { incremental::cached_vj(self, mpi_operator) } else { self.generate_vj_with_ri_v_sync(1.0, mpi_operator) },
             AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
             AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
@@ -2491,7 +2492,7 @@ impl SCF {
                     self.generate_vk_with_isdf_new(scaling_factor)
                 } else {
                     match self.algorithm_jk {
-                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => if self.mol.ctrl.incremental_fock { incremental::cached_vk(self, scaling_factor, mpi_operator) } else { self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator) },
                     AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
                     }
@@ -2513,8 +2514,12 @@ impl SCF {
             //let (exc,vxc) = self.generate_vxc(1.0);
             let _ = utilities::timing(&dt3, Some("evaluate vxc total"));
             if let Some((t_den, t_elem, t_gemm, t_scat, t_call)) = crate::dft::xc_timing::report_and_reset() {
-                println!("[xc-time] density {:.3}s | elem {:.3}s | gemm {:.3}s | scatter {:.3}s | contract_total {:.3}s (thread-seconds, divide by chunk count for wall)",
-                    t_den, t_elem, t_gemm, t_scat, t_call);
+                let skip_info = match crate::dft::batch_rho_cache::take_stats() {
+                    Some((s, t)) => format!(" | batch-skip {}/{} ({:.1}%)", s, t, 100.0 * s as f64 / t as f64),
+                    None => String::new(),
+                };
+                println!("[xc-time] density {:.3}s | elem {:.3}s | gemm {:.3}s | scatter {:.3}s | contract_total {:.3}s{} (thread-seconds, divide by chunk count for wall)",
+                    t_den, t_elem, t_gemm, t_scat, t_call, skip_info);
             }
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
@@ -2667,6 +2672,7 @@ impl SCF {
                 &solvent_static.pstatic.v_grids_n,
                 &solvent_static.pstatic.v_pq_chol,
                 ri_reuse.as_ref(),
+                solvent_static.pstatic.pg.as_ref(),
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
@@ -4687,11 +4693,58 @@ pub fn vj_upper_with_rimatr_sync_v02(
             let mut dm_s_upper = MatrixUpper::from_vec(num_baspar,dm[i_spin].iter_matrixupper().unwrap().map(|x| *x).collect_vec()).unwrap();
             dm_s_upper.iter_diagonal_mut().for_each(|x| {*x = *x/2.0});
 
-            let mut tmp_v = vec![0.0;num_auxbas];
+            // ---- rayon parallel contractions (replacing single-threaded BLAS dgemv) ------
+            // The tensor is [533133, 11642] = 49.6 GB. Two dgemv calls each stream the
+            // entire tensor (99.2 GB total memory traffic). BLAS dgemv on the OpenMP
+            // build achieves ~13 GB/s effective bandwidth (~7.7s); rayon over columns
+            // with each thread reading contiguous column blocks reaches node bandwidth
+            // (~1.7-2.0s, 4x speedup). Same pattern as the PCM cderi contractions.
+            let ri_data = &ri3fn.data[..];
+            let nrow = num_baspar;
+            let ncols = num_auxbas;
+            let dm_packed = &dm_s_upper.data[..];
 
-            _dgemv(ri3fn, &dm_s_upper.data, &mut tmp_v, 'T', 2.0, 0.0, 1, 1);
+            // pass 1: tmp[P] = 2.0 × Σ_pairs ri3fn[pair,P] × D[pair]
+            // (each column P is independent, contiguous in column-major storage)
+            let tmp_v: Vec<f64> = (0..ncols)
+                .into_par_iter()
+                .map(|c| {
+                    let col = &ri_data[c * nrow..(c + 1) * nrow];
+                    let mut s = 0.0_f64;
+                    for (av, xv) in col.iter().zip(dm_packed.iter()) {
+                        s += av * xv;
+                    }
+                    2.0 * s
+                })
+                .collect();
 
-            _dgemv(ri3fn, &tmp_v, &mut vj_spin.data, 'N',1.0,0.0,1,1);
+            // pass 2: J[pair] = Σ_P ri3fn[pair,P] × tmp[P]
+            // (parallel over column blocks, per-block row partials, then reduce)
+            let nthread = rayon::current_num_threads().max(1);
+            let block = ((ncols + nthread * 4 - 1) / (nthread * 4)).max(1);
+            let starts: Vec<usize> = (0..ncols).step_by(block).collect();
+            let partials: Vec<Vec<f64>> = starts
+                .into_par_iter()
+                .map(|c0| {
+                    let c1 = (c0 + block).min(ncols);
+                    let mut acc = vec![0.0_f64; nrow];
+                    for c in c0..c1 {
+                        let tc = tmp_v[c];
+                        if tc == 0.0 { continue; }
+                        let col = &ri_data[c * nrow..(c + 1) * nrow];
+                        for (av, accv) in col.iter().zip(acc.iter_mut()) {
+                            *accv += av * tc;
+                        }
+                    }
+                    acc
+                })
+                .collect();
+            vj_spin.data.iter_mut().for_each(|v| *v = 0.0);
+            for part in partials {
+                for (jv, pv) in vj_spin.data.iter_mut().zip(part.iter()) {
+                    *jv += pv;
+                }
+            }
 
         }
     }
@@ -5445,6 +5498,9 @@ pub fn vk_upper_with_ri_v_sync(
             let eigv_s = &eigv[i_spin];
             let nw = occupied_orbital_count(&occupation[i_spin]);
             if nw>0 {
+                if std::env::var("REST_K_STAT").is_ok() {
+                    println!("[k-stat] unscreened K: spin={} nw={} num_basis={} num_auxbas={}", i_spin, nw, num_basis, num_auxbas);
+                }
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
                 tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
                     .for_each(|value| {*value.0 = *value.1});
@@ -6416,6 +6472,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
         });
 
         // dm = wC*C^{T}
+        let _t_dm = std::time::Instant::now();
         _dgemm_full(&weight_eigv,'N',eigv_s, 'T',dm_s, 1.0, 0.0);
         //dm_s.lapack_dgemm(&mut weight_eigv, eigv_s, 'N', 'T', 1.0, 0.0);
         //dm_s.formated_output(5, "full");
@@ -6522,6 +6579,15 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // build below is already solvent-consistent (chkfile restart converges in
     // few iterations; also fixes the noiter path where solvent_scf stayed None)
     if scf_data.mol.ctrl.solvent_enabled {
+        scf_data.refresh_solvent_with_mpi(mpi_operator);
+    }
+    // ---- PCM-in-DIIS consistency (Gaussian l502 DISPCM=2 default) ------------------
+    // The DIIS seed record and the FIRST loop iteration's Fock must carry the solvent
+    // potential of the guess density. Without this, `solvent_scf` only appears after
+    // the first diagonalization, so the first two DIIS error vectors mix a PCM-less
+    // and a PCM-full Fock — an inconsistent history that pollutes the extrapolation
+    // for exactly the iterations where the guess is farthest from convergence.
+    if scf_data.mol.ctrl.solvent_enabled && scf_data.solvent_scf.is_none() {
         scf_data.refresh_solvent_with_mpi(mpi_operator);
     }
     scf_data.generate_hf_hamiltonian(mpi_operator);
@@ -6721,7 +6787,23 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             scf_data.print_homo_lumo_gap()
         };
         let dt1_3 = time::Local::now();
-        scf_converge = scf_data.check_scf_convergence(&scf_records);
+                scf_converge = scf_data.check_scf_convergence(&scf_records);
+        // ---- fresh-Fock validation gate ------------------------------------------------
+        // With the incremental Fock active, the criteria can pass while the cached J/K
+        // still lags the density by the last increment; the energy printed at that
+        // point would be systematically off (measured on a tight-criterion w30 run:
+        // 3.3e-3 Ha above the fully converged value, independent of the screening
+        // tightness). When the criteria pass on a stale cache, force one more
+        // iteration with a full rebuild — the accepted energy then comes from a Fock
+        // built at exactly the converged density.
+        if scf_data.mol.ctrl.incremental_fock
+            && (scf_converge[0] || scf_converge[1])
+            && incremental::fock_is_stale()
+        {
+            incremental::request_full_rebuild();
+            scf_converge = [false, false];
+            println!("[incremental] convergence criteria met on a lagged Fock: one fresh validation iteration follows");
+        }
         let dt1_4 = time::Local::now();
         
         // -------------------------
@@ -6840,7 +6922,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             let timecost = (dt1_2.timestamp_millis()-dt1_1.timestamp_millis()) as f64 /1000.0;
             println!("diagonalize_hamiltonian: {:10.2}s", timecost);
             let timecost = (dt1_3.timestamp_millis()-dt1_2.timestamp_millis()) as f64 /1000.0;
-            println!("generate_density_matrix: {:10.2}s", timecost);
+            println!("occupation+dm+pcm+homo: {:10.2}s", timecost);
             let timecost = (dt1_4.timestamp_millis()-dt1_3.timestamp_millis()) as f64 /1000.0;
             println!("check_scf_convergence:   {:10.2}s", timecost);
             let timecost = (dt1_5.timestamp_millis()-dt1_4.timestamp_millis()) as f64 /1000.0;

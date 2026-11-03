@@ -263,6 +263,10 @@ guessfile = "my_checkpoint.rchk"
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
+- `incremental_fock`: 取值bool。是否启用**密度增量 Fock**：当相邻两步的密度变化 `max|ΔD|` 落在 `scf_acc_rho` 与 `3 × scf_acc_rho` 之间时，J/K 直接复用缓存并只按密度差更新，省掉整张 RI 张量的重算。缺省为 false（实验性）。
+    - 复用只在收敛中段生效：`scf_acc_rho ≤ max|ΔD| < 3 × scf_acc_rho`。密度变化低于 `scf_acc_rho` 时强制全量重建，保证判据被接受时 Fock 与密度同步；连续复用满 4 步也强制重建一次。
+    - 收敛判据通过后还会多跑一次全量新鲜验证迭代，避免滞后的 Fock 使能量停在错误的收敛点。
+    - 能量误差与 `scf_acc_rho` 同量级（实测 w30 严格判据下与无增量路径差 < 1e-13 Ha）。适合迭代数多、单步 J/K 占比高的体系。默认关闭。
 
 ### 自洽场初猜相关关键词
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
@@ -324,6 +328,11 @@ chkfile = "mychk.rchk"
 - `ediis_switch_gap`：取值f64。预留关键词。当前实现中 EDIIS→DIIS 的切换由 DIIS 误差范数自动确定（阈值 1e-3），本关键词暂不生效。缺省为 0.1。
 - `adiis_penalty`：取值f64。ADIIS 惩罚参数 μ（Hu-Yang, JCP 2010, 132, 054109）。缺省为 0.5。仅当 `mixer = "adiis+diis"` 时生效。
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
+- `dynamic_damping`: 取值bool。是否在 DIIS 尚未接管的**早期迭代**（`num_iter < start_diis_cycle`）对密度做自适应阻尼。缺省为 false。
+    - 开启后，下一步的 Fock 由阻尼密度 `D_in + α·(D_out − D_in)` 构建，而不是直接用本轮的原始输出 `D_out`。α 取 0.5；当最大密度变化超过 0.1 a.u.（强振荡，例如数百 Ha 量级的能量跳变）时取 0.25。密度变化落到 `damping_error_threshold` 以下后自动关闭。
+    - 该选项只作用于 DIIS 之前的阶段。与已启用的 DIIS 外推叠加时会同时存在阻尼、Pulay 外推与振荡触发的线性混合三种机制，实测在开壳层过渡金属体系上互相破坏稳定性（能量千 Ha 级振荡），因此不要与 `start_diis_cycle = 1` 同时依赖。
+    - 适用于 DIIS 首轮即失控、需要先压住早期振荡的体系。绝大多数体系保持缺省 false。
+- `damping_error_threshold`: 取值f64。`dynamic_damping = true` 时的密度变化阈值（最大元，a.u.），低于该值不施加阻尼。缺省为 1.0e-3
 - `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
     - `"fermi"`：Fermi-Dirac 展宽
     - `"gaussian"`：Gaussian 展宽  
