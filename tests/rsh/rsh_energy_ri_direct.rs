@@ -75,7 +75,7 @@ fn test_wb97x_energy() {
 fn test_lc_blyp_energy() {
     let scf = run_scf("lc-blyp");
     let pyscf_ref = -55.1845937756802;
-    assert!(scf.mol.xc_data.is_rsh());
+    assert!(scf.mol.dfadef.is_rsh());
     println!("REST LC-BLYP: {:.12}", scf.scf_energy);
     assert!((scf.scf_energy - pyscf_ref).abs() < 1e-5,
         "LC-BLYP energy mismatch: REST={} pyscf={}", scf.scf_energy, pyscf_ref);

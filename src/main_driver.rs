@@ -380,6 +380,10 @@ pub fn main_driver() -> anyhow::Result<()> {
                     }
                     geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark, &mpi_operator)
                         .map_err(|e| anyhow::anyhow!("Geometry optimization (geometric_pyo3 engine) failed: {}", e))?;
+                    // MOM (`mom_gap_check = "last"`): one S0 SCF at the geometry the
+                    // optimization ended on, for the adiabatic gap of the final
+                    // structure (the per-step variant runs inside the state guard).
+                    scf_data.mom_final_gap_report(&mpi_operator);
                     println!("Geometry after relaxation [Ang]:");
                     println!("{}", scf_data.mol.geom.formated_geometry());
                     time_mark.count("geom_opt");
@@ -712,7 +716,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     // RPA
     //--------------------------
-    if scf_data.mol.xc_data.is_rpa() {
+    if scf_data.mol.dfadef.is_rpa() {
         if let Some(e) = yamaguchi_tot {
             println!("The RPA energy        : {:18.10} Ha", e);
         } else {
@@ -724,7 +728,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     // DH / ZRPS / SCSRPA
     //--------------------------
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         if let Some(e) = yamaguchi_tot {
             println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
@@ -766,6 +770,28 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     }
 
     //==================================================================
+    // MOM (`force_state_occupation`): is this still the state that was asked
+    // for? The guard compares the current determinant with the ground-state
+    // determinant built from the same orbitals (one extra Fock build), with the
+    // spin signature of the first converged step and with the tracked-orbital
+    // overlap (`SCF::mom_state_check`, docs/dscf_s1_geomopt_plan.md A3). It runs
+    // BEFORE the reference commit: a state that fails the check must not become
+    // the reference of the following steps.
+    //==================================================================
+    scf_data.mom_state_check(mpi_operator);
+
+    //==================================================================
+    // MOM: roll the maximum-overlap reference forward to this geometry step's
+    // converged orbitals, so that the next step of a geometry optimization
+    // compares against its own predecessor instead of against the first
+    // (Franck-Condon) geometry.
+    // No-op unless `[ctrl] mom_strategy = "step"` (the default) and an
+    // occupation constraint is present; nothing is committed when the SCF
+    // did not converge. See `SCF::mom_commit_reference`.
+    //==================================================================
+    scf_data.mom_commit_reference();
+
+    //==================================================================
     // Store the open-shell singlet energies (E_mix / K_ab / E_T / E_S)
     // so that the chkfile and the total-energy collection see the
     // spin-purified ROKS total energy E_S = 2 E_mix - E_T
@@ -793,7 +819,7 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     // Now evaluate the advanced correction energy for the given method
     //==================================================================
     //let mut time_mark = utilities::TimeRecords::new();
-    if let Some(dft_method) = &scf_data.mol.xc_data.dfa_family_pos {
+    if let Some(dft_method) = &scf_data.mol.dfadef.family_pos() {
         match dft_method {
             dft::DFAFamily::PT2 | dft::DFAFamily::SBGE2 => {
                 //time_mark.new_item("PT2", "the PT2 evaluation");
@@ -845,6 +871,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     //====================================
     let mut total_energy = scf_data.scf_energy;
 
+
     if scf_data.mol.ctrl.oss_roks {
         // ROKS: the total energy is the spin-purified open-shell singlet
         // E_S = 2 E_mix - E_T, stored by store_oss_energies at the SCF
@@ -853,9 +880,9 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         // FIRST: for an OSS + double-hybrid job the xdh branch below would
         // otherwise return E_mix(DH) instead of E_S(DH).
         total_energy = scf_data.energies.get("oss_e_singlet").unwrap()[0];
-    } else if scf_data.mol.xc_data.is_rpa() {
+    } else if scf_data.mol.dfadef.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
-    } else if scf_data.mol.xc_data.is_fifth_dfa() {
+    } else if scf_data.mol.dfadef.is_fifth_dfa() {
         total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
     } else {
         total_energy = scf_data.scf_energy;
@@ -884,7 +911,7 @@ fn initialize_time_record(mol: &Molecule) -> utilities::TimeRecords {
         },
         _ => {}
     };
-    if let Some(dft_method) = &mol.xc_data.dfa_family_pos {
+    if let Some(dft_method) = &mol.dfadef.family_pos() {
         match dft_method {
             dft::DFAFamily::PT2 | dft::DFAFamily::SBGE2 => {
                 time_mark.new_item("PT2", "the PT2 evaluation");
@@ -919,6 +946,23 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     // branch (would differentiate E_mix, not E_S) would give wrong results.
     if scf_data.mol.ctrl.oss_roks {
         panic!("ERROR: rohf-oss: forces / geometry optimization are not yet supported for oss_roks (planned for Phase 2, Step 5)");
+    }
+
+    // A force / geometry-optimization step of a MOM state must not differentiate
+    // a state the SCF did not settle on: which determinant is being computed is
+    // decided by the overlap selection inside the SCF, so a non-converged step
+    // can belong to a *different* determinant than the previous one, and the
+    // optimizer would receive a discontinuous energy and a meaningless gradient.
+    // Fail closed instead of continuing silently.
+    if !scf_data.mol.ctrl.force_state_occupation.is_empty() && !scf_data.scf_converged {
+        panic!(
+            "ERROR: the SCF of this force / geometry-optimization step with force_state_occupation \
+             (MOM) did not converge (or the iteration was skipped with [ctrl] noiter), so the \
+             electronic state of this geometry is not defined and its gradient cannot be used. \
+             Either make the step converge -- raise [ctrl] max_scf_cycle, check scf_acc_rho / \
+             scf_acc_etot, add [ctrl] mix_param damping, or reduce the geometry step via \
+             [geometric_pyo3] tmax -- or verify the state by hand at this geometry first."
+        );
     }
 
     time_mark.count_start("force");
@@ -958,8 +1002,8 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // 1) analytical RHF, UHF force
         // 2) dftd force
         // 3) doubly-hybrid (PT2-family) correlation gradient, as a separate entry
-        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
-        if scf_data.mol.xc_data.is_fifth_dfa() && !is_dh {
+        let is_dh = matches!(scf_data.mol.dfadef.family_pos(), Some(crate::dft::DFAFamily::PT2));
+        if scf_data.mol.dfadef.is_fifth_dfa() && !is_dh {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
         }
         if is_dh && mpi_operator.is_some() {
@@ -1009,7 +1053,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             }
         }
 
-        let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
 
         // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.
@@ -1027,13 +1071,18 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
         // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
         // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
-        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        let is_dh = matches!(scf_data.mol.dfadef.family_pos(), Some(crate::dft::DFAFamily::PT2));
         let dh_needs_grids = {
-            let xc_data = &scf_data.mol.xc_data;
-            let final_xc = xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
+            let dfadef = &scf_data.mol.dfadef;
+            let has_libxc = |comps: Option<&Vec<crate::dft::parse_xc::DFAComponent>>| {
+                comps.map_or(false, |comps| {
+                    comps.iter().any(|c| c.component_type == crate::dft::parse_xc::ComponentType::Libxc)
+                })
+            };
+            let final_xc = has_libxc(dfadef.xc_nscf.as_ref());
             let delta_hyb =
-                xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
-            final_xc || delta_hyb.abs() > 1.0e-10 || !xc_data.dfa_compnt_scf.is_empty()
+                dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
+            final_xc || delta_hyb.abs() > 1.0e-10 || has_libxc(dfadef.xc_scf.as_ref())
         };
         if is_dh && dh_needs_grids && scf_data.grids.is_none() {
             scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
@@ -1198,7 +1247,7 @@ fn eval_normal_modes(
     time_mark: &mut utilities::TimeRecords,
     mpi_operator: &Option<MPIOperator>,
 ) {
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
 
@@ -1574,7 +1623,7 @@ mod geometric_pyo3_impl {
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
                     // post-SCF (fifth-DFA) methods have no analytic hessian; reject before any
                     // response object is built (the DFT grids it would need are already freed)
-                    if scf_data.mol.xc_data.is_fifth_dfa() {
+                    if scf_data.mol.dfadef.is_fifth_dfa() {
                         panic!("Normal modes calculation is currently not available for post-SCF methods.");
                     }
                     // shared response object for the hessian, per the SCF type

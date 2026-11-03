@@ -24,14 +24,14 @@ impl DispSpec {
     /// Resolve the dispersion specification from the molecule.
     /// Returns `None` if no empirical dispersion is specified.
     pub fn resolve(mol: &Molecule) -> Option<Self> {
-        let disp_from_parse_xc = mol.dfadef.as_ref().map(|dfadef| dfadef.has_dispersion()).unwrap_or(false);
+        let disp_from_parse_xc = mol.dfadef.has_dispersion();
         let disp_from_ctrl = mol.ctrl.empirical_dispersion.is_some();
         if disp_from_parse_xc && disp_from_ctrl {
             panic!("Empirical dispersion is specified in both xc and empirical_dispersion. Please specify it in only one place to avoid ambiguity.");
         }
 
         if disp_from_parse_xc {
-            let comp = mol.dfadef.as_ref().unwrap().get_dispersion().unwrap();
+            let comp = mol.dfadef.get_dispersion().unwrap();
             // VV10 is a density-based non-local correlation term evaluated on
             // the quadrature grid during the SCF, not an empirical pairwise
             // dispersion correction.

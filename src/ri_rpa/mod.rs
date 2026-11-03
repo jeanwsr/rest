@@ -123,8 +123,8 @@ pub fn rpa_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     }
 
 
-    let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
-    let hy_coeffi_pot = if let Some(coeff) = scf_data.mol.xc_data.dfa_hybrid_pos {coeff} else {0.0};
+    let hy_coeffi_scf = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hy_coeffi_pot = scf_data.mol.dfadef.dfa_hybrid_nscf.unwrap_or(0.0);
     //let hy_coeffi_rpa = if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {coeff.clone()} else {vec![0.0,0.0]};
     let xdh_rpa_energy: f64 = rpa_c_energy;
     //println!("Exc_scf: ({:?},{:?}),Exc_pos: ({:?},{:?})",xc_energy_scf,hy_coeffi_scf,xc_energy_xdh,hy_coeffi_xdh);

@@ -39,41 +39,19 @@ use crate::ri_pt2::PT2FPMode;
 use crate::SCF;
 
 use enumflags2::BitFlags;
-use libxc::prelude::*;
 
 /// J/K factors of the RI-JK part of the (restricted) final-energy functional of a DH.
 ///
 /// The final functional carries the full Coulomb (`factor_j = 1`) and its own hybrid coefficient
-/// `dfa_hybrid_pos` (for an HF final functional without DFT parts, the full exchange). Compare
+/// `dfa_hybrid_nscf` (for an HF final functional without DFT parts, the full exchange). Compare
 /// [`scf_jk_factors`](super::rresp_interface::scf_jk_factors) for the SCF-iteration functional.
 pub fn dh_jk_factors(scf_data: &SCF) -> (f64, f64) {
-    let xc_data = &scf_data.mol.xc_data;
-    // the final functional's total hybrid coefficient; absent `dfa_hybrid_pos` (post-SCF family
+    let dfadef = &scf_data.mol.dfadef;
+    // the final functional's total hybrid coefficient; absent `dfa_hybrid_nscf` (post-SCF family
     // without its own functional), the final functional is the SCF functional. For an HF final
     // functional (e.g. MP2 correlation on HF), this correctly yields the full exchange 1.0.
-    let factor_k = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf);
+    let factor_k = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf);
     (1.0, factor_k)
-}
-
-/// List of `(scale, functional)` pairs of the final-energy functional's DFT (XC numint) part
-/// (spin-unpolarized); `None` when the final functional has no DFT part.
-pub fn dh_xc_func_list(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    let xc_data = &scf_data.mol.xc_data;
-    let (xc_code, xc_params) = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-        // a present-but-empty component list (pure-MP2-family post-SCF methods) carries no DFT
-        // part; treated the same as absent, so no empty KS contribution object is built
-        (Some(code), Some(_)) if code.is_empty() => return None,
-        (Some(code), Some(param)) => (code, param),
-        (None, None) => return None,
-        _ => panic!("dfa_compnt_pos and dfa_paramr_pos must be present or absent together."),
-    };
-    Some(
-        xc_code
-            .iter()
-            .zip(xc_params.iter())
-            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-            .collect_vec(),
-    )
 }
 
 /// Solve the Z-vector (CP-SCF) equation for a Lagrangian of the (combined) post-SCF contributions.
@@ -392,11 +370,11 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
         scf_data.mol.start_mo, 0,
         "RGFockDH does not support frozen-core double hybrids yet (mol.start_mo != 0)."
     );
-    match scf_data.mol.xc_data.dfa_family_pos {
+    match scf_data.mol.dfadef.family_pos() {
         Some(DFAFamily::PT2) => {}
         _ => panic!("RGFockDH currently requires the PT2 post-SCF family (ri_pt2 correlation)."),
     }
-    if scf_data.mol.xc_data.omega().is_some() {
+    if scf_data.mol.dfadef.omega().is_some() {
         panic!(
             "RGFockDH does not support range-separated double hybrids yet: the final-energy \
              functional's range separation is not stored in xc_data (only the SCF functional's \
@@ -405,12 +383,13 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
     }
     let [c_os, c_ss] = scf_data
         .mol
-        .xc_data
-        .dfa_paramr_adv
+        .dfadef
+        .fifth_rung_component()
+        .expect("RGFockDH requires the fifth-rung spin factors (os/ss parameters).")
+        .param_positional
         .clone()
-        .expect("RGFockDH requires the PT2 spin factors (dfa_paramr_adv).")
         .try_into()
-        .expect("dfa_paramr_adv must have exactly two entries (c_os, c_ss).");
+        .expect("the fifth-rung factors must have exactly two entries (c_os, c_ss).");
 
     let nocc = mo_occ.view().greater(0).sum();
 
@@ -442,7 +421,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- DFT (final-energy functional, common SCF grid) --- //
 
-    if let Some(xc_func_list) = dh_xc_func_list(scf_data) {
+    if let Some(xc_func_list) = scf_data.mol.dfadef.nscf_func_list(1) {
         let mol = get_cint_mol(&scf_data.mol);
         let grids = scf_data.grids.as_ref().expect(
             "The DH generalized Fock requires the SCF grids; note xdh_calculations frees them, so build this interface before it or regenerate the grids in between.",

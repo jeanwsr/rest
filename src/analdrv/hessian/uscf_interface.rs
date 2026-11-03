@@ -2,7 +2,7 @@ use crate::analdrv::prelude::*;
 use super::print_hessian_and_timing;
 use crate::analdrv::hessian::rscf_interface::{scf_proton_charges, scf_skeleton_nimatmul};
 use crate::analdrv::response::rresp_interface::scf_jk_factors;
-use crate::analdrv::response::uresp_interface::{scf_xc_func_list_uks, URespSCF};
+use crate::analdrv::response::uresp_interface::URespSCF;
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dftd::hess::HessDFTD;
@@ -126,7 +126,7 @@ pub fn uscf_hess_interface<'a>(
         let verbose = scf_data.mol.ctrl.print_level > 2;
         let grid_shift = cfg.grid_shift_deriv;
         let proton_charges = scf_proton_charges(scf_data);
-        UHessKSNIMatmul::new(&mol, scf_xc_func_list_uks(scf_data), ni, grid_shift, proton_charges, verbose)
+        UHessKSNIMatmul::new(&mol, scf_data.mol.dfadef.scf_func_list(2), ni, grid_shift, proton_charges, verbose)
     });
     if let Some(ref mut hess_nimatmul_obj) = hess_nimatmul_obj {
         hess_el_list.push(hess_nimatmul_obj);

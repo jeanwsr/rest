@@ -161,6 +161,94 @@ pub enum JobType {
     MD,
 }
 
+/// How the maximum-overlap reference of `force_state_occupation` is updated
+/// (keyword `[ctrl] mom_strategy`). See docs/dscf_s1_geomopt_plan.md, A2.
+///
+/// Both variants use the same overlap criterion ("the occupied orbital is the
+/// one that overlaps most with the reference"); they differ only in **when the
+/// reference is replaced**, which is the distinction between the two methods in
+/// the literature:
+///
+/// - `Initial` never replaces it, so every comparison is against the
+///   wavefunction read from the chkfile/guessfile (or, for a scan, against the
+///   first geometry). This is the *initial* maximum overlap method (IMOM;
+///   Barca, Gilbert, Gill, JCTC 14, 1501 (2018)) and it is the behaviour before
+///   this keyword existed.
+/// - `Step` (default) replaces it with the converged orbitals of each geometry
+///   step, which keeps the comparison local along a path: the reference then
+///   differs from the current orbitals only by one geometry step, so an
+///   excited-state geometry optimization does not lose the state as the geometry
+///   moves away from the Franck-Condon point.
+///
+/// The literature's plain maximum overlap method (Gilbert, Besley, Gill, JPCA
+/// 112, 13164 (2008)) replaces the reference at every SCF **iteration**; that
+/// variant is deliberately not implemented (see the plan document: the input
+/// layer requires a converged external reference, so its only use case -- a poor
+/// initial guess -- cannot occur here, and it risks contaminating the DIIS
+/// history). The keyword name `iteration` is reserved and refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MomStrategy {
+    Initial,
+    Step,
+}
+
+impl Default for MomStrategy {
+    fn default() -> Self {
+        MomStrategy::Step
+    }
+}
+
+impl MomStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MomStrategy::Initial => "initial",
+            MomStrategy::Step => "step",
+        }
+    }
+}
+
+/// Whether the MOM state guard aborts the job or only warns
+/// (keyword `[ctrl] mom_guard`, default `"enforce"`).
+///
+/// The guard (`SCF::mom_state_check`) decides whether the calculation is still the
+/// electronic state that was asked for. A force or geometry optimization of the
+/// wrong state produces a confident, wrong structure, which is worse than a stop,
+/// so the default aborts on a failed check. `"warn"` downgrades every check to a
+/// printed line -- for deliberately exploring a suspicious region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MomGuard {
+    Enforce,
+    Warn,
+}
+
+impl Default for MomGuard {
+    fn default() -> Self {
+        MomGuard::Enforce
+    }
+}
+
+/// When to run the extra S0 SCF that turns the guard's frozen-orbital gap into a
+/// real adiabatic gap (keyword `[ctrl] mom_s0_check`, default `"off"`).
+///
+/// - `Off`: no extra SCF.
+/// - `Each`: one restricted S0 SCF per geometry step (costs about one SCF per
+///   step; gives the full MOM-S0 gap curve, which is where an avoided crossing
+///   shows up).
+/// - `Last`: one S0 SCF at the geometry the optimization ended on (cheap, gives
+///   the adiabatic gap of the final structure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MomS0Check {
+    Off,
+    Each,
+    Last,
+}
+
+impl Default for MomS0Check {
+    fn default() -> Self {
+        MomS0Check::Off
+    }
+}
+
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
 /// Hamiltonian in MPI runs.
 ///
@@ -299,9 +387,6 @@ pub struct InputKeywords {
     pub xc: String,
     pub xc_type: DFTType,
     // == for the non_standard setting of DFA ==
-    pub xc_namelist: Option<Vec<String>>,
-    pub xc_paralist: Option<Vec<f64>>,
-    pub dfa_hybrid_scf: Option<f64>,
     // =========================================
     // == for the non_standard setting of DFA ==
     pub xc_model: Option<String>,
@@ -522,6 +607,21 @@ pub struct InputKeywords {
     pub ndipole_displacement: f64,
     pub nhessian_displacement: f64,
     pub force_state_occupation: Vec<ForceStateOccupation>,
+    /// When to replace the maximum-overlap reference of `force_state_occupation`
+    /// (keyword `mom_strategy`, default `"step"`). See [`MomStrategy`].
+    pub mom_strategy: MomStrategy,
+    /// Whether a failed MOM state check aborts or only warns (`mom_guard`,
+    /// default `enforce`). See [`MomGuard`].
+    pub mom_guard: MomGuard,
+    /// When to run the extra S0 SCF for a real adiabatic gap (`mom_s0_check`,
+    /// default `off`). See [`MomS0Check`].
+    pub mom_s0_check: MomS0Check,
+    /// Abort when `E(MOM) - E(S0)` drops below this value (eV, default 0.05).
+    /// The only tunable guard threshold, and the only criterion that can tell
+    /// "the state is no longer an excited state". Needs `mom_s0_check = "each"`.
+    /// (The second criterion, the tracked-orbital overlap, has no keyword: it is
+    /// a fixed 0.2 cosine, see `scf_io::mom_guard`.)
+    pub mom_s0_gap_abort: f64,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
     /// Maximum memory available to **this MPI process** in MB, `None` if no limit.
@@ -655,9 +755,6 @@ impl InputKeywords {
             // Keywords associated with the method employed
             xc: String::from("x3lyp"),
             xc_type: DFTType::Standard,
-            xc_namelist: None,
-            xc_paralist: None,
-            dfa_hybrid_scf: None,
             xc_model: None,
             empirical_dispersion: None,
             post_xc: vec![],
@@ -761,6 +858,10 @@ impl InputKeywords {
             frac_tolerant: 1.0e-3,
             auxiliary_reference_states: Vec::new(),
             force_state_occupation: Vec::new(),
+            mom_strategy: MomStrategy::Step,
+            mom_guard: MomGuard::Enforce,
+            mom_s0_check: MomS0Check::Off,
+            mom_s0_gap_abort: 0.05,
             rpa_de_excitation_parameters: None,
             max_memory: None,
             max_memory_backup: None,
@@ -795,7 +896,7 @@ impl InputKeywords {
             solvent_name: String::new(),
             solvent_descriptors: None, 
             stop_at: None,
-            xc_parser: String::from("legacy"),
+            xc_parser: String::from("parse_xc"),
             j2c_decomp: J2CDecompOption::default(),
             ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
@@ -898,14 +999,11 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             println!("The exchange-correlation method: {}", ctrl.xc);
         },
         DFTType::NonStandard => {
-            if let (Some(xc_namelist), Some(xc_paralist), Some(dfa_hybrid_scf)) = (&ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf) {
-                println!("Nonstandard exchange-correlation method with {:16.8} exact exchange is employed:", dfa_hybrid_scf);
-                xc_namelist.iter().zip(xc_paralist.iter()).for_each(|(xc_name, xc_para)| {
-                    println!("    Component: {:>20}, parameter: {:16.8}", xc_name, xc_para);
-                });
-            } else {
-                panic!("Error:: xc_namelist, xc_paralist and xc_hybrid_para should be specified for nonstandard xc method")
-            }
+            panic!(
+                "Error:: DFTType::NonStandard is removed. Please use xc_parser = 'parse_xc' \
+                 with the xc expression syntax instead, e.g. xc_parser = 'parse_xc' and \
+                 xc = '0.5*gga_x_pbe + 0.5*gga_c_pbe + hf*0.2'."
+            )
         },
         DFTType::DeepLearning => {
             if let Some(xc_model) = &ctrl.xc_model {
@@ -1015,6 +1113,31 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         };
         for fso in ctrl.force_state_occupation.iter_mut() {
             fso.normalize_ref_index(actual_file);
+        }
+        // The MOM reference lifecycle (keyword mom_strategy, default "step"):
+        // "initial" keeps the reference read from the file for the whole job
+        // (the initial maximum overlap method); "step" replaces it with the
+        // converged orbitals of each geometry step so the overlap comparison
+        // stays local along a path.
+        info!("MOM (force_state_occupation) reference strategy: {:?} ({})",
+            ctrl.mom_strategy, ctrl.mom_strategy.as_str());
+        if ctrl.mom_strategy == MomStrategy::Step {
+            info!("  the reference is re-committed after every converged SCF step (rolling); \
+                   set mom_strategy = \"initial\" to keep the file reference fixed (IMOM)");
+        }
+        // Every geometry step writes the chkfile. If that file is also the MOM
+        // reference, the reference is silently replaced by the excited-state
+        // wavefunction and a restart would track the wrong orbitals.
+        if ctrl.has_chkfile {
+            let chk = ctrl.chkfile.clone();
+            if ctrl.force_state_occupation.iter().any(|f| f.ref_index() == chk.as_str()) {
+                warn!(
+                    "force_state_occupation: the chkfile ({}) is also the MOM reference, but every \
+                     geometry step overwrites it. Use a separate `chkfile` name (or feed the \
+                     reference through `guessfile`) so the reference stays readable.",
+                    chk
+                );
+            }
         }
     }
 
@@ -1385,39 +1508,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {
                     DFTType::Standard
                 },
-            };
-            // to be deprecated
-            tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
-                serde_json::Value::Array(tmp_op) => {
-                    let mut tmp_vec:Vec<String> = vec![];
-                    tmp_op.iter().for_each(|x| {
-                        let op_type = x.to_string();
-                        let string_len = op_type.len();
-                        tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
-                    });
-                    Some(tmp_vec)
-                },
-                other => {None},
-            };
-            tmp_input.xc_paralist = match tmp_ctrl.get("xc_paralist").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Array(tmp_op) => {
-                    let tmp_vec:Vec<f64> = tmp_op.iter().map(|x| {
-                        match x {
-                            serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
-                            serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
-                            other => {0.0},
-                        }
-                    }).collect::<Vec<f64>>();
-                    Some(tmp_vec)
-                },
-                other => {None},
-            };
-            //
-            tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
-                serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
-                other => {None}
             };
             tmp_input.xc_model = match tmp_ctrl.get("xc_model").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {
@@ -2053,6 +2143,64 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => vec![],
             };
 
+            // mom_strategy: when to replace the maximum-overlap reference of
+            // force_state_occupation (default "step" = roll it along the path).
+            tmp_input.mom_strategy = match tmp_ctrl.get("mom_strategy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_strategy) => match tmp_strategy.to_lowercase().as_str() {
+                    "step" | "rolling" => MomStrategy::Step,
+                    "initial" | "imom" => MomStrategy::Initial,
+                    "iteration" | "mom" => panic!(
+                        "ERROR: mom_strategy = \"{}\" (the literature's maximum overlap method, which \
+                         re-commits the reference at every SCF iteration) is not implemented in this \
+                         version. Use \"step\" (default; re-commit after each converged geometry step) \
+                         or \"initial\" (the initial maximum overlap method, IMOM).",
+                        tmp_strategy
+                    ),
+                    other => panic!(
+                        "ERROR: unknown mom_strategy \"{}\". Valid values: \"step\" (default), \"initial\".",
+                        other
+                    ),
+                },
+                serde_json::Value::Null => MomStrategy::Step,
+                other => panic!("ERROR: mom_strategy must be a string, got {:?}", other),
+            };
+
+            // mom_guard / mom_s0_check: the state guard's action, and whether it
+            // also runs an S0 SCF per step or at the final geometry
+            // (docs/dscf_s1_geomopt_plan.md, A3).
+            tmp_input.mom_guard = match tmp_ctrl.get("mom_guard").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_guard) => match tmp_guard.to_lowercase().as_str() {
+                    "enforce" => MomGuard::Enforce,
+                    "warn" => MomGuard::Warn,
+                    other => panic!(
+                        "ERROR: unknown mom_guard \"{}\". Valid values: \"enforce\" (default; a failed \
+                         state check aborts a force / geometry-optimization job), \"warn\".",
+                        other
+                    ),
+                },
+                serde_json::Value::Null => MomGuard::Enforce,
+                other => panic!("ERROR: mom_guard must be a string, got {:?}", other),
+            };
+            tmp_input.mom_s0_check = match tmp_ctrl.get("mom_s0_check").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_gap) => match tmp_gap.to_lowercase().as_str() {
+                    "off" => MomS0Check::Off,
+                    "each" | "step" => MomS0Check::Each,
+                    "last" | "final" => MomS0Check::Last,
+                    other => panic!(
+                        "ERROR: unknown mom_s0_check \"{}\". Valid values: \"off\" (default), \
+                         \"each\" (one S0 SCF per geometry step), \"last\" (one at the final geometry).",
+                        other
+                    ),
+                },
+                serde_json::Value::Null => MomS0Check::Off,
+                other => panic!("ERROR: mom_s0_check must be a string, got {:?}", other),
+            };
+            tmp_input.mom_s0_gap_abort = match tmp_ctrl.get("mom_s0_gap_abort").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(0.05),
+                serde_json::Value::String(tmp_str) => tmp_str.parse().unwrap_or(0.05),
+                other => 0.05,
+            };
+
             //
             tmp_input.auxiliary_reference_states = match tmp_ctrl.get("auxiliary_reference_states").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_chk) => vec![(String::from("none"),0)],
@@ -2408,7 +2556,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
-                other => String::from("legacy"),
+                other => String::from("parse_xc"),
             };
             
             tmp_input.analdrv_tasks = match tmp_ctrl.get("analdrv_tasks").unwrap_or(&serde_json::Value::Null) {

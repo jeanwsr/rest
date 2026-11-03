@@ -1670,9 +1670,9 @@ impl RIRHFHessian<'_> {
         // hybrid DFA (e.g. B3LYP, hyb=0.2) scales the K term by hyb so that
         //   h_partial = e1 + ej - hyb*ek        (PySCF df/hessian/rks.py:60)
         //   h1ao      = h1 + vj1 - 0.5*hyb*vk1  (PySCF df/hessian/rks.py:109)
-        let is_dft = !scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_dft = scf_data.mol.dfadef.is_dfa_scf();
         let factor_k = if is_dft {
-            scf_data.mol.xc_data.dfa_hybrid_scf
+            scf_data.mol.dfadef.dfa_hybrid_scf
         } else {
             1.0
         };
@@ -1686,13 +1686,9 @@ impl RIRHFHessian<'_> {
         }
     }
 
-    /// Check if this is an RKS (DFT) calculation: non-empty XC functional list.
-    fn is_rks(&self) -> bool {
-        !self.scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
-    }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
-        self.scf_data.mol.xc_data.is_hybrid()
+        self.scf_data.mol.dfadef.is_hybrid()
     }
 
     pub fn print_timings(&self) {
@@ -2709,7 +2705,7 @@ impl RIRHFHessian<'_> {
         // Scatters directly into the live h_partial buffer (zero new allocation).
         // The implementation lives in rks.rs; split-borrow of self.result.data
         // and self.timings from a shared &SCF ref compiles cleanly here.
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             let scf = self.scf_data;
             let hp_data = &mut self
                 .result
@@ -3307,7 +3303,7 @@ impl RIRHFHessian<'_> {
 
         // Per-atom: h1ao = hcore_deriv + vj1 - 0.5*vk1 + vxc_deriv1
         let _t_vxc_d1 = std::time::Instant::now();
-        let vxc_d1: Option<Vec<Vec<f64>>> = if self.is_rks() {
+        let vxc_d1: Option<Vec<Vec<f64>>> = if self.scf_data.mol.dfadef.is_dfa_scf() {
             Some(crate::hessian::rks::compute_vxc_h1ao(scf))
         } else {
             None
@@ -3723,7 +3719,7 @@ impl RIRHFHessian<'_> {
                 );
             }
         }
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             self.timings
                 .push(("  rks: vxc_deriv1", _t_vxc_d1.elapsed()));
         }
@@ -3987,11 +3983,11 @@ impl RIRHFHessian<'_> {
             // RKS: hybrid exchange scaling (0.5*hyb for closed-shell). For HF
             // (no DFA components), hyb=1.0 so k_scaling=0.5, recovering the
             // historical J - 0.5*K response.
-            let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+            let is_hf = !scf.mol.dfadef.is_dfa_scf();
             let hyb_e1 = if is_hf {
                 1.0
             } else {
-                scf.mol.xc_data.dfa_hybrid_scf
+                scf.mol.dfadef.dfa_hybrid_scf
             };
             let k_scaling_e1 = 0.5 * hyb_e1;
             for ia in 0..natm {

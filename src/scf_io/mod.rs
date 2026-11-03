@@ -136,6 +136,24 @@ pub struct SCF {
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
+    /// Rolling maximum-overlap reference of `force_state_occupation` (MOM): the
+    /// converged orbitals of the previous geometry step, committed by
+    /// [`SCF::mom_commit_reference`] when `[ctrl] mom_strategy = "step"`.
+    ///
+    /// `ref_eigenvectors` holds the wavefunction read from the chkfile/guessfile
+    /// and never changes, so a geometry optimization would keep comparing every
+    /// step against the first (Franck-Condon) geometry, i.e. it would run the
+    /// *initial* maximum overlap method. Rolling the reference keeps the overlap
+    /// comparison local along the path. See docs/dscf_s1_geomopt_plan.md, A2.
+    pub mom_running_ref: Option<force_state_occupation::MomRunningRef>,
+    /// Number of committed rolling references (diagnostics: the geometry step).
+    pub mom_commit_count: usize,
+    /// `<S^2>` of the first converged step of a MOM job: the spin signature of the
+    /// state that was asked for. `mom_state_check` compares against it
+    /// (docs/dscf_s1_geomopt_plan.md, A3).
+    pub mom_s2_ref: Option<f64>,
+    /// Report of the most recent [`SCF::mom_state_check`].
+    pub mom_last_report: Option<MomStateReport>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
     /// Spin-resolved quasiparticle energies: (G energies, W energies), indexed [spin].
@@ -161,6 +179,12 @@ pub struct SCF {
     pub rimatr_pair_map: Option<ri_jk::PairMap>,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    /// Whether the last SCF procedure converged (set by `scf_without_build` after
+    /// the iteration loop; also read by the MD driver). The MOM reference
+    /// lifecycle ([`SCF::mom_commit_reference`]: never commit a half-converged
+    /// state) and the force driver (`eval_force`: never differentiate a state
+    /// the SCF did not settle on) rely on it as well. `[ctrl] noiter` leaves it
+    /// `false`. See docs/dscf_s1_geomopt_plan.md, A2.
     pub scf_converged: bool,
     /// Raw TDDFT eigenvectors from the last `tddft_main` call:
     /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
@@ -195,6 +219,8 @@ pub enum SCFType {
 mod oss_roks;
 pub use self::oss_roks::oss_homo_lumo_scan;
 pub use self::oss_roks::OssTripletCache;
+mod mom_guard;
+pub use self::mom_guard::MomStateReport;
 
 impl SCF {
     pub fn init_scf(mol: &Molecule) -> SCF {
@@ -229,6 +255,10 @@ impl SCF {
             eigenvectors: [MatrixFull::empty(),
                            MatrixFull::empty()],
             ref_eigenvectors: HashMap::new(),
+            mom_running_ref: None,
+            mom_commit_count: 0,
+            mom_s2_ref: None,
+            mom_last_report: None,
             //density_matrix: [MatrixFull::new([1,1],0.0),
             //                     MatrixFull::new([1,1],0.0)],
             density_matrix: vec![MatrixFull::empty(),
@@ -293,7 +323,7 @@ impl SCF {
                 // Therefore, even though "spin_polarization=False" is specified as input, we handle it as "spin_channel=2".
                 scf_data.mol.ctrl.spin_channel=2;
                 scf_data.mol.spin_channel=2;
-                scf_data.mol.xc_data.spin_channel=2;
+                scf_data.mol.spin_channel=2;
             },
             SCFType::UHF => {
                 info!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")
@@ -339,7 +369,7 @@ impl SCF {
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
             // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
-            let scale_rsh = if mol.xc_data.is_rsh() { 2.0 } else { 1.0 };
+            let scale_rsh = if mol.dfadef.is_rsh() { 2.0 } else { 1.0 };
             // TODO: for safety, we add factor 1.5 to the memory requirement
             let mem_cderi_mb = 1.5 * scale_rsh * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
@@ -404,12 +434,7 @@ impl SCF {
         }
         //========================================
         // For emperial dispersion correction
-        let mut disp_from_parse_xc = false;
-        if let Some(dfadef) = &self.mol.dfadef {
-        if dfadef.has_dispersion() {
-            disp_from_parse_xc = true;
-        }
-        }
+        let disp_from_parse_xc = self.mol.dfadef.has_dispersion();
         let disp_from_ctrl = self.mol.ctrl.empirical_dispersion.is_some();
         if disp_from_ctrl || disp_from_parse_xc {
             // (energy, grad, sigma); fallback to this default value if dftd evaluation fails
@@ -417,7 +442,7 @@ impl SCF {
             let (engy_disp, grad_disp, sigma_disp) = dftd(&self.mol).unwrap_or(default_disp);
 
             let disp_name = if disp_from_parse_xc {
-                self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()
+                self.mol.dfadef.get_dispersion().unwrap().func.clone()
             } else {
                 self.mol.ctrl.empirical_dispersion.clone().unwrap()
             };
@@ -534,7 +559,7 @@ impl SCF {
         let ri3fn_full = if use_eri_jk {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
         let ri3fn_symm = if use_eri_jk {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
-        let is_rsh = self.mol.xc_data.is_rsh();
+        let is_rsh = self.mol.dfadef.is_rsh();
 
         // For RSH: J uses on-the-fly shell-based ERI (generate_vj_on_the_fly_par).
         // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
@@ -642,7 +667,7 @@ impl SCF {
 
         // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
-            let omega = self.mol.xc_data.omega().unwrap();
+            let omega = self.mol.dfadef.omega().unwrap();
             info!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             if ri3fn_symm {
                 // Note: SR RI omega is negative in libcint's convention.
@@ -840,7 +865,7 @@ impl SCF {
                 grids.aop = None;
             }
         } else {
-            self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
+            self.grids = if self.mol.dfadef.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
                 let grids = Grids::build(&mut self.mol);
                 info!("Grid size: {:}", grids.coordinates.len());
                 Some(grids)
@@ -870,7 +895,7 @@ impl SCF {
             }
         }
 
-        if self.mol.xc_data.nlc_vv10.is_some() && self.nlc_grids.is_none() {
+        if self.mol.dfadef.is_nlc() && self.nlc_grids.is_none() {
             let mut nlc_grids = Grids::build_with_level(&self.mol, self.mol.ctrl.grid_gen_level);
             nlc_grids.prepare_tabulated_ao(&self.mol);
             if self.mol.ctrl.print_level > 0 {
@@ -881,7 +906,7 @@ impl SCF {
     }
 
     fn evaluate_nlc_vv10(&self) -> Option<(f64, Vec<MatrixUpper<f64>>)> {
-        let (b, c) = self.mol.xc_data.nlc_vv10?;
+        let (b, c) = self.mol.dfadef.vv10_params()?;
         let grids = self.nlc_grids.as_ref()?;
         Some(crate::dft::nlc::vv10_exc_vxc(
             &self.mol,
@@ -974,7 +999,8 @@ impl SCF {
 
 
     pub fn generate_occupation(&mut self) {
-        (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
+        // `self` is already the `&mut SCF` binding (reborrowed for the call).
+        (self.occupation, self.homo, self.lumo) = generate_occupation_outside(self);
         // For the restricted open-shell singlet, persist the open-shell
         // orbital indices (a, b) once the occupation has been generated for
         // the first time (automatic choice: a = nc, b = nc + 1). The fixed
@@ -2301,7 +2327,7 @@ impl SCF {
         let scaling_factor = match self.scftype {
             SCFType::RHF => -0.5,
             _ => -1.0,
-        }*self.mol.xc_data.dfa_hybrid_scf ;
+        }*self.mol.dfadef.dfa_hybrid_scf ;
         if ! scaling_factor.eq(&0.0) {
             //let vk = self.generate_vk_with_ri_v(scaling_factor);
             let vk = self.generate_vk_with_erifold4_sync(scaling_factor);
@@ -2315,7 +2341,7 @@ impl SCF {
             };
         }
         let dt3 = time::Local::now();
-        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+        if self.mol.dfadef.is_dfa_scf() {
             let (exc,vxc) = self.generate_vxc(1.0);
             //println!("{:?}",vxc[0].data);
             for i_spin in (0..spin_channel) {
@@ -2390,8 +2416,8 @@ impl SCF {
         // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
         let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
 
-        if let Some((omega, alpha, _)) = self.mol.xc_data.rsh_params() {
-            let hyb = self.mol.xc_data.dfa_hybrid_scf;
+        if let Some((omega, alpha, _)) = self.mol.dfadef.rsh_params_scf() {
+            let hyb = self.mol.dfadef.dfa_hybrid_scf;
             let scaling_kfull = base_scaling * alpha;           // alpha * K_full
             let scaling_ksr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
 
@@ -2457,7 +2483,7 @@ impl SCF {
                 }
             }
         } else {
-            let scaling_factor = base_scaling * self.mol.xc_data.dfa_hybrid_scf;
+            let scaling_factor = base_scaling * self.mol.dfadef.dfa_hybrid_scf;
             if ! scaling_factor.eq(&0.0) {
                 let use_dm_only = self.mol.ctrl.use_dm_only;
                 let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
@@ -2478,7 +2504,7 @@ impl SCF {
             }
         }
         let dt3 = time::Local::now();
-        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+        if self.mol.dfadef.is_dfa_scf() {
             //let (exc,vxc) = self.generate_vxc_rayon_dm_only(1.0);
             let (_, exc,vxc) = if self.mol.ctrl.use_dm_only {
                 self.generate_vxc_mpi_rayon_dm_only(1.0, mpi_operator)
@@ -2776,7 +2802,7 @@ impl SCF {
 //        let scaling_factor = match self.scftype {
 //            SCFType::RHF => -0.5,
 //            _ => -1.0,
-//        }*self.mol.xc_data.dfa_hybrid_scf ;
+//        }*self.mol.dfadef.dfa_hybrid_scf ;
 //        if ! scaling_factor.eq(&0.0) {
 //            let use_dm_only = self.mol.ctrl.use_dm_only;
 //            let vk = if self.mol.ctrl.use_isdf{
@@ -2794,7 +2820,7 @@ impl SCF {
 //            };
 //        }
 //        let dt3 = time::Local::now();
-//        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+//        if self.mol.dfadef.is_dfa_scf() {
 //            let (_, exc,vxc) = self.generate_vxc_mpi_rayon_dm_only(1.0, mpi_operator);
 //            //let (exc,vxc) = self.generate_vxc(1.0);
 //            let _ = utilities::timing(&dt3, Some("evaluate vxc total"));
@@ -2828,7 +2854,7 @@ impl SCF {
 //    }
 
     pub fn generate_hf_hamiltonian_for_guess(&mut self) {
-        if self.mol.xc_data.dfa_compnt_scf.len() == 0 {
+        if !self.mol.dfadef.is_dfa_scf() {
             if self.mol.ctrl.eri_type.eq("analytic") {
                 self.generate_hf_hamiltonian_erifold4();
             } else if  self.mol.ctrl.eri_type.eq("ri_v") {
@@ -2891,7 +2917,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         let mut exc_total = 0.0;
         let mut vxc_total = 0.0;
-        if self.mol.xc_data.dfa_compnt_scf.len() == 0 {
+        if !self.mol.dfadef.is_dfa_scf() {
             if self.mol.ctrl.eri_type.eq("analytic") {
                 self.generate_hf_hamiltonian_erifold4();
             } else if  self.mol.ctrl.eri_type.eq("ri_v") {
@@ -2985,8 +3011,10 @@ impl SCF {
                 let exc_dldfa = crate::dft::deep_learning::dl_hybrid_xc_energy(&energy_components);
                 // 3) update the DL-DFA xc potential 
                 let next_dfa_paramr_scf = crate::dft::deep_learning::dl_hybrid_xc_param(&energy_components);
-                self.mol.xc_data.dfa_hybrid_scf = next_dfa_paramr_scf[1];
-                self.mol.xc_data.dfa_paramr_scf = next_dfa_paramr_scf[2..].to_vec();
+                self.mol.dfadef.dfa_hybrid_scf = next_dfa_paramr_scf[1];
+                for (i, comp) in self.mol.dfadef.xc_scf.as_mut().expect("DL-DFA must carry SCF components").iter_mut().enumerate() {
+                    comp.factor = next_dfa_paramr_scf[2 + i];
+                }
             },
             _ => {}
         }
@@ -3057,19 +3085,18 @@ impl SCF {
             panic!("Only RI_V version has been implemented for SCF::evaluate_energy_components")
         };
         //println!("Exc[HF] = {:16.8}", exc_hf);
-        let current_dfa = &self.mol.xc_data;
+        let funcs = self.mol.dfadef.scf_func_list(self.mol.spin_channel);
         let xc_energy_list = if let Some(grids) = &self.grids {
-            let xc_code_list = &current_dfa.dfa_compnt_scf;
-            self.mol.xc_data.xc_exc_list(
-                xc_code_list, 
+            crate::dft::xc_exc_list(
+                &funcs, 
+                self.mol.spin_channel,
                 grids, 
                 &self.density_matrix, 
                 &self.eigenvectors, 
                 &self.occupation
             )
         } else {
-            let code_list = &self.mol.xc_data.dfa_compnt_scf;
-            vec![[0.0,0.0];code_list.len()]
+            vec![[0.0,0.0];funcs.len()]
         };
 
         let mut xc_energy_list: Vec<f64> = xc_energy_list.iter().map(|energy| energy[0]+energy[1]).collect();
@@ -3081,8 +3108,8 @@ impl SCF {
             xc_energy_list = tot_xc_list;
         }
 
-        let mut exc_total = exc_hf * current_dfa.dfa_hybrid_scf;
-        xc_energy_list.iter().zip(current_dfa.dfa_paramr_scf.iter()).for_each(|(xc_energy, &param)| {
+        let mut exc_total = exc_hf * self.mol.dfadef.dfa_hybrid_scf;
+        xc_energy_list.iter().zip(funcs.iter().map(|(factor, _)| factor)).for_each(|(xc_energy, &param)| {
             exc_total += xc_energy * param
         });
 
@@ -3154,7 +3181,15 @@ impl SCF {
         let mo = &mut self.eigenvectors;
         let occ = &mut self.occupation;
         if let Some(grids) = &mut self.grids {
-            exc_spin = self.mol.xc_data.xc_exc(grids, spin_channel,dm, mo, occ,iop, mpi_operator);
+            // iop = 0: the SCF functional's components; iop = 1: the final-energy
+            // functional's components, taken from the DFAdef (the narrowed xc_data
+            // carries no post-SCF state)
+            let funcs = match iop {
+                0 => self.mol.dfadef.scf_func_list(spin_channel),
+                1 => self.mol.dfadef.nscf_func_list(spin_channel).unwrap_or_default(),
+                other => panic!("evaluate_xc_energy: unknown iop {other}"),
+            };
+            exc_spin = crate::dft::xc_exc(&funcs, grids, spin_channel, dm, mo, occ, mpi_operator);
         }
         let exc:f64 = exc_spin.iter().sum();
         exc
@@ -3449,7 +3484,8 @@ impl SCF {
         let print_level = self.mol.ctrl.print_level;
         if let Some(grids) = &self.grids {
             let dt0 = utilities::init_timing();
-            let (exc,mut vxc_ao) = self.mol.xc_data.xc_exc_vxc(grids, spin_channel,dm, mo, occ, print_level);
+            let funcs = self.mol.dfadef.scf_func_list(spin_channel);
+            let (exc,mut vxc_ao) = crate::dft::xc_exc_vxc(&funcs, grids, spin_channel,dm, mo, occ, print_level);
             let dt1 = utilities::timing(&dt0, Some("Total vxc_ao time"));
             exc_spin = exc;
             if let Some(ao) = &grids.ao {
@@ -3522,9 +3558,9 @@ impl SCF {
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
                 omp_set_num_threads_wrapper(1);
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
-                // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold, 0.0);
+                let funcs = self.mol.dfadef.scf_func_list(spin_channel);
+                let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots_dm_only(&funcs, range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {
@@ -3724,9 +3760,9 @@ impl SCF {
                 omp_set_num_threads_wrapper(1);
 
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
-                // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold, 0.0);
+                let funcs = self.mol.dfadef.scf_func_list(spin_channel);
+                let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots(&funcs, range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {
@@ -6319,7 +6355,7 @@ fn occupation_is_index_contiguous(scf_data: &SCF) -> bool {
     })
 }
 
-pub fn generate_occupation_outside(scf_data: &SCF) -> ([Vec<f64>;2], [usize;2], [usize;2]) {
+pub fn generate_occupation_outside(scf_data: &mut SCF) -> ([Vec<f64>;2], [usize;2], [usize;2]) {
     let mut occ = [vec![],vec![]];
     let mut homo = [0,0];
     let mut lumo = [0,0];
@@ -6344,7 +6380,20 @@ pub fn generate_occupation_outside(scf_data: &SCF) -> ([Vec<f64>;2], [usize;2], 
         &scf_data.scftype, 
         &scf_data.eigenvectors, 
         &scf_data.ovlp, 
-        &scf_data.ref_eigenvectors);
+        &scf_data.ref_eigenvectors,
+        scf_data.mom_running_ref.as_ref());
+        // The projection above runs on a scratch copy of the constraints (it
+        // needs `&mut`, while this function reads the molecule). Its result --
+        // which orbital currently carries the constraint, in which channel, with
+        // what overlap -- is the state of the calculation, and the MOM reference
+        // lifecycle (`SCF::mom_commit_reference`, which rolls `prev_state` with
+        // the reference) has to see it. Without this write-back the control block
+        // keeps its initial `curr_state = 0` and a commit would roll the tracked
+        // orbital to index 0 -- i.e. the state silently collapses to whatever
+        // orbital 0 is.
+        for (dst, src) in scf_data.mol.ctrl.force_state_occupation.iter_mut().zip(force_occ.iter()) {
+            dst.set_selection(src.get_curr_state(), src.get_curr_spin(), src.get_overlap());
+        }
         if scf_data.mol.ctrl.print_level>=2 {
             let mut window = [occ[0].len()-1,0];
             force_occ.iter().map(|x| x.get_check_window())
@@ -7334,6 +7383,108 @@ impl SCF {
         e
     }
 
+}
+
+impl SCF {
+    /// Commit the converged orbitals of this geometry step as the
+    /// maximum-overlap reference of the next one (`[ctrl] mom_strategy = "step"`,
+    /// the default; `"initial"` never commits, which is the *initial* maximum
+    /// overlap method and reproduces the behaviour before this feature).
+    ///
+    /// The reference of `force_state_occupation` is otherwise the wavefunction
+    /// read from the chkfile/guessfile, read exactly once per job. A geometry
+    /// optimization re-enters the SCF at every step with `initial_guess =
+    /// "inherit"` (no file is read again), so without this commit every step
+    /// would keep comparing its orbitals against the *first* geometry and the
+    /// state would silently be lost once the geometry moves far enough.
+    ///
+    /// Two things happen together here, and the second is easy to forget:
+    ///
+    /// 1. the current orbitals (both channels) become the running reference;
+    /// 2. `prev_state <- curr_state` for every entry that addresses this
+    ///    reference, because the index that the projection found is an index of
+    ///    the *current* orbital list, which now becomes the reference list. If
+    ///    the indices are not rolled with the reference, the next comparison
+    ///    looks for the wrong orbital.
+    ///
+    /// Nothing is committed when the SCF did not converge (the state of this
+    /// step is then unreliable, and a committed reference would poison the rest
+    /// of the path).
+    pub fn mom_commit_reference(&mut self) {
+        if self.mol.ctrl.force_state_occupation.is_empty() {
+            return;
+        }
+        if self.mol.ctrl.mom_strategy == crate::ctrl_io::MomStrategy::Initial {
+            return;
+        }
+        // A single-point job never consumes the rolled reference again (the
+        // next job re-reads the file), so skipping the commit keeps its log and
+        // its results identical to the pre-A2 behaviour.
+        if matches!(self.mol.ctrl.job_type, crate::ctrl_io::JobType::SinglePoint) {
+            return;
+        }
+        if !self.scf_converged {
+            if self.mol.ctrl.print_level >= 1 {
+                println!("[MOM] the SCF did not converge: the rolling reference is NOT updated (this geometry step is unreliable)");
+            }
+            return;
+        }
+        if self.eigenvectors[0].data.is_empty() {
+            return;
+        }
+        let Some(key) = self.mol.ctrl.force_state_occupation.first().map(|f| f.ref_index().to_string()) else {
+            return;
+        };
+        // The reference and the tracked indices have to move together. A zero
+        // overlap means the projection produced no selection for that entry (it
+        // did not run, or the search window found nothing), so rolling now could
+        // only point the next comparison at an arbitrary orbital.
+        if self.mol.ctrl.force_state_occupation.iter()
+            .filter(|f| f.ref_index() == key.as_str())
+            .any(|f| f.get_overlap() <= 0.0)
+        {
+            if self.mol.ctrl.print_level >= 1 {
+                println!("[MOM] the overlap projection produced no selection for this step: the rolling reference is NOT updated (the tracked index would become arbitrary)");
+            }
+            return;
+        }
+        self.mom_commit_count += 1;
+        self.mom_running_ref = Some(force_state_occupation::MomRunningRef::new(
+            key.clone(),
+            [self.eigenvectors[0].clone(), self.eigenvectors[1].clone()],
+            self.mol.num_basis,
+            self.mol.num_state,
+            self.mol.spin_channel,
+            self.mom_commit_count,
+        ));
+
+        let mut lines: Vec<String> = Vec::new();
+        for fso in self.mol.ctrl.force_state_occupation.iter_mut() {
+            if fso.ref_index() != key.as_str() {
+                continue;
+            }
+            let (prev_idx, curr_idx) = (fso.get_prev_state(), fso.get_curr_state());
+            let (curr_spin, ovlp) = (fso.get_curr_spin(), fso.get_overlap());
+            fso.commit_state();
+            if prev_idx == curr_idx {
+                lines.push(format!(
+                    "  tracked orbital {} (channel {}): overlap {:8.5} -> committed as the new reference",
+                    curr_idx, curr_spin, ovlp
+                ));
+            } else {
+                lines.push(format!(
+                    "  WARNING: tracked orbital moved {} -> {} (channel {}, overlap {:8.5}); the reference now follows the new index -- check that this is the intended state",
+                    prev_idx, curr_idx, curr_spin, ovlp
+                ));
+            }
+        }
+        if self.mol.ctrl.print_level >= 1 {
+            println!("[MOM] step {}: rolling reference committed from the converged orbitals", self.mom_commit_count);
+            for line in lines {
+                println!("{}", line);
+            }
+        }
+    }
 }
 
 impl SCF {

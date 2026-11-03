@@ -63,7 +63,6 @@ use std::ops::Range;
 use rest_tensors::RIFull;
 use rest_tensors::{TensorOpt, MatrixFull, MatrixFullSlice, BasicMatrix};
 use rest_tensors::matrix_blas_lapack::{_dgemm};
-use libc::{sysconf, _SC_PHYS_PAGES};
 
 use crate::utilities::memory_batch::{detect_available_memory_mb};
 
@@ -657,7 +656,7 @@ fn compute_double_gap(i_state_eigen: f64, j_state_eigen: f64, i_state_occ: f64, 
 /// Closed‑shell energy kernel. Computes both OS and SS contributions.
 /// The input `eri_virt` must be a square n1 × n1 matrix.
 /// If `off_diag` is true, the result is multiplied by 2.
-fn compute_eri_virt_close_shell<'a, M>(eri_virt: &M, eigenvalues: &Vec<f64>, occupation: &Vec<f64>,
+pub fn compute_eri_virt_close_shell<'a, M>(eri_virt: &M, eigenvalues: &Vec<f64>, occupation: &Vec<f64>,
     i_state_eigen: f64, j_state_eigen: f64, i_state_occ: f64, j_state_occ: f64,
     virt_offset: usize, off_diag: bool) -> (f64, f64)
 where M: BasicMatrix<'a, f64> + ?Sized
@@ -695,7 +694,7 @@ where M: BasicMatrix<'a, f64> + ?Sized
 /// Same‑spin (open‑shell) energy kernel. Only SS contribution is computed.
 /// The virtual pair loop is triangular (a < b) and includes occupation
 /// filtering.
-fn compute_eri_virt_ss<'a, M> (eri_virt: &M, eigenvalues: &Vec<f64>, occupation: &Vec<f64>,
+pub fn compute_eri_virt_ss<'a, M> (eri_virt: &M, eigenvalues: &Vec<f64>, occupation: &Vec<f64>,
     i_state_eigen: f64, j_state_eigen: f64, i_state_occ: f64, j_state_occ: f64,
     virt_offset: usize) -> f64
 where M: BasicMatrix<'a, f64> + ?Sized
@@ -727,7 +726,7 @@ where M: BasicMatrix<'a, f64> + ?Sized
 
 /// Opposite‑spin energy kernel. Only OS contribution is computed.
 /// It uses α and β eigenvalues/occupations separately.
-fn compute_eri_virt_os<'a, M> (eri_virt: &M, alpha_eigenvalues: &Vec<f64>, beta_eigenvalues: &Vec<f64>,
+pub fn compute_eri_virt_os<'a, M> (eri_virt: &M, alpha_eigenvalues: &Vec<f64>, beta_eigenvalues: &Vec<f64>,
     alpha_occupation: &Vec<f64>, beta_occupation: &Vec<f64>,
     i_state_eigen: f64, j_state_eigen: f64, i_state_occ: f64, j_state_occ: f64,
     virt_offset: usize) -> f64
