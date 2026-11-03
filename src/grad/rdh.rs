@@ -52,7 +52,7 @@ use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
-use crate::grad::rhf::{get_grad_dao_ovlp, RIRHFGradient, RIHFGradientFlagsBuilder};
+use crate::grad::rhf::{get_grad_dao_ovlp, occupation_is_aufbau, occupation_summary, RIRHFGradient, RIHFGradientFlagsBuilder};
 use crate::grad::rks::get_vxc_rayon_new;
 use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
@@ -98,6 +98,18 @@ impl<'a> RDHGradient<'a> {
         let device = DeviceBLAS::default();
         assert!(!mol_obj.ctrl.spin_polarization, "RDHGradient supports only restricted (spin-polarization = false) references.");
         assert!(mol_obj.start_mo == 0, "RDHGradient does not support frozen core (start_mo).");
+        // A Delta-SCF / MOM occupation (a hole below the HOMO, an occupied
+        // orbital above it) breaks the contiguous `0..nocc` / `nocc..nmo` split
+        // that every PT2 occupied/virtual pair space of this driver is built
+        // from, so the correlation gradient would be silently wrong. Refuse it.
+        assert!(
+            occupation_is_aufbau(&scf_data.occupation[0]),
+            "The DH (PT2-family) analytic gradient does not support a non-Aufbau occupation \
+             (MOM / force_state_occupation): {}. The PT2 occupied/virtual spaces are built from \
+             the contiguous 0..nocc / nocc..nmo split. Either optimize the geometry with the SCF \
+             functional (a non-PT2 `xc`), or drop force_state_occupation.",
+            occupation_summary(&scf_data.occupation[0])
+        );
         assert!(self.mpi_operator.is_none(), "RDHGradient is not MPI-parallelized yet.");
         assert!(
             scf_data.mol.dfadef.omega().is_none(),

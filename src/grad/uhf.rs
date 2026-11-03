@@ -244,11 +244,32 @@ impl RIUHFGradient<'_> {
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
         let mo_occ = get_mo_occ(self.scf_data, &device);
         let nao = dm.shape()[0];
-        let nocc = [
-            mo_occ[0].iter().map(|&x| if x > 0.0 { 1 } else { 0 }).sum::<usize>(),
-            mo_occ[1].iter().map(|&x| if x > 0.0 { 1 } else { 0 }).sum::<usize>(),
+        // Occupied manifold of the exchange derivative, per channel: the
+        // orbitals that are actually occupied, weighted by sqrt(occupation)
+        // (unit occupations give exactly the legacy coefficients). A MOM /
+        // `force_state_occupation` hole is not at the HOMO, so the legacy
+        // `mo_coeff[:, 0..nocc]` block is the wrong orbital set for a
+        // Delta-SCF state; see `occupied_coeff_block`.
+        let occ_coeff = [
+            occupied_coeff_block(mo_coeff[0].view(), mo_occ[0].view()),
+            occupied_coeff_block(mo_coeff[1].view(), mo_occ[1].view()),
         ];
-        let occ_coeff = [mo_coeff[0].i((.., ..nocc[0])), mo_coeff[1].i((.., ..nocc[1]))];
+        let nocc = [occ_coeff[0].shape()[1], occ_coeff[1].shape()[1]];
+        // Diagnostic + version marker of the exchange-occupation fix: a MOM
+        // (Delta-SCF) determinant makes the gradient contract the *actually*
+        // occupied orbitals instead of the leading 0..nocc block. Seeing this
+        // line in a force log proves the fix is active in the binary.
+        if self.flags.print_level >= 1 {
+            for spin in 0..2 {
+                if !occupation_is_aufbau(&self.scf_data.occupation[spin]) {
+                    println!(
+                        "gradient (exchange): non-Aufbau occupation in spin channel {}: {}; contracting K with the actually occupied orbitals",
+                        spin,
+                        occupation_summary(&self.scf_data.occupation[spin])
+                    );
+                }
+            }
+        }
 
         // eigen-decomposed ERI
         let ederi_utp = {

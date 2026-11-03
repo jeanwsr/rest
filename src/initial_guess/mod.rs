@@ -510,16 +510,28 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, ovlp: &
             );
             let ne = mol.num_elec;
             let nocc = [ne[1].round() as usize, ne[2].round() as usize];
+            // `proj_mo` projects only the columns inside `mo_range` and ZERO-PADS the
+            // rest. The default range is the occupied block, which is all the density
+            // needs -- but a MOM constraint (`force_state_occupation`) is usually
+            // anchored on a *virtual* orbital (the particle), and zeroing it makes the
+            // reference orbital a zero vector: every maximum-overlap comparison then
+            // returns 0, the occupation falls back to the Aufbau filling and the state
+            // silently collapses. Observed on H2O/B3LYP with a chkfile written 0.03 A
+            // away in geometry (t15): the occupied reference column matched with
+            // overlap 0.99999 while the virtual one matched orbital 0 with 0.0000.
+            // So a MOM job projects the full spectrum.
+            let mom_run = !mol.ctrl.force_state_occupation.is_empty();
+            let project_full = mol.ctrl.basis_projection.as_str() == "full" || mom_run;
             let mo_range = if matches!(scftype, SCFType::ROHF) {
                 // ROKS/ROHF: shared spatial MOs stored in the alpha channel only
-                match mol.ctrl.basis_projection.as_str() {
-                    "full" => [0..source.num_state, 0..0],
-                    _ => [0..nocc[0], 0..0],
+                match project_full {
+                    true => [0..source.num_state, 0..0],
+                    false => [0..nocc[0], 0..0],
                 }
             } else {
-                match mol.ctrl.basis_projection.as_str() {
-                    "full" => [0..source.num_state, 0..source.num_state],
-                    _ => [0..nocc[0], 0..nocc[1]],
+                match project_full {
+                    true => [0..source.num_state, 0..source.num_state],
+                    false => [0..nocc[0], 0..nocc[1]],
                 }
             };
             let mo = proj::proj_mo(mol, &source, mo2, mo_range);

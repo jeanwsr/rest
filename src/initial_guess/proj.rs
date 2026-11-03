@@ -232,13 +232,18 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
         }
 
     let mut geom_diff = true;
+    let mut geom_shift: f64 = 0.0;
     if let Some(ref sgeom) = source_geom {
         if sgeom.unit == mol_target.geom.unit
             && sgeom.position.size() == mol_target.geom.position.size()
         {
-            geom_diff = sgeom.position.iter()
-                .zip(mol_target.geom.position.iter())
-                .any(|(s, t)| (s - t).abs() > GEOM_TOL);
+            for (s, t) in sgeom.position.iter().zip(mol_target.geom.position.iter()) {
+                let d = (s - t).abs();
+                if d > geom_shift {
+                    geom_shift = d;
+                }
+            }
+            geom_diff = geom_shift > GEOM_TOL;
         }
     } else {
         geom_diff = false;
@@ -246,7 +251,11 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
             let s_ptr = source_atm[i][ATM_ENV] as usize;
             let t_ptr = mol_target.cint_atm[i][ATM_ENV] as usize;
             for d in 0..3 {
-                if (source_env[s_ptr + d] - mol_target.cint_env[t_ptr + d]).abs() > GEOM_TOL {
+                let diff = (source_env[s_ptr + d] - mol_target.cint_env[t_ptr + d]).abs();
+                if diff > geom_shift {
+                    geom_shift = diff;
+                }
+                if diff > GEOM_TOL {
                     geom_diff = true;
                     break;
                 }
@@ -270,6 +279,32 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     mol_source.num_elec = src_ne;
 
     let basis_diff = loaded_nbasis != mol_target.num_basis || loaded_nmo != mol_target.num_state;
+
+    // A large geometry difference means the guess gets re-expressed through a cross
+    // overlap between two displaced basis sets. Two things are worth knowing:
+    //   * by default `proj_mo` projects only the occupied block and ZERO-PADS the
+    //     rest, so every *virtual* orbital of the reference is lost. That is fatal
+    //     for a maximum-overlap (`force_state_occupation`) run, whose particle
+    //     orbital is a virtual: the reference column becomes a zero vector and the
+    //     state collapses into the Aufbau filling without a single error line.
+    //     MOM jobs therefore project the full spectrum (see
+    //     `initial_guess_from_hdf5chk`), which is why this is a warning now and
+    //     not a failure.
+    //   * the projected virtuals are only column-normalized, not mutually
+    //     orthonormal, and their quality degrades with the displacement.
+    // Either way, a chkfile written at (or near) the starting geometry is the safe
+    // choice; say so rather than let the user discover it through a collapsed state.
+    if geom_diff && geom_shift > 0.2 && !basis_diff {
+        warn!(
+            "the initial guess comes from a chkfile written at a different geometry \
+             (largest atom displacement {:.3} bohr = {:.3} Angstrom); it will be re-expressed \
+             through a cross overlap between the two geometries. For a large displacement the \
+             projected orbitals degrade, and outside the projected block they are zero-padded \
+             (maximum-overlap / force_state_occupation runs project the full spectrum for that \
+             reason). Prefer a chkfile written at (or near) the starting geometry.",
+            geom_shift, geom_shift * 0.52917721067
+        );
+    }
 
     if basis_diff || geom_diff {
         return GuessAction::Project(mol_source);

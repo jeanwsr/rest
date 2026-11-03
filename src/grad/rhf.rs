@@ -349,8 +349,24 @@ impl RIRHFGradient<'_> {
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
         let mo_occ = get_mo_occ(self.scf_data, &device);
         let nao = dm.shape()[0];
-        let nocc = mo_occ.iter().map(|&x| if x > 0.0 { 1 } else { 0 }).sum::<usize>();
-        let weighted_occ_coeff = mo_coeff.i((.., 0..nocc)) * mo_occ.mapv(f64::sqrt).i((None, 0..nocc));
+        // Occupied manifold of the exchange derivative: the orbitals that are
+        // actually occupied, weighted by sqrt(occupation). A MOM hole is not at
+        // the HOMO, so the legacy `mo_coeff[:, 0..nocc]` block is not the
+        // occupied manifold for a Delta-SCF (force_state_occupation) state; see
+        // `occupied_coeff_block`. For an Aufbau occupation this reproduces the
+        // legacy columns and weights exactly.
+        let weighted_occ_coeff = occupied_coeff_block(mo_coeff.view(), mo_occ.view());
+        let nocc = weighted_occ_coeff.shape()[1];
+        // Diagnostic + version marker of the exchange-occupation fix: a MOM
+        // (Delta-SCF) determinant makes the gradient contract the *actually*
+        // occupied orbitals instead of the leading 0..nocc block. Seeing this
+        // line in a force log proves the fix is active in the binary.
+        if self.flags.print_level >= 1 && !occupation_is_aufbau(&self.scf_data.occupation[0]) {
+            println!(
+                "gradient (exchange): non-Aufbau occupation in spin channel 0: {}; contracting K with the actually occupied orbitals",
+                occupation_summary(&self.scf_data.occupation[0])
+            );
+        }
 
         // eigen-decomposed ERI
         let ederi_utp = {
@@ -1147,6 +1163,64 @@ fn get_mo_energy(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
 fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
     let dm = &scf_data.density_matrix[0];
     return rt::asarray((&dm.data, dm.size, device)).to_owned();
+}
+
+/// Occupied manifold of one spin channel, as the column block the exchange
+/// derivative has to be contracted with: the orbitals that are *actually*
+/// occupied (mask `occ > 0`), each column scaled by `sqrt(occupation)`.
+///
+/// `mo_coeff` is `[nao, nmo]`; the returned tensor is `[nao, n_active]`.
+///
+/// The assemblers used to take the leading `0..nocc` columns of `mo_coeff`
+/// (`mo_coeff[:, 0..nocc]`), which is the occupied manifold only for an
+/// **Aufbau** occupation. A MOM / `force_state_occupation` determinant (the
+/// Delta-SCF route to an excited state) can leave a hole *below* the HOMO and
+/// push an occupied orbital *above* it, and the leading block then holds the
+/// empty orbital (contracted with full weight in the UHF assembler, which
+/// assumes unit occupations) while dropping the occupied one: the exchange
+/// derivative silently used the wrong orbital set, so every force / geometry
+/// optimization of a MOM state was wrong as soon as the functional carried
+/// exact exchange (pure GGA/LDA was unaffected because `factor_k` is `None`
+/// and the K block is skipped).
+///
+/// The mask-based selection below is the same construction the SCF's own
+/// exchange build uses (`ri_jk::pure_incore::generate_vk_ri_incore_coeff_with_rstsr`,
+/// `ri_jk::pure_direct`), so the energy and its gradient see one manifold.
+/// For an Aufbau occupation the selected columns and their `sqrt(occ)` weights
+/// are exactly the legacy ones (unit occupations give a weight of exactly 1.0),
+/// so existing results stay bit-for-bit unchanged.
+pub(crate) fn occupied_coeff_block(mo_coeff: TsrView<f64>, mo_occ: TsrView<f64>) -> Tsr<f64> {
+    // `rt::gt` consumes its first operand, and `mo_occ` is needed again below
+    // for the sqrt(occupation) weights, so the comparison borrows it (the same
+    // form `ri_jk::pure_incore` uses: `rt::lt(&mo_occ, 0.0)`).
+    let occ_mask = rt::gt(&mo_occ, f64::EPSILON).into_vec();
+    let occ_coeff = mo_coeff.bool_select(-1, &occ_mask);
+    let occ = mo_occ.bool_select(-1, &occ_mask).sqrt();
+    // `into_contig(ColMajor)` keeps the column-major layout the downstream
+    // contractions assert on (`TsrView::f_prefer`), which the legacy
+    // `mo_coeff[:, 0..nocc]` view satisfied by construction.
+    (occ_coeff * occ.i((None, ..))).into_contig(ColMajor)
+}
+
+/// True when the occupied orbitals of one spin channel are exactly the leading
+/// block `0..nocc` (an index-contiguous / Aufbau occupation).
+///
+/// Used by the guards that have to refuse a non-Aufbau occupation outright
+/// (the double-hybrid gradients build their occupied / virtual pair spaces
+/// from the contiguous `0..nocc` / `nocc..nmo` split) and by the diagnostics.
+pub(crate) fn occupation_is_aufbau(occ: &[f64]) -> bool {
+    let nocc = occ.iter().filter(|&&o| o > f64::EPSILON).count();
+    (0..nocc).all(|i| occ[i] > f64::EPSILON)
+        && (nocc..occ.len()).all(|i| occ[i] <= f64::EPSILON)
+}
+
+/// Describe the occupation pattern for a diagnostic / panic message.
+pub(crate) fn occupation_summary(occ: &[f64]) -> String {
+    let occupied = occ.iter().enumerate()
+        .filter(|(_, o)| **o > f64::EPSILON)
+        .map(|(i, _)| i.to_string())
+        .collect::<Vec<String>>();
+    format!("occupied = [{}] of {} orbitals", occupied.join(", "), occ.len())
 }
 
 /* #endregion */

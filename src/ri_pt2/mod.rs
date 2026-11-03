@@ -259,6 +259,15 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     // which is only valid for an Aufbau occupation, while the OSS beta
     // channel has a hole below its HOMO. The ri_symm / legacy drivers build
     // occ_range = start_mo..homo+1 and handle the hole correctly.
+    //
+    // A MOM occupation (`force_state_occupation`) has exactly the same shape --
+    // the hole sits below the highest occupied index (e.g. alpha = {0..6, 8}
+    // with the hole at 7 and the HOMO at 8) -- so it must be excluded for the
+    // same reason. Without the exclusion a Delta-SCF / MOM single point with a
+    // doubly-hybrid functional would include the hole in the PT2 pair space and
+    // report a silently wrong correlation energy. `use_ri_symm` is required
+    // anyway for the streaming driver, so the legacy path is always available.
+    let mom_occupation = !scf_data.mol.ctrl.force_state_occupation.is_empty();
     let use_streaming = !use_new_driver
         && !use_torch_engine
         && scf_data.mol.ctrl.ri_pt2.streaming
@@ -266,6 +275,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         && scf_data.mol.ctrl.use_ri_symm
         && scf_data.rimatr.is_some()
         && !scf_data.mol.ctrl.oss_roks
+        && !mom_occupation
         && dfa_family_pos == crate::dft::DFAFamily::PT2;
 
     if use_torch_engine {
