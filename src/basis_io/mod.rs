@@ -1,3 +1,5 @@
+//! Basis I/O: BSE-format basis/ECP parsing (`BasCell`/`Basis4Elem` + Raw mirrors),
+//! libcint-consistent normalization, and GTO evaluation (see `gto_cartesian`/`gto_value`).
 use rest_tensors::matrix_blas_lapack::_dgemm_nn;
 use rest_tensors::{MatrixFull, RIFull};
 use itertools::{Itertools, izip};
@@ -31,9 +33,6 @@ pub use gto_value::*;
 #[cfg(test)]
 mod tests;
 use self::basic_math::{double_factorial, specific_double_factorial};
-
-//use crate::geom_io::GeomCell;
-//use ndarray::{Axis};
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct BasCellRaw {
@@ -459,10 +458,6 @@ impl BasCell {
         }
    }
 }
-
-
-
-
 
 
 
