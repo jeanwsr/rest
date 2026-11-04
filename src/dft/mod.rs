@@ -2574,6 +2574,25 @@ impl Grids {
         utilities::timing(&dt0, Some("Generating the grids"));
         let num_threads = rayon::current_num_threads();
         utilities::apply_round_robin_permutation(&mut coordinates, &mut weights, &mut atm_idx, &mut quadrature_weights);
+        // prototype: atom-contiguous batches (REST_XC_ATOM_BATCH) — undo the
+        // round-robin interleave so grid points are ordered atom by atom, as
+        // generated. Each compressed batch then covers a single atom's shell
+        // neighborhood and the per-batch AO union shrinks toward ORCA's
+        // segregated-batch structure. Measurement prototype only.
+        if std::env::var("REST_XC_ATOM_BATCH").is_ok() {
+            let n = atm_idx.len();
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by_key(|&i| atm_idx[i]);
+            let old_c = std::mem::take(&mut coordinates);
+            let old_w = std::mem::take(&mut weights);
+            let old_a = std::mem::take(&mut atm_idx);
+            let old_q = std::mem::take(&mut quadrature_weights);
+            coordinates = order.iter().map(|&i| old_c[i]).collect();
+            weights = order.iter().map(|&i| old_w[i]).collect();
+            atm_idx = order.iter().map(|&i| old_a[i]).collect();
+            quadrature_weights = order.iter().map(|&i| old_q[i]).collect();
+            println!(" [atom-batch] grids reordered to atom-contiguous order ({} points)", n);
+        }
         let parallel_balancing = balancing(coordinates.len(), num_threads);
         global_grid = Grids {
             weights,
@@ -3248,6 +3267,70 @@ impl Grids {
         }
         if let Some(c) = &mut self.aop_compressed {
             for b in c.batches.iter_mut() { for x in 0..3 { advise_huge_pages(&mut b[x].data); } }
+        }
+
+        // prototype: pair-screening statistics (REST_XC_PAIR_STATS), computed
+        // from the compressed tables themselves: per sampled batch report the
+        // union rows at several thresholds, the per-point significant singles,
+        // and a proxy for the per-point pair count (both singles > sqrt(tau)).
+        // Sizes the extra win an ORCA-style per-batch pair list would add on
+        // top of the batch union.
+        if std::env::var("REST_XC_PAIR_STATS").is_ok() {
+            if let Some(c) = &self.ao_compressed {
+                let nb = c.batches.len();
+                let stride = (nb / 300).max(1);
+                let taus: [f64; 3] = [1e-6, 1e-8, 1e-10];
+                let sampled: Vec<usize> = (0..nb).step_by(stride).collect();
+                use rayon::prelude::*;
+                let accs: Vec<[f64; 9]> = sampled.par_iter().map(|&ib| {
+                    let b = &c.batches[ib];
+                    let n_act = c.batch_ao_map[ib].len();
+                    let ncols = b.size[1];
+                    let mut a = [0f64; 9];
+                    a[0] = n_act as f64;
+                    for ti in 0..3 {
+                        let tau = taus[ti];
+                        let sq = tau.sqrt();
+                        let mut ur = 0usize;
+                        for i in 0..n_act {
+                            let mut mx = 0f64;
+                            for g in 0..ncols {
+                                let v = b.data[i + g * n_act].abs();
+                                if v > mx { mx = v; }
+                            }
+                            if mx > tau { ur += 1; }
+                        }
+                        let mut pt = 0f64;
+                        let mut pp = 0f64;
+                        for g in 0..ncols {
+                            let mut s_tau = 0usize;
+                            let mut s_sq = 0usize;
+                            for i in 0..n_act {
+                                let v = b.data[i + g * n_act].abs();
+                                if v > tau { s_tau += 1; }
+                                if v > sq { s_sq += 1; }
+                            }
+                            pt += s_tau as f64;
+                            pp += (s_sq as f64) * (s_sq as f64);
+                        }
+                        a[1 + ti] = ur as f64;
+                        a[3 + 2 * ti] = pt / ncols as f64;
+                        a[3 + 2 * ti + 1] = pp / ncols as f64;
+                    }
+                    a
+                }).collect();
+                let n = accs.len() as f64;
+                let mut m = [0f64; 9];
+                for a in &accs { for k in 0..9 { m[k] += a[k]; } }
+                for k in 0..9 { m[k] /= n; }
+                println!(" [pair-stats] sampled {}/{} batches, blksize {}, avg_union_rows@aocut={:.0}", accs.len(), nb, c.blksize, m[0]);
+                for ti in 0..3 {
+                    println!(" [pair-stats] tau={:.0e}: union_rows={:.0}, pt_singles={:.0}, pt_pairs~={:.0}, ratios(s^2/u^2, p/u^2)={:.2}/{:.2}",
+                        taus[ti], m[1 + ti], m[3 + 2 * ti], m[3 + 2 * ti + 1],
+                        (m[3 + 2 * ti] * m[3 + 2 * ti]) / (m[0] * m[0]),
+                        m[3 + 2 * ti + 1] / (m[0] * m[0]));
+                }
+            }
         }
 
         omp_set_num_threads_wrapper(default_omp_num_threads);
