@@ -2337,7 +2337,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter,side,printlevel);
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
     let n=lumo;
@@ -2349,7 +2349,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter,side,printlevel);
     println!("The QP energy of LUMO obtained by GWA is {}",lumo_qp);
 }
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
@@ -2445,7 +2445,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
+        eigenenergies[n], qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of HOMO obtained by GWA (low-rank) is {}", homo_qp);
 
@@ -2464,7 +2464,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
+        eigenenergies[n], qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of LUMO obtained by GWA (low-rank) is {}", lumo_qp);
 }

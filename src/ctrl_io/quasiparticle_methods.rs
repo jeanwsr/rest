@@ -447,6 +447,9 @@ pub struct QuasiParticle {
     pub gw_extrapolate_occ_threshold:f64,
     pub gw_extrapolate_vir_threshold:f64,
     pub external_field_freq:f64,
+    /// Cartesian component of the dipole operator used as the response-BSE
+    /// right-hand side: "x", "y" or "z" (default "z").
+    pub response_bse_dipole_type:String,
     pub lifetime_gamma:f64,
     pub gw_or_bse:String,
     pub gw_span_energy:f64,
@@ -483,6 +486,19 @@ pub struct QuasiParticle {
     /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
     /// large broadening from incorrectly halving off-contour residues.
     pub cdgw_res_tol: f64,
+    /// Convergence threshold (Ha) of the **energy-path** quasiparticle root
+    /// finder (`newton_solver_lowrank` / `newton_solver`), i.e. the residual
+    /// ``|qp_eq(omega)|`` below which the QP energy is accepted.  It was
+    /// hardcoded to `1e-5` Ha, which is fine for spectra but too loose for
+    /// finite-difference work: an Omega that is pinned to the QP energies then
+    /// jitters by ~`1e-7` Ha between two displaced geometries, and dividing by
+    /// `2 h_FD` turns that into a `~1e-3` Ha/Bohr noise floor in the FD
+    /// reference.  Default `1e-5` reproduces the historical behaviour; set
+    /// `1e-7`--`1e-9` for gradient validation.
+    pub qpe_tol: f64,
+    /// Maximum number of iterations of the energy-path QP root finder
+    /// (default 50).  Raise it together with a tight [`Self::qpe_tol`].
+    pub qpe_max_iter: usize,
     /// FSCD absolute frequency-merge threshold (Ha).  Candidate residue
     /// frequencies closer than this are represented by a single sampled
     /// frequency.  Default 0.05 Ha (1.361 eV), matching TURBOMOLE's `thrs1`.
@@ -886,6 +902,7 @@ impl Default for QuasiParticle {
             spectrum_test_step:0.01,
             pysoc:false,
             external_field_freq:0.5,
+            response_bse_dipole_type:String::from("z"),
             lifetime_gamma:0.001,
             gw_imag_rayon:true,
             bse_auxbas_path: None,
@@ -901,6 +918,8 @@ impl Default for QuasiParticle {
             qsgw_eta: 0.001,
             cdgw_eta: 0.001,
             cdgw_res_tol: 0.001,
+            qpe_tol: 1.0e-5,
+            qpe_max_iter: 50,
             fscd_domega: 0.05,
             fscd_rel_tol: 1.0e-3,
             fscd_interp: String::from("linear"),
@@ -1086,6 +1105,7 @@ impl QuasiParticle {
         table.insert("gw_extrapolate_vir_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_vir_threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
         table.insert("external_field_freq".to_string(), toml::Value::Float(self.external_field_freq));
+        table.insert("response_bse_dipole_type".to_string(), toml::Value::String(self.response_bse_dipole_type.clone()));
         table.insert("lifetime_gamma".to_string(), toml::Value::Float(self.lifetime_gamma));
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
         table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
@@ -1114,6 +1134,8 @@ impl QuasiParticle {
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
         table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("qpe_tol".to_string(), toml::Value::Float(self.qpe_tol));
+        table.insert("qpe_max_iter".to_string(), toml::Value::Integer(self.qpe_max_iter as i64));
         table.insert("fscd_domega".to_string(), toml::Value::Float(self.fscd_domega));
         table.insert("fscd_rel_tol".to_string(), toml::Value::Float(self.fscd_rel_tol));
         table.insert("fscd_interp".to_string(), toml::Value::String(self.fscd_interp.clone()));
@@ -1408,7 +1430,12 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.external_field_freq = match tmp_ctrl.get("external_field_freq").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.5_f64)},
                 other => {0.5},
-            };tmp_input.lifetime_gamma = match tmp_ctrl.get("lifetime_gamma").unwrap_or(&serde_json::Value::Null) {
+            };
+            tmp_input.response_bse_dipole_type = match tmp_ctrl.get("response_bse_dipole_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("z"),
+            };
+            tmp_input.lifetime_gamma = match tmp_ctrl.get("lifetime_gamma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.001_f64)},
                 other => {0.001},
             };
@@ -1870,6 +1897,16 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.cdgw_eta = match tmp_ctrl.get("cdgw_eta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
+            };
+            tmp_input.qpe_tol = match tmp_ctrl.get("qpe_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-5),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(1.0e-5),
+                _ => 1.0e-5,
+            };
+            tmp_input.qpe_max_iter = match tmp_ctrl.get("qpe_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(50),
+                _ => 50,
             };
             tmp_input.cdgw_res_tol = match tmp_ctrl.get("cdgw_res_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),

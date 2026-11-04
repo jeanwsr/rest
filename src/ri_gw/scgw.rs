@@ -1185,8 +1185,8 @@ pub fn single_orbital_gw_ac(
             num_state,
             w_c_at_freqs,
             e_ks_n,
-            0.00001,
-            50,
+            qp_ctrl.qpe_tol,
+            qp_ctrl.qpe_max_iter,
             side,
             scf_data.mol.ctrl.print_level,
         );
@@ -1231,8 +1231,8 @@ pub fn single_orbital_gw_ac(
                 num_state,
                 w_c_at_freqs,
                 e_ks_n,
-                0.00001,
-                50,
+                qp_ctrl.qpe_tol,
+                qp_ctrl.qpe_max_iter,
                 side,
                 scf_data.mol.ctrl.print_level,
             );
@@ -1322,7 +1322,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
             |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
             n, consts, ri_ov_slot, ri_row_n,
             &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-            e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
+            e_ks_n, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level
         );
         println!("First round QP energy (no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -1336,7 +1336,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
                 |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
                 n, consts, ri_ov_slot, ri_row_n,
                 &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-                e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
+                e_ks_n, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -1455,7 +1455,7 @@ where
         crate::ri_gw::newton_solver(
             wrapped_f, n, consts, ri_ov, ri_row_n,
             gwqp_g, gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-            initial_guess, 0.00001, 50, side, print_level
+            initial_guess, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, print_level
         )
     } else if rootfinder == "interpolation".to_string() {
         println!("Orbital #{} (second round, with {} self-energy):", n, self_energy_type);
@@ -1476,7 +1476,7 @@ where
             qp_energy = crate::ri_gw::newton_solver(
                 wrapped_f, n, consts, ri_ov, ri_row_n,
                 gwqp_g, gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-                initial_guess, 0.00001, 50, side, print_level
+                initial_guess, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, print_level
             );
         }
         qp_energy
@@ -1695,8 +1695,8 @@ pub fn single_orbital_gw_fscd(
             num_state,
             w_c_at_freqs,
             e_ks_n,
-            0.00001,
-            50,
+            qp_ctrl.qpe_tol,
+            qp_ctrl.qpe_max_iter,
             side,
             print_level,
         );
@@ -1729,8 +1729,8 @@ pub fn single_orbital_gw_fscd(
                 num_state,
                 w_c_at_freqs,
                 e_ks_n,
-                0.00001,
-                50,
+                qp_ctrl.qpe_tol,
+                qp_ctrl.qpe_max_iter,
                 side,
                 print_level,
             );
@@ -2322,7 +2322,7 @@ fn single_orbital_gw_lowrank(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             w_c_at_freqs, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+            qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -2358,7 +2358,7 @@ fn single_orbital_gw_lowrank(
             qp_energy = ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -2391,7 +2391,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -2411,7 +2411,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -2497,7 +2497,7 @@ fn single_orbital_gw_lowrank_v2(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank_v2(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             wc_rows, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+            qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank v2, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -2524,7 +2524,7 @@ fn single_orbital_gw_lowrank_v2(
             qp_energy = ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -2557,7 +2557,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -2577,7 +2577,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
