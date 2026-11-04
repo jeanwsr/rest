@@ -27,7 +27,7 @@ fn test_double_factorial() {
     for x in 0..=19 {
         println!("{},{}",x,double_factorial(x));
     }
-    for x in -10..=-1 {
+    for x in -1..=19 {
         println!("{},{}",x,double_factorial(x));
     }
 }

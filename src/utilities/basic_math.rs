@@ -16,20 +16,22 @@ pub fn factorial_u128(n: usize) -> u128 {
 }
 
 /// Legacy-name factorial returning f64, u128-backed: exact through 33!
-/// (the old i32 version overflowed above 12!). For n < 0 returns 1.0.
+/// (the old i32 version overflowed above 12!). Panics for n < 0 (undefined).
 /// New code should prefer `factorial_u128`.
 #[inline]
 pub fn factorial(n: i32) -> f64 {
-    factorial_u128(n.max(0) as usize) as f64
+    assert!(n >= 0, "factorial is undefined for negative input, got {}", n);
+    factorial_u128(n as usize) as f64
 }
 
 /// Legacy-name double factorial n!! returning f64, u128-backed: exact far
-/// beyond the old i32 version's 21!! overflow limit. Convention difference to
-/// the old i32 version: returns 1.0 for ALL n <= 0 (the old odd-negative
-/// values like (-3)!! = -1 were never exercised by any caller; callers only
-/// rely on (-1)!! = 1). New code should prefer `double_factorial_u128`.
+/// beyond the old i32 version's 21!! overflow limit. Uses the standard
+/// convention (-1)!! = 1. Odd-negative inputs below -1 (e.g. (-3)!! = -1) are
+/// mathematically defined but not implemented here. New code should prefer
+/// `double_factorial_u128`.
 #[inline]
 pub fn double_factorial(n: i32) -> f64 {
+    assert!(n >= -1, "double_factorial is not implemented for n < -1 (only the (-1)!! = 1 convention is provided), got {}", n);
     double_factorial_u128(n) as f64
 }
 
