@@ -31,14 +31,7 @@ fn test_double_factorial() {
         println!("{},{}",x,double_factorial(x));
     }
 }
-#[test]
-fn debug_cartesian_gto() {
-    let a = 3.0;
-    let l = 2usize;
-    let c = [0.0, 0.0,0.0];
-    let r = [1.0, 2.0,3.0];
-    //cartesian_gto(a, l, c, r);
-}
+
 #[test]
 fn debug_par() {
     let vec1:Vec<i32> = (0..1000).map(|i| i).collect();
@@ -68,8 +61,6 @@ fn test_cart_gto_deriv() {
     let r = [[1.0, 2.0, 3.0]];
     let gto_center = [0.0, 0.0, 0.0];
     let cur_l = 2;
-    // let bas = Basis4Elem::new();
-    // let ao_deriv = 2;
     let ground_truth_0 = cartesian_gto_batch_v04(a, cur_l, &gto_center, &r);
     let ground_truth_1 = cartesian_gto_1st_batch_v03(a, cur_l, &gto_center, &r);
     let test_res = cartesian_gto_1st_batch_v04(a, cur_l, &gto_center, &r);
