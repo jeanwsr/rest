@@ -5,23 +5,28 @@ use FlagSide::L as Left;
 use FlagSide::R as Right;
 
 /// Run `f` with the OpenBLAS (pthread-build) global thread count temporarily
-/// capped at `REST_J2C_CD_THREADS` (default 8, the dsyevd precedent), restoring
-/// the previous value afterwards. On OpenMP-built OpenBLAS the setter maps to
-/// the OpenMP team size, which is equally honoured, so the cap is a no-op to
-/// correctness on either build. Only used for one-shot setup factorizations
-/// (j2c CD), never from rayon workers, so the global save/restore is race-free.
+/// capped, restoring the previous value afterwards. The cap never *raises*
+/// the thread count above what the caller has already configured: the
+/// effective count is `min(current, cap)`, with `cap` taken from
+/// `REST_J2C_CD_THREADS` (default 8, the dsyevd precedent). Rationale: the
+/// global count is set at startup from `ctrl.num_threads` (ctrl_io), and a
+/// run configured for fewer threads than the cap — `num_threads = 1` being
+/// the clearest case — must not silently spawn extra BLAS threads inside a
+/// "cap". Only used for one-shot setup factorizations (j2c CD), never from
+/// rayon workers, so the global save/restore is race-free.
 fn with_openblas_threads_cap<T, F: FnOnce() -> T>(f: F) -> T {
-    const DEFAULT_THREADS: usize = 8;
-    let n = std::env::var("REST_J2C_CD_THREADS")
+    const DEFAULT_CAP: usize = 8;
+    let cap = std::env::var("REST_J2C_CD_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THREADS)
+        .unwrap_or(DEFAULT_CAP)
         .max(1);
     extern "C" {
         fn openblas_get_num_threads() -> std::os::raw::c_int;
         fn openblas_set_num_threads(n: std::os::raw::c_int);
     }
     let saved = unsafe { openblas_get_num_threads() } as usize;
+    let n = saved.min(cap);
     unsafe { openblas_set_num_threads(n as std::os::raw::c_int) };
     let result = f();
     unsafe { openblas_set_num_threads(saved as std::os::raw::c_int) };
