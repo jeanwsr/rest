@@ -49,35 +49,47 @@ pub fn eval_ao_on_grids(
     ao
 }
 
-pub fn obtain_mu_ia_z(eigenvectors:&MatrixFull<f64>,ao_dip:&RIFull<f64>,i:usize,a:usize)->f64{
+pub fn obtain_mu_ia_component(eigenvectors:&MatrixFull<f64>,ao_dip:&RIFull<f64>,i:usize,a:usize,component:usize)->f64{
     let num_state=eigenvectors.size[0];
-    let ao_dip_tmp = ao_dip.get_reducing_matrix(2).unwrap();
+    let ao_dip_tmp = ao_dip.get_reducing_matrix(component).unwrap();
     let mu_ia:f64=(0..num_state).cartesian_product(0..num_state).fold(0.0,|acc,(m,n)|{
         let idx = m * ao_dip_tmp.size[0] + n;
         acc+eigenvectors[[m,i]]*eigenvectors[[n,a]]*ao_dip_tmp.data[idx]});
     mu_ia
 }
-pub fn compute_mu_z_vec(scf_data:&SCF)->Vec<f64>{
+pub fn obtain_mu_ia_z(eigenvectors:&MatrixFull<f64>,ao_dip:&RIFull<f64>,i:usize,a:usize)->f64{
+    obtain_mu_ia_component(eigenvectors,ao_dip,i,a,2)
+}
+pub fn compute_mu_dip_vec(scf_data:&SCF,component:&str)->Vec<f64>{
+    let comp = match component.trim().to_lowercase().as_str() {
+        "x" | "0" => 0,
+        "y" | "1" => 1,
+        "z" | "2" | "" => 2,
+        other => panic!("Invalid response_bse_dipole_type: \"{}\". Expected x, y or z.", other),
+    };
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ao_dip=ri_bse::dipoles::obtain_ao_dips(scf_data,None);
-    let mut mu_z_vec=vec![0.0;occ_size*vir_size];
+    let mut mu_vec=vec![0.0;occ_size*vir_size];
     let eigenvectors=scf_data.eigenvectors[0].clone();
     //eigenvectors.formated_output(1000,"full");
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
-        let mu_ia=obtain_mu_ia_z(&eigenvectors,&ao_dip,i,a+occ_size);
-        mu_z_vec[i+a*occ_size]=mu_ia;
+        let mu_ia=obtain_mu_ia_component(&eigenvectors,&ao_dip,start_mo+i,lumo+a,comp);
+        mu_vec[i+a*occ_size]=mu_ia;
     });
     //dipole_matrix.formated_output(1000,"full");
-    mu_z_vec
+    mu_vec
 }
-pub fn prepare_p0_r_i(mu_z_vec:&Vec<f64>,gwqp:&Vec<f64>,omega:f64,gamma:f64,occ_size:usize,vir_size:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn compute_mu_z_vec(scf_data:&SCF)->Vec<f64>{
+    compute_mu_dip_vec(scf_data,"z")
+}
+pub fn prepare_p0_r_i(mu_z_vec:&Vec<f64>,gwqp:&Vec<f64>,start_mo:usize,lumo:usize,omega:f64,gamma:f64,occ_size:usize,vir_size:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let mut p0rp=vec![0.0;occ_size*vir_size];
     let mut p0rm=vec![0.0;occ_size*vir_size];
     let mut p0ip=vec![0.0;occ_size*vir_size];
     let mut p0im=vec![0.0;occ_size*vir_size];
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
         let mu_ia_z=mu_z_vec[i+a*occ_size];
-        let energy_gap=gwqp[a+occ_size]-gwqp[i];
+        let energy_gap=gwqp[lumo+a]-gwqp[start_mo+i];
         // Non-interacting response for GMRES convention (omega -> omega - i*gamma):
         //   A_4c_nonint * z_nonint = b_4c
         //   z0_nonint = P*(D-omega)/Delta   (rp component)
@@ -111,7 +123,7 @@ pub fn pairvec_matvec(scf_data:&SCF,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64
     (ap.iter().enumerate().map(|(k,apk)|apk+bm[k]).collect(),bp.iter().enumerate().map(|(k,bpk)|bpk+am[k]).collect())
 }
 pub fn update_w_vecs<F1>(rp:&Vec<f64>,rm:&Vec<f64>,ip:&Vec<f64>,im:&Vec<f64>,pair_matvec:F1,
-    gwqp:&Vec<f64>,omega:f64,gamma:f64,occ_size:usize,vir_size:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
+    gwqp:&Vec<f64>,start_mo:usize,lumo:usize,omega:f64,gamma:f64,occ_size:usize,vir_size:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
     where F1:Fn(&(Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>){
     let preal=(rp.clone(),rm.clone());
     let pimag=(ip.clone(),im.clone());
@@ -122,7 +134,7 @@ pub fn update_w_vecs<F1>(rp:&Vec<f64>,rm:&Vec<f64>,ip:&Vec<f64>,im:&Vec<f64>,pai
     let mut wip=vec![0.0;occ_size*vir_size];
     let mut wim=vec![0.0;occ_size*vir_size];
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
-        let energy_gap=gwqp[a+occ_size]-gwqp[i];
+        let energy_gap=gwqp[lumo+a]-gwqp[start_mo+i];
         let prefactor_p:f64=1.0/((omega-energy_gap).powf(2.0)+gamma.powf(2.0));
         let prefactor_m:f64=1.0/((omega+energy_gap).powf(2.0)+gamma.powf(2.0));
         // T(z) = A_4c_diag^{-1} * Interaction  (exact equivalence with GMRES)
@@ -291,14 +303,14 @@ pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation (Pople). Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
-    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let mu_z_vec=compute_mu_dip_vec(scf_data,&qp_ctrl.response_bse_dipole_type);
     // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
     // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
     let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
     drop(inverse_dielectric);
     let external_field_freq=qp_ctrl.external_field_freq;
     let lifetime_gamma=qp_ctrl.lifetime_gamma;
-    let p0=prepare_p0_r_i(&mu_z_vec,&scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size);
+    let p0=prepare_p0_r_i(&mu_z_vec,&scf_data.gwqp.0,start_mo,lumo,external_field_freq,lifetime_gamma,occ_size,vir_size);
     let wrapped_pair_matvec = |pairvec:&(Vec<f64>,Vec<f64>)| -> (Vec<f64>,Vec<f64>) {
         let ap = mv.a(scf_data,&qp_ctrl,&pairvec.0);
         let am = mv.a(scf_data,&qp_ctrl,&pairvec.1);
@@ -309,7 +321,7 @@ pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     };
     let wrapped_update_w=|u:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         update_w_vecs(&u.0,&u.1,&u.2,&u.3,|x|wrapped_pair_matvec(&x),
-            &scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size)
+            &scf_data.gwqp.0,start_mo,lumo,external_field_freq,lifetime_gamma,occ_size,vir_size)
     };
     // Diagonal preconditioner: M = diag(A_4c)
     let energy_diag=ri_bse::construct_energy_diag_for_a_window(
@@ -332,11 +344,19 @@ pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     result
 }
 fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctrl:&QuasiParticle){
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    let occ_eigenvecs=MatrixFull::from_vec([num_state,occ_size],scf_data.eigenvectors[0].data[0..occ_size*num_state].to_vec().clone()).unwrap();
-    let vir_eigenvecs=MatrixFull::from_vec([num_state,vir_size],scf_data.eigenvectors[0].data[occ_size*num_state..].to_vec().clone()).unwrap();
-    let mut first_prod=MatrixFull::new([num_state,vir_size],0.0);
-    let mut ao_polarized_density_matrix=MatrixFull::new([num_state,num_state],0.0);
+    let (start_mo,_num_state,occ_size,vir_size,_homo,lumo)=get_occupation_parameters(scf_data,'N');
+    // `get_occupation_parameters(...,'N')` returns the *active* window
+    // (`num_state = lumo + vir_size` when `bse_cutoff_energy` is set), not the
+    // full AO dimension of the eigenvectors.  Use the actual eigenvector row
+    // count for the AO transformations and slice the occupied/virtual columns
+    // from the correct offsets (start_mo, lumo).  Using the compact window as
+    // the AO dimension both mis-shapes the matrices and reads the wrong MO
+    // columns whenever start_mo != 0.
+    let num_basis=scf_data.eigenvectors[0].size[0];
+    let occ_eigenvecs=MatrixFull::from_vec([num_basis,occ_size],scf_data.eigenvectors[0].data[start_mo*num_basis..(start_mo+occ_size)*num_basis].to_vec()).unwrap();
+    let vir_eigenvecs=MatrixFull::from_vec([num_basis,vir_size],scf_data.eigenvectors[0].data[lumo*num_basis..(lumo+vir_size)*num_basis].to_vec()).unwrap();
+    let mut first_prod=MatrixFull::new([num_basis,vir_size],0.0);
+    let mut ao_polarized_density_matrix=MatrixFull::new([num_basis,num_basis],0.0);
     _dgemm_full(&occ_eigenvecs,'N',polarized_density_matrix,'N',&mut first_prod,1.0,0.0);
     _dgemm_full(&first_prod,'N',&vir_eigenvecs,'T',&mut ao_polarized_density_matrix,1.0,0.0);
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).open("AO_Polarized_Density_Matrix.txt").expect("open failure");
@@ -344,7 +364,7 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     let grids = &qp_ctrl.response_bse_grids;
     let grid_val=eval_ao_on_grids(&scf_data.mol,&grids);
     //grid_val.formated_output(1000,"full");
-    let mut first_prod=MatrixFull::new([num_state,grids.len()],0.0);
+    let mut first_prod=MatrixFull::new([num_basis,grids.len()],0.0);
     _dgemm_full(&ao_polarized_density_matrix,'N',&grid_val,'N',&mut first_prod,1.0,0.0);
     let grid_data:Vec<f64>=first_prod.iter_columns_full().zip(grid_val.iter_columns_full()).map(|(fp,gval)|{
         let fp_vec=fp.to_vec();
@@ -412,7 +432,7 @@ pub fn response_bse_dense(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
-    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let mu_z_vec=compute_mu_dip_vec(scf_data,&qp_ctrl.response_bse_dipole_type);
     let a=ri_bse::construct_submat_a(scf_data,&inverse_dielectric,&scf_data.gwqp.0, 'R');
     let b=ri_bse::construct_submat_b(scf_data,'R',&inverse_dielectric);
     let mut linear_equation_lhs=MatrixFull::new([occ_size*vir_size*4,occ_size*vir_size*4],0.0);
@@ -466,7 +486,7 @@ pub fn response_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
-    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let mu_z_vec=compute_mu_dip_vec(scf_data,&qp_ctrl.response_bse_dipole_type);
     // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
     // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
     let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
@@ -514,7 +534,7 @@ pub fn response_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let precond_trivial=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         z.clone()
     };
-    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let mu_z_vec=compute_mu_dip_vec(scf_data,&qp_ctrl.response_bse_dipole_type);
     let rhs_p=(mu_z_vec.clone(),mu_z_vec.clone(),vec![0.0;occ_size*vir_size],vec![0.0;occ_size*vir_size]);
     let solution=fourvec_gmres(&gmres_matvec,&precond,&rhs_p,qp_ctrl.response_bse_tol,qp_ctrl.response_bse_max_iter);
     let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]+solution.1[ia]).collect();
@@ -697,7 +717,7 @@ pub fn response_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Ve
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation (Klopper Subspace Solver). Parameters:\nOcc Size={}, Vir Size={}, External Field Freq={}, Lifetime Gamma={}",
              occ_size, vir_size, qp_ctrl.external_field_freq, qp_ctrl.lifetime_gamma);
-    let mu_z_vec = compute_mu_z_vec(scf_data);
+    let mu_z_vec = compute_mu_dip_vec(scf_data, &qp_ctrl.response_bse_dipole_type);
     // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
     // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
     let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
@@ -754,6 +774,7 @@ pub fn response_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Ve
 
     // Initial guess: non-interacting response (paper Eqns 14-15)
     let p0 = prepare_p0_r_i(&mu_z_vec, &scf_data.gwqp.0,
+                             start_mo, lumo,
                              external_field_freq, lifetime_gamma,
                              occ_size, vir_size);
 
