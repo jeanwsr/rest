@@ -61,6 +61,9 @@ pub fn g0w0(
             GwVariant::Fscd => {
                 gw_near_fermi_surface_fscd(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold, gw_ctx)
             }
+            GwVariant::Wac => {
+                gw_near_fermi_surface_wac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
+            }
         }
     } else if gw_scheme == "no gw" {
         Vec::new()
@@ -2588,4 +2591,82 @@ fn single_orbital_gw_lowrank_v2(
 
     println!("GW of orbital #{} (low-rank v2) took {:?}, QP={}", n, start.elapsed(), final_qp);
     final_qp
+}
+
+/// CD-WAC driver: contour deformation with an analytic continuation of `W`.
+///
+/// The self-energy is evaluated by [`ri_gw::gw_grad::GwGradEngine`] in
+/// `gw_variant = "wac"` mode: the imaginary-axis integral is the ordinary CD
+/// one and the residue term evaluates `W_c,nm(zeta_m)` through a Padé
+/// approximant built from reference `W` rows (imaginary axis + near real
+/// axis).  Using the gradient engine here keeps the energy and its analytic
+/// gradient on exactly the same functional.
+pub fn gw_near_fermi_surface_wac(
+    scf_data: &mut SCF,
+    _num_freq: usize,
+    _vxc_nn: &Vec<f64>,
+    occ_threshold: f64,
+    vir_threshold: f64,
+) -> Vec<f64> {
+    use crate::ri_gw::gw_grad::{GwGradConfig, GwGradEngine};
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let ks_energies = scf_data.eigenvalues[0].clone();
+    let (start_mo, num_state, occ_size, _vir_size, _homo, _lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+    let e_homo = ks_energies[occ_size - 1];
+    let e_lumo = ks_energies[occ_size];
+    let calc_orbs_indices: Vec<usize> = ks_energies
+        .iter()
+        .enumerate()
+        .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+        .map(|(n, _)| n)
+        .collect();
+    println!("WAC calculated orbital indices:{:?}", calc_orbs_indices);
+
+    let cfg = GwGradConfig::from_scf(scf_data);
+    let vxc = GwGradEngine::precompute_vxc(scf_data);
+    let engine = GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+    let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
+        .iter()
+        .map(|&n| {
+            let energy = engine.qp_energy_of(n);
+            println!("  WAC QP energy of orbital {n}: {:.10} Ha", energy);
+            (n, energy)
+        })
+        .collect();
+    drop(engine);
+
+    let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift =
+        calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    let mut gwqp: Vec<f64> = Vec::new();
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("low extrapolations:{}", calc_orbs[0].0);
+        println!("calculated orbitals:{}", calc_orbs.len());
+        println!(
+            "high extrapolations:{}",
+            num_state - 1 - calc_orbs[calc_orbs.len() - 1].0
+        );
+        println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
+    }
+    for i in 0..calc_orbs[0].0 {
+        gwqp.push(scf_data.eigenvalues[0][i] + occ_shift)
+    }
+    for i in 0..calc_orbs.len() {
+        gwqp.push(calc_orbs[i].1)
+    }
+    for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
+        gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
+    }
+    ri_gw::display::extrapolation_quasiparticles(
+        &gwqp,
+        occ_size,
+        &calc_orbs_indices,
+        occ_threshold,
+        vir_threshold,
+    );
+    scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    let _ = (start_mo, &qp_ctrl);
+    gwqp
 }

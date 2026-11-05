@@ -167,35 +167,34 @@ pub struct PadeDerivatives {
     pub dvalue_dz: Complex64,
     /// `d^2P/dz^2`
     pub d2value_dz2: Complex64,
-    /// `dP/dp` with parameters `[y_0 .. y_{n-1}, ef]`
+    /// `dP/dp` with parameters `[y_0 .. y_{n-1}]` for the node-based entry
+    /// point, and `[y_0 .. y_{n-1}, ef]` for [`pade_derivatives`].
     pub dvalue_dparam: Vec<Complex64>,
     /// `d^2P/dz dp` with the same parameter layout
     pub d2value_dz_dparam: Vec<Complex64>,
 }
 
-/// Build the Thiele continued fraction of `values` on the shifted nodes
-/// `ef + i lambda_s` and evaluate it, together with all derivatives needed by
-/// the analytic gradient.
+/// General node-based Padé derivatives.
 ///
-/// This mirrors [`crate::ri_gw::ac::PadeApproximant::from_imaginary_axis`] +
-/// [`crate::ri_gw::ac::PadeApproximant::evaluate`] branch for branch, so the
-/// value agrees with the energy path to machine precision.
+/// `nodes` are the interpolation nodes (the **variable that enters the
+/// continued fraction**, e.g. `z_p^2` for the CD-WAC continuation of `W`), and
+/// `values` the corresponding function values.  The parameter layout of the
+/// returned derivatives is `[values_0..values_{n-1}, nodes_0..nodes_{n-1}]`,
+/// which lets a caller chain the node derivatives to whatever geometric
+/// quantity the nodes depend on.
 ///
-/// Returns `None` when the continued fraction breaks down, exactly where the
-/// energy path would return `AcError::ContinuedFractionBreakdown`.
-pub fn pade_derivatives(
-    lambdas: &[f64],
-    ef: f64,
+/// The construction is the same Thiele reciprocal-difference scheme as
+/// [`crate::ri_gw::ac::PadeApproximant`] and mirrors it branch for branch.
+pub fn pade_derivatives_nodes(
+    nodes: &[Complex64],
     values: &[Complex64],
     z: Complex64,
 ) -> Option<PadeDerivatives> {
     let n = values.len();
-    if n == 0 || lambdas.len() != n || !z.re.is_finite() || !z.im.is_finite() {
+    if n == 0 || nodes.len() != n || !z.re.is_finite() || !z.im.is_finite() {
         return None;
     }
-    let np = n + 1;
     let zero = Complex64::new(0.0, 0.0);
-    let ef_index = n;
 
     // The production code returns a constant approximant when every sample
     // coincides (this also covers the single-sample case).
@@ -204,31 +203,27 @@ pub fn pade_derivatives(
             .iter()
             .all(|v| (*v - values[0]).norm() <= BREAKDOWN_TOLERANCE)
     {
-        let mut g = vec![zero; np];
-        // `coefficients[0] = values[0]`: the approximant is independent of `ef`.
+        let mut g = vec![zero; 2 * n];
         g[0] = Complex64::new(1.0, 0.0);
         return Some(PadeDerivatives {
             value: values[0],
             dvalue_dz: zero,
             d2value_dz2: zero,
             dvalue_dparam: g,
-            d2value_dz_dparam: vec![zero; np],
+            d2value_dz_dparam: vec![zero; 2 * n],
         });
     }
 
+    let np = 2 * n;
     let val: Vec<Dual> = values
         .iter()
         .enumerate()
         .map(|(i, &v)| Dual::parameter(v, i, np))
         .collect();
-    let ef_dual = Dual::parameter(Complex64::new(ef, 0.0), ef_index, np);
-    let node: Vec<Dual> = lambdas
+    let node: Vec<Dual> = nodes
         .iter()
-        .map(|&lambda| {
-            let mut nd = ef_dual.clone();
-            nd.v += Complex64::new(0.0, lambda);
-            nd
-        })
+        .enumerate()
+        .map(|(i, &u)| Dual::parameter(u, n + i, np))
         .collect();
 
     let mut coefficients: Vec<Dual> = Vec::with_capacity(n);
@@ -266,6 +261,176 @@ pub fn pade_derivatives(
         d2value_dz2: result.d2,
         dvalue_dparam: result.g,
         d2value_dz_dparam: result.g1,
+    })
+}
+
+/// Plain (value-only) Thiele coefficient construction, used by the greedy
+/// point-selection loop of [`pade_derivatives_greedy`].
+fn thiele_coefficients(nodes: &[Complex64], values: &[Complex64]) -> Option<Vec<Complex64>> {
+    let n = values.len();
+    let mut coefficients = Vec::with_capacity(n);
+    coefficients.push(values[0]);
+    for i in 1..n {
+        let mut reciprocal = values[i] - coefficients[0];
+        for j in 1..i {
+            if reciprocal.norm() <= BREAKDOWN_TOLERANCE {
+                return None;
+            }
+            reciprocal = (nodes[i] - nodes[j - 1]) / reciprocal - coefficients[j];
+        }
+        if reciprocal.norm() <= BREAKDOWN_TOLERANCE {
+            return None;
+        }
+        coefficients.push((nodes[i] - nodes[i - 1]) / reciprocal);
+    }
+    Some(coefficients)
+}
+
+/// Value of a Thiele approximant from its coefficients.
+fn thiele_evaluate(nodes: &[Complex64], coefficients: &[Complex64], z: Complex64) -> Option<Complex64> {
+    let last = coefficients.len() - 1;
+    let mut result = coefficients[last];
+    for i in (0..last).rev() {
+        if result.norm() <= BREAKDOWN_TOLERANCE {
+            return None;
+        }
+        result = coefficients[i] + (z - nodes[i]) / result;
+    }
+    Some(result)
+}
+
+/// Greedy Thiele interpolation in the spirit of Panadés-Barrueta & Golze,
+/// J. Chem. Theory Comput. 19, 5450 (2023), Section 3.2.
+///
+/// The reference points are inserted one at a time: the first one is the
+/// point with the largest `|W|`, and every following one is the remaining
+/// point with the largest deviation `|T_k(u_j) - W_j|` from the current
+/// approximant.  This ordering is what keeps the reciprocal differences away
+/// from zero when the reference set mixes the imaginary axis with near-real
+/// points.  Points whose insertion would break the continued fraction are
+/// skipped; if the final construction still breaks, the most recently added
+/// points are dropped until it succeeds.
+///
+/// The returned derivatives refer to the **original** `nodes`/`values` order,
+/// so a caller can chain them to its own parameters.
+pub fn pade_derivatives_greedy(
+    nodes: &[Complex64],
+    values: &[Complex64],
+    z: Complex64,
+) -> Option<PadeDerivatives> {
+    let n = values.len();
+    if n == 0 || nodes.len() != n {
+        return None;
+    }
+    if n <= 2 {
+        return pade_derivatives_nodes(nodes, values, z);
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    // first point: largest |W|
+    let mut first = 0usize;
+    for j in 1..n {
+        if values[j].norm() > values[first].norm() {
+            first = j;
+        }
+    }
+    order.push(first);
+    let value_of = |ord: &[usize]| -> Option<Vec<Complex64>> {
+        let nd: Vec<Complex64> = ord.iter().map(|&i| nodes[i]).collect();
+        let vl: Vec<Complex64> = ord.iter().map(|&i| values[i]).collect();
+        let coefficients = thiele_coefficients(&nd, &vl)?;
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            out.push(thiele_evaluate(&nd, &coefficients, nodes[j])?);
+        }
+        Some(out)
+    };
+    while order.len() < n {
+        let approx = match value_of(&order) {
+            Some(v) => v,
+            None => break,
+        };
+        let mut best: Option<(usize, f64)> = None;
+        for j in 0..n {
+            if order.contains(&j) {
+                continue;
+            }
+            let err = (approx[j] - values[j]).norm();
+            if best.map_or(true, |(_, e)| err > e) {
+                best = Some((j, err));
+            }
+        }
+        match best {
+            Some((j, _)) => order.push(j),
+            None => break,
+        }
+    }
+    while order.len() >= 3 {
+        let nd: Vec<Complex64> = order.iter().map(|&i| nodes[i]).collect();
+        let vl: Vec<Complex64> = order.iter().map(|&i| values[i]).collect();
+        if let Some(d) = pade_derivatives_nodes(&nd, &vl, z) {
+            let mut dv = vec![Complex64::new(0.0, 0.0); 2 * n];
+            let mut dm = vec![Complex64::new(0.0, 0.0); 2 * n];
+            for (pos, &i) in order.iter().enumerate() {
+                dv[i] = d.dvalue_dparam[pos];
+                dv[n + i] = d.dvalue_dparam[order.len() + pos];
+                dm[i] = d.d2value_dz_dparam[pos];
+                dm[n + i] = d.d2value_dz_dparam[order.len() + pos];
+            }
+            return Some(PadeDerivatives {
+                value: d.value,
+                dvalue_dz: d.dvalue_dz,
+                d2value_dz2: d.d2value_dz2,
+                dvalue_dparam: dv,
+                d2value_dz_dparam: dm,
+            });
+        }
+        order.pop();
+    }
+    pade_derivatives_nodes(nodes, values, z)
+}
+
+/// Build the Thiele continued fraction of `values` on the shifted nodes
+/// `ef + i lambda_s` and evaluate it, together with all derivatives needed by
+/// the analytic gradient.
+///
+/// This mirrors [`crate::ri_gw::ac::PadeApproximant::from_imaginary_axis`] +
+/// [`crate::ri_gw::ac::PadeApproximant::evaluate`] branch for branch, so the
+/// value agrees with the energy path to machine precision.
+///
+/// Returns `None` when the continued fraction breaks down, exactly where the
+/// energy path would return `AcError::ContinuedFractionBreakdown`.
+pub fn pade_derivatives(
+    lambdas: &[f64],
+    ef: f64,
+    values: &[Complex64],
+    z: Complex64,
+) -> Option<PadeDerivatives> {
+    let n = values.len();
+    if lambdas.len() != n {
+        return None;
+    }
+    let nodes: Vec<Complex64> = lambdas
+        .iter()
+        .map(|&lambda| Complex64::new(ef, lambda))
+        .collect();
+    let node_deriv = pade_derivatives_nodes(&nodes, values, z)?;
+    // Chain the node derivatives to `ef`: `d node_s / d ef = 1`.
+    let mut dvalue_dparam = node_deriv.dvalue_dparam[..n].to_vec();
+    let mut d2value_dz_dparam = node_deriv.d2value_dz_dparam[..n].to_vec();
+    let mut ef_value = Complex64::new(0.0, 0.0);
+    let mut ef_mixed = Complex64::new(0.0, 0.0);
+    for s in 0..n {
+        ef_value += node_deriv.dvalue_dparam[n + s];
+        ef_mixed += node_deriv.d2value_dz_dparam[n + s];
+    }
+    dvalue_dparam.push(ef_value);
+    d2value_dz_dparam.push(ef_mixed);
+    Some(PadeDerivatives {
+        value: node_deriv.value,
+        dvalue_dz: node_deriv.dvalue_dz,
+        d2value_dz2: node_deriv.d2value_dz2,
+        dvalue_dparam,
+        d2value_dz_dparam,
     })
 }
 

@@ -19,6 +19,18 @@
 //!   the per-`(k,m)` coefficient stored in [`AcQpData`], plus the explicit
 //!   mean-field energy derivative.  This also covers the BSE diagonal, whose
 //!   QP energies are built from these caches;
+//! * `"wac"` is **CD with an analytic continuation of `W`** (CD-WAC,
+//!   Panadés-Barrueta & Golze, J. Chem. Theory Comput. 19, 5450 (2023)):
+//!   the imaginary-axis integral is the CD one, while the residue term
+//!   evaluates `W_c,nm(zeta_m)` from a Thiele Padé approximant built on
+//!   reference rows `W_c,nm(z_p)` (the imaginary-axis grid plus near-real
+//!   points).  The gradient differentiates the approximant with respect to
+//!   every reference value and to the evaluation node, and the reference
+//!   response rows are pulled back through the same RI/CPHF machinery
+//!   ([`WacQpData`]).  Because the reference screening factors are shared by
+//!   every target orbital and every QP iteration, this is the O(N^4)
+//!   alternative to the O(N^5) residue loop for deep core levels.  This also
+//!   covers the BSE diagonal computed from these caches;
 //! * `"fscd"` currently differentiates the CD functional (the frequency
 //!   sampling of the residue sum is not used by the gradient).
 //!
@@ -101,7 +113,7 @@
 //! exact moving residue frequencies.  See the section header below.
 
 use crate::ctrl_io::quasiparticle_methods::GwVariant;
-use crate::ri_gw::ac_grad::pade_derivatives;
+use crate::ri_gw::ac_grad::{pade_derivatives, pade_derivatives_greedy, pade_derivatives_nodes};
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre_grids};
 use crate::scf_io::SCF;
@@ -339,6 +351,15 @@ pub struct GwGradConfig {
     /// (`Sigma_c(omega + i eta)`), REST `ac_eta`, used only by
     /// [`GwVariant::Ac`].
     pub ac_eta: f64,
+    /// CD-WAC (`gw_variant = "wac"`): number of imaginary-axis reference
+    /// frequencies for the continuation of `W` (0 = all quadrature points).
+    pub wac_n_imag: usize,
+    /// CD-WAC: number of real-axis reference frequencies.
+    pub wac_n_real: usize,
+    /// CD-WAC: largest real reference frequency (Ha; 0 = automatic).
+    pub wac_omega_max: f64,
+    /// CD-WAC: imaginary offset (Ha) of the near-real reference frequencies.
+    pub wac_delta: f64,
     /// imaginary-axis grid selector, mirrors `mol.ctrl.freq_grid_type`
     pub freq_grid_type: usize,
     /// frequency cut-off for grids 1/2, mirrors `mol.ctrl.freq_cut_off`
@@ -675,6 +696,10 @@ impl Default for GwGradConfig {
             gw_variant: GwVariant::Cd,
             ac_num_samples: 16,
             ac_eta: 0.001,
+            wac_n_imag: 0,
+            wac_n_real: 20,
+            wac_omega_max: 50.0,
+            wac_delta: 1.0e-3,
             freq_grid_type: 0,
             freq_cut_off: 50.0,
             eta: 0.001,
@@ -737,6 +762,10 @@ impl GwGradConfig {
             gw_variant: qp.gw_variant,
             ac_num_samples: qp.ac_num_samples.max(2),
             ac_eta: if qp.ac_eta > 0.0 { qp.ac_eta } else { 1.0e-3 },
+            wac_n_imag: qp.wac_n_imag,
+            wac_n_real: qp.wac_n_real,
+            wac_omega_max: qp.wac_omega_max,
+            wac_delta: if qp.wac_delta > 0.0 { qp.wac_delta } else { 1.0e-3 },
             freq_grid_type: scf.mol.ctrl.freq_grid_type,
             freq_cut_off: scf.mol.ctrl.freq_cut_off,
             eta: qp.cdgw_eta,
@@ -1988,6 +2017,8 @@ pub struct QpCache {
     pub residues: Vec<Residue>,
     /// Analytic-continuation (Padé) response data; empty for the CD functional.
     pub ac: AcQpData,
+    /// CD-WAC (Padé continuation of `W`) response data; `None` otherwise.
+    pub wac: Option<WacQpData>,
 }
 
 /// Derivative information of the analytic-continuation (Padé) self-energy of
@@ -2025,12 +2056,115 @@ impl AcQpData {
     }
 }
 
+/// One active residue of the CD-WAC functional.
+///
+/// The Padé approximant of `W_c,nm` is a linear combination of the reference
+/// values with coefficients `alpha[p] = d Re P_m / d W_nm(z_p)`; `weight` is
+/// the signed CD pole factor and `beta` the explicit `d/d e_m` of the residue
+/// argument (the dependence of the reference values on `e_m` flows through the
+/// response pullback).
+#[derive(Clone, Debug)]
+pub struct WacEntry {
+    pub m: usize,
+    pub weight: f64,
+    pub alpha: Vec<f64>,
+    pub beta: f64,
+}
+
+/// CD-WAC response data of one QP cache.
+#[derive(Clone, Debug, Default)]
+pub struct WacQpData {
+    pub entries: Vec<WacEntry>,
+    pub n_ref: usize,
+    /// `d R / d omega_max` of the automatic reference grid (0 when pinned)
+    pub node_coeff: f64,
+}
+
 /// Imaginary-axis samples of one AC (Padé) self-energy row.
 struct AcSetup {
     /// `lambda_s`, the imaginary frequency of every sample
     lambdas: Vec<f64>,
     /// `Sigma_c,nn(i lambda_s)`
     values: Vec<Complex<f64>>,
+}
+
+/// Complex RPA response `chi0(z) = sum_ia qt_ia d_ia(z) qt_ia^T` in the
+/// metric-transformed representation, with
+/// `d_ia(z) = -4 de_ia/(de_ia^2 - z^2)` (the same convention as the CD
+/// imaginary-axis response and its Lorentzian real-axis limit).
+fn wac_chi0_weights(
+    qtia: &[f64],
+    naux: usize,
+    nov: usize,
+    w: &[Complex<f64>],
+) -> MatrixFull<Complex<f64>> {
+    let mut scaled = vec![Complex::new(0.0, 0.0); naux * nov];
+    for col in 0..nov {
+        let d = w[col];
+        for r in 0..naux {
+            let q = qtia[r + col * naux];
+            scaled[r + col * naux] = Complex::new(q * d.re, q * d.im);
+        }
+    }
+    let qm_data: Vec<Complex<f64>> = qtia.iter().map(|&x| Complex::new(x, 0.0)).collect();
+    let qm = MatrixFull::from_vec([naux, nov], qm_data).unwrap();
+    let sm = MatrixFull::from_vec([naux, nov], scaled).unwrap();
+    let mut chi = MatrixFull::from_vec(
+        [naux, naux],
+        vec![Complex::new(0.0, 0.0); naux * naux],
+    )
+    .unwrap();
+    chi.lapack_zgemm(
+        &sm,
+        &qm,
+        'N',
+        'T',
+        Complex::new(1.0, 0.0),
+        Complex::new(0.0, 0.0),
+    );
+    chi
+}
+
+fn wac_chi0(
+    qtia: &[f64],
+    naux: usize,
+    nov: usize,
+    de_ia: &[f64],
+    z: Complex<f64>,
+) -> MatrixFull<Complex<f64>> {
+    let w: Vec<Complex<f64>> = de_ia
+        .iter()
+        .map(|&de| {
+            let den = Complex::new(de * de, 0.0) - z * z;
+            Complex::new(-4.0 * de, 0.0) / den
+        })
+        .collect();
+    wac_chi0_weights(qtia, naux, nov, &w)
+}
+
+/// Reference data of the CD-WAC continuation of `W`.
+///
+/// `z[p]` are the reference frequencies (imaginary axis first, then the
+/// near-real points) and `u[p] = z[p]^2` the Padé nodes.  `lu[p]` factors the
+/// complex screening matrix `I - chi0(z[p])` in the metric-transformed
+/// (`S q`) representation, so that the row of any target orbital at every
+/// reference frequency is one triangular solve away.
+struct WacReference {
+    z: Vec<Complex<f64>>,
+    u: Vec<Complex<f64>>,
+    lu: Vec<CdLuFactor>,
+    /// number of leading entries that lie on the imaginary axis (their values
+    /// are the already available `QpRowTable::w_imag`)
+    n_imag: usize,
+    /// quadrature index of every imaginary-axis reference
+    imag_index: Vec<usize>,
+    /// `d u_p / d omega_max` for the automatic (geometry-dependent) real grid;
+    /// all zero when `wac_omega_max` is pinned by the input card.
+    du_domega_max: Vec<Complex<f64>>,
+    /// orbital indices that set the automatic `omega_max = e_last - e_first`
+    omega_max_movers: (usize, usize),
+    /// `d z_p / d omega_max` of the reference frequencies (0 when pinned)
+    dz_domega_max: Vec<f64>,
 }
 
 /// Value and response coefficients of the AC self-energy at one frequency.
@@ -2303,6 +2437,9 @@ pub struct GwGradEngine<'a> {
     /// metric-transformed occupied-virtual block (kept for on-the-fly factors).
     /// Evictable together with `qt` ([`Self::evict_qt`]).
     pub qtia: RefCell<Vec<f64>>,
+    /// CD-WAC reference screening factors (built lazily, once per geometry).
+    /// Only [`GwVariant::Wac`] reads them.
+    wac_ref: RefCell<Option<WacReference>>,
     /// hybrid parameter alpha of the reference, as used by REST's GW
     /// `consts` (`dfa_hybrid_scf`)
     pub hybrid: f64,
@@ -2365,6 +2502,8 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
         z_order: Vec<Vec<f64>>,
         /// `(-4 de/(de^2+u^2), -4(u^2-de^2)/(de^2+u^2)^2)` per quadrature point
         imag_factors: Vec<(Vec<f64>, Vec<f64>)>,
+        /// CD-WAC reference-frequency buckets `V[k][p]` (reused by every cache)
+        v_wac: Vec<Vec<Vec<f64>>>,
     }
 
     impl QpPullbackScratch {
@@ -2406,6 +2545,7 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 v_res: Vec::new(),
                 z_order: Vec::new(),
                 imag_factors: Vec::new(),
+                v_wac: Vec::new(),
             }
         }
 
@@ -2433,6 +2573,17 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 })
                 .collect();
             let nquad = engine.quad.len();
+            let n_wac = if engine.config.gw_variant == GwVariant::Wac {
+                engine.ensure_wac_reference();
+                engine
+                    .wac_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|r| r.z.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             QpPullbackScratch {
                 nk,
                 naux,
@@ -2458,6 +2609,7 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 v_res: vec![Vec::new(); nk],
                 z_order: vec![Vec::new(); nk],
                 imag_factors,
+                v_wac: vec![vec![vec![0.0f64; naux * naux]; n_wac]; nk],
             }
         }
     }
@@ -2773,6 +2925,7 @@ impl<'a> GwGradEngine<'a> {
                 lr_grid: (0..z_grid.len()).map(|_| OnceLock::new()).collect(),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
+                wac_ref: RefCell::new(None),
                 hybrid,
                 fock_hyb,
                 vxc_nn,
@@ -2839,6 +2992,7 @@ impl<'a> GwGradEngine<'a> {
                     .collect(),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
+                wac_ref: RefCell::new(None),
                 hybrid,
                 fock_hyb,
                 vxc_nn,
@@ -4296,6 +4450,7 @@ impl<'a> GwGradEngine<'a> {
             y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
             residues,
             ac: AcQpData::default(),
+            wac: None,
         }
     }
 
@@ -4321,6 +4476,7 @@ impl<'a> GwGradEngine<'a> {
             y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
             residues,
             ac: AcQpData::default(),
+            wac: None,
         }
     }
 
@@ -4353,6 +4509,7 @@ impl<'a> GwGradEngine<'a> {
             y0_static,
             residues,
             ac: AcQpData::default(),
+            wac: None,
         }
     }
 
@@ -4387,6 +4544,9 @@ impl<'a> GwGradEngine<'a> {
         if self.config.gw_variant == GwVariant::Ac {
             return self.ac_cache_at_omega(n, omega, want_y);
         }
+        if self.config.gw_variant == GwVariant::Wac {
+            return self.wac_cache_at_omega(n, omega, want_y);
+        }
         let table = self.qp_row_table(n);
         let (_contour, _imag, y_imag, residues) =
             self.sigma_c_parts_with(omega, n, true, want_y, &table);
@@ -4411,6 +4571,7 @@ impl<'a> GwGradEngine<'a> {
             y0_static,
             residues,
             ac: AcQpData::default(),
+            wac: None,
         }
     }
 
@@ -4477,6 +4638,433 @@ impl<'a> GwGradEngine<'a> {
             })
             .collect();
         AcSetup { lambdas, values }
+    }
+
+    // ------------------------------------------------------------------
+    // CD-WAC: contour deformation with an analytic continuation of W
+    // ------------------------------------------------------------------
+
+    /// Make the CD-WAC reference screening factors resident (once per
+    /// geometry).
+    ///
+    /// The reference set always contains imaginary-axis points (the same
+    /// quadrature the CD imaginary integral uses) and, when
+    /// [`GwGradConfig::wac_n_real`] is positive, near-real points
+    /// `r_i + i*wac_delta` on a quadratic grid between 0 and
+    /// [`GwGradConfig::wac_omega_max`].  The quadratic spacing puts most points
+    /// at the small frequencies that matter for valence residues while still
+    /// covering the deep-core range.
+    fn ensure_wac_reference(&self) {
+        if self.wac_ref.borrow().is_some() {
+            return;
+        }
+        let nquad = self.quad.len();
+        let mut imag_index: Vec<usize> = (0..nquad).collect();
+        let want_imag = self.config.wac_n_imag;
+        if want_imag > 0 && want_imag < nquad {
+            // even thinning of the full quadrature grid
+            imag_index = (0..want_imag)
+                .map(|i| i * (nquad - 1) / (want_imag - 1).max(1))
+                .collect();
+        }
+        let mut z: Vec<Complex<f64>> = imag_index
+            .iter()
+            .map(|&i| Complex::new(0.0, self.quad[i].0))
+            .collect();
+        let delta = self.config.wac_delta;
+        let n_real = self.config.wac_n_real;
+        let pinned = self.config.wac_omega_max > 0.0;
+        let mut t2s: Vec<f64> = Vec::new();
+        let mut movers = (0usize, self.nmo.saturating_sub(1));
+        if n_real > 0 {
+            let (omega_max, span) = if pinned {
+                (self.config.wac_omega_max, 0.0)
+            } else {
+                let mut lo = 0usize;
+                let mut hi = 0usize;
+                for (i, &x) in self.e.iter().enumerate() {
+                    if x < self.e[lo] {
+                        lo = i;
+                    }
+                    if x > self.e[hi] {
+                        hi = i;
+                    }
+                }
+                movers = (lo, hi);
+                let span = self.e[hi] - self.e[lo];
+                (span.max(1.0), if span > 1.0 { 1.0 } else { 0.0 })
+            };
+            for i in 0..n_real {
+                let t = i as f64 / (n_real - 1).max(1) as f64;
+                let t2 = t * t;
+                t2s.push(t2);
+                z.push(Complex::new(omega_max * t2, delta));
+            }
+        }
+        let u: Vec<Complex<f64>> = z.iter().map(|&zz| zz * zz).collect();
+        let dz_domega_max: Vec<f64> = (0..z.len())
+            .map(|p| {
+                if p < imag_index.len() || pinned || n_real == 0 {
+                    0.0
+                } else {
+                    let span = self.e[movers.1] - self.e[movers.0];
+                    if span > 1.0 {
+                        t2s[p - imag_index.len()]
+                    } else {
+                        0.0
+                    }
+                }
+            })
+            .collect();
+        let du_domega_max: Vec<Complex<f64>> = (0..z.len())
+            .map(|p| {
+                if p < imag_index.len() || pinned || n_real == 0 {
+                    Complex::new(0.0, 0.0)
+                } else {
+                    let t2 = t2s[p - imag_index.len()];
+                    // the automatic `omega_max = max(span, 1)` only moves when
+                    // the span exceeds 1 Ha
+                    let span = self.e[movers.1] - self.e[movers.0];
+                    if span > 1.0 {
+                        2.0 * z[p] * t2
+                    } else {
+                        Complex::new(0.0, 0.0)
+                    }
+                }
+            })
+            .collect();
+        let (naux, nov) = (self.naux, self.de_ia.len());
+        let lu: Vec<CdLuFactor> = self.with_qtia(|qtia| {
+            z.iter()
+                .map(|&zz| {
+                    let mut chi = wac_chi0(qtia, naux, nov, &self.de_ia, zz);
+                    // A = I - chi0
+                    for x in chi.data.iter_mut() {
+                        *x = -*x;
+                    }
+                    for d in 0..naux {
+                        chi[[d, d]] += Complex::new(1.0, 0.0);
+                    }
+                    let re: Vec<f64> = chi.data.iter().map(|c| c.re).collect();
+                    let im: Vec<f64> = chi.data.iter().map(|c| c.im).collect();
+                    let lu = CdLuFactor::factor(&re, &im, naux);
+                    lu
+                })
+                .collect()
+        });
+        *self.wac_ref.borrow_mut() = Some(WacReference {
+            z,
+            u,
+            lu,
+            n_imag: imag_index.len(),
+            imag_index,
+            du_domega_max,
+            omega_max_movers: movers,
+            dz_domega_max,
+        });
+    }
+
+    /// Reference values `W_c,nm(z_p)` of orbital row `n`, laid out
+    /// `[n_ref][nmo]`.
+    fn wac_values(
+        &self,
+        table: &QpRowTable,
+        r: &WacReference,
+    ) -> (Vec<Vec<Complex<f64>>>, Vec<Vec<Complex<f64>>>) {
+        let nmo = self.nmo;
+        let naux = self.naux;
+        let nref = r.z.len();
+        let mut out: Vec<Vec<Complex<f64>>> = Vec::with_capacity(nref);
+        let mut dout: Vec<Vec<Complex<f64>>> = vec![vec![Complex::new(0.0, 0.0); nmo]; nref];
+        for &wi in r.imag_index.iter() {
+            out.push(
+                table.w_imag[wi]
+                    .iter()
+                    .map(|&w| Complex::new(w, 0.0))
+                    .collect(),
+            );
+        }
+        let qn = &table.m;
+        // reference-frequency derivative of the response diagonal,
+        // d/dz [-4 de/(de^2 - z^2)] = -8 de z/(de^2 - z^2)^2
+        let need_node = r.dz_domega_max.iter().any(|&x| x != 0.0);
+        let qtia = if need_node {
+            self.with_qtia(|q| q.to_vec())
+        } else {
+            Vec::new()
+        };
+        for p in r.n_imag..nref {
+            let mut y: Vec<Complex<f64>> = qn.iter().map(|&x| Complex::new(x, 0.0)).collect();
+            r.lu[p].solve_in_place(&mut y, nmo);
+            let mut w = vec![Complex::new(0.0, 0.0); nmo];
+            for m in 0..nmo {
+                let mut acc = Complex::new(0.0, 0.0);
+                for a in 0..naux {
+                    let q = qn[a + m * naux];
+                    acc += q * (y[a + m * naux] - Complex::new(q, 0.0));
+                }
+                w[m] = acc;
+            }
+            if need_node && r.dz_domega_max[p] != 0.0 {
+                // d W / d z = y^T (d chi0/dz) y, then chain dz/domega_max
+                let z = r.z[p];
+                let wts: Vec<Complex<f64>> = self
+                    .de_ia
+                    .iter()
+                    .map(|&de| {
+                        let den = Complex::new(de * de, 0.0) - z * z;
+                        Complex::new(-8.0 * de, 0.0) * z / (den * den)
+                    })
+                    .collect();
+                let dchi = wac_chi0_weights(&qtia, naux, self.de_ia.len(), &wts);
+                let dz = r.dz_domega_max[p];
+                let mut dm = vec![Complex::new(0.0, 0.0); nmo];
+                for m in 0..nmo {
+                    let mut acc = Complex::new(0.0, 0.0);
+                    for a in 0..naux {
+                        let ya = y[a + m * naux];
+                        for b in 0..naux {
+                            acc += ya * dchi[[a, b]] * y[b + m * naux];
+                        }
+                    }
+                    dm[m] = acc * dz;
+                }
+                dout[p] = dm;
+            }
+            out.push(w);
+        }
+        (out, dout)
+    }
+
+    /// Imaginary-axis contribution of the CD self-energy and its first two
+    /// `omega` derivatives (identical to the CD engine's `imag` part).
+    fn wac_imag_part(&self, omega: f64, table: &QpRowTable) -> (f64, f64, f64) {
+        let mut i0 = 0.0f64;
+        let mut i1 = 0.0f64;
+        let mut i2 = 0.0f64;
+        for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
+            let w = &table.w_imag[wi];
+            let mut s0 = 0.0;
+            let mut s1 = 0.0;
+            let mut s2 = 0.0;
+            for m in 0..self.nmo {
+                let t = omega - self.e[m];
+                let d = t * t + u * u;
+                s0 += 2.0 * t / d * w[m];
+                s1 += 2.0 * (u * u - t * t) / (d * d) * w[m];
+                s2 += -4.0 * t * (3.0 * u * u - t * t) / (d * d * d) * w[m];
+            }
+            i0 += s0 * wgt / TWO_PI;
+            i1 += s1 * wgt / TWO_PI;
+            i2 += s2 * wgt / TWO_PI;
+        }
+        (i0, i1, i2)
+    }
+
+    /// Active CD residues at `omega` and their Padé-interpolated `W` values.
+    ///
+    /// Returns `(sigma_residue, d/d omega, d^2/d omega^2)`.
+    ///
+    /// The pole selection mirrors `ri_gw::contour_rayon`: for `omega` above
+    /// the Fermi level the virtual poles with `omega - e_a > -res_tol` enter
+    /// with weight `+pole_factor`, below it the occupied poles with
+    /// `e_i - omega > -res_tol` enter with weight `-pole_factor`.
+    fn wac_residue(
+        &self,
+        omega: f64,
+        n: usize,
+        r: &WacReference,
+        vals: &[Vec<Complex<f64>>],
+        dvals: &[Vec<Complex<f64>>],
+    ) -> (f64, f64, f64, Vec<WacEntry>, f64) {
+        let ef = 0.5 * (self.e[self.nocc - 1] + self.e[self.nocc]);
+        let sign = if omega > ef { 1.0 } else { -1.0 };
+        let eta = self.config.eta;
+        let mut r0 = 0.0f64;
+        let mut r1 = 0.0f64;
+        let mut r2 = 0.0f64;
+        let mut entries: Vec<WacEntry> = Vec::new();
+        let mut node_coeff = 0.0f64;
+        let start = if sign > 0.0 { self.nocc } else { 0 };
+        let end = if sign > 0.0 { self.nmo } else { self.nocc };
+        for m in start..end {
+            let de = if sign > 0.0 {
+                omega - self.e[m]
+            } else {
+                self.e[m] - omega
+            };
+            if de <= -self.config.res_tol {
+                continue;
+            }
+            let pole_factor = if de.abs() < self.config.res_tol { 0.5 } else { 1.0 };
+            let weight = sign * pole_factor;
+            let ze = Complex::new(de, eta);
+            let ue = ze * ze;
+            let column: Vec<Complex<f64>> = vals.iter().map(|row| row[m]).collect();
+            let p = match pade_derivatives_greedy(&r.u, &column, ue) {
+                Some(p) => p,
+                None => {
+                    panic!(
+                        "gw_grad (WAC): the Padé continuation of W broke down for orbital {n}, \
+                         pole m = {m} ({} reference frequencies)",
+                        r.u.len()
+                    );
+                }
+            };
+            // d(zeta)/d omega = sign, u = (zeta + i eta)^2
+            let du = 2.0 * ze * sign;
+            let d2u = Complex::new(2.0, 0.0);
+            r0 += weight * p.value.re;
+            r1 += weight * (p.dvalue_dz * du).re;
+            r2 += weight * (p.d2value_dz2 * du * du + p.dvalue_dz * d2u).re;
+            // Coefficients of the pullback: `alpha[p] = d Re P / d W(z_p)`
+            // and the explicit `d/d e_m` of the evaluation node.
+            let nref = vals.len();
+            let alpha: Vec<f64> = (0..nref).map(|q| p.dvalue_dparam[q].re).collect();
+            // automatic reference grid: d u_q / d omega_max * d P / d u_q
+            for q in 0..nref {
+                // node position and reference value both move with omega_max
+                node_coeff += weight
+                    * (p.dvalue_dparam[nref + q] * r.du_domega_max[q]).re;
+                node_coeff += weight * (p.dvalue_dparam[q] * dvals[q][m]).re;
+            }
+            // u = (zeta + i eta)^2, d zeta/d e_m = -sign
+            let du_de = -2.0 * ze * sign;
+            let beta = weight * (p.dvalue_dz * du_de).re;
+            entries.push(WacEntry { m, weight, alpha, beta });
+        }
+        (r0, r1, r2, entries, node_coeff)
+    }
+
+    /// CD-WAC self-energy and its first two `omega` derivatives at fixed
+    /// geometry: `Sigma = R_wac - I`.
+    fn wac_sigma(
+        &self,
+        omega: f64,
+        n: usize,
+        table: &QpRowTable,
+        r: &WacReference,
+        vals: &[Vec<Complex<f64>>],
+        dvals: &[Vec<Complex<f64>>],
+    ) -> (f64, f64, f64, Vec<WacEntry>, f64) {
+        let (i0, i1, i2) = self.wac_imag_part(omega, table);
+        let (r0, r1, r2, entries, node_coeff) = self.wac_residue(omega, n, r, vals, dvals);
+        (r0 - i0, r1 - i1, r2 - i2, entries, node_coeff)
+    }
+
+    /// Assemble a CD-WAC [`QpCache`].  The residue list is empty (the WAC
+    /// residue term is carried by the Padé data) and there is no static
+    /// subtraction.
+    #[allow(clippy::too_many_arguments)]
+    fn wac_finish_cache(
+        &self,
+        n: usize,
+        table: &QpRowTable,
+        omega: f64,
+        freq: f64,
+        z_factor: f64,
+        dsigma: f64,
+        static_fallback: bool,
+        want_y: bool,
+        entries: Vec<WacEntry>,
+        n_ref: usize,
+        node_coeff: f64,
+    ) -> QpCache {
+        let (_c, _i, y_imag, _res) = self.sigma_c_parts_with(freq, n, true, want_y, table);
+        QpCache {
+            target: n,
+            omega,
+            freq,
+            z_factor,
+            dsigma_domega: dsigma,
+            static_fallback,
+            linearized: false,
+            lin_shift: 0.0,
+            w_imag: table.w_imag.clone(),
+            y_imag: if want_y { y_imag } else { Vec::new() },
+            // the WAC pullback needs `m = S q_n` even for a full cache
+            m_imag: table.m.clone(),
+            w0: Vec::new(),
+            y0_static: Vec::new(),
+            residues: Vec::new(),
+            ac: AcQpData::default(),
+            wac: Some(WacQpData { entries, n_ref, node_coeff }),
+        }
+    }
+
+    /// CD-WAC cache at a fixed frequency (pinned QP energies).
+    fn wac_cache_at_omega(&self, n: usize, omega: f64, want_y: bool) -> QpCache {
+        let table = self.qp_row_table(n);
+        self.ensure_wac_reference();
+        let guard = self.wac_ref.borrow();
+        let r = guard.as_ref().unwrap();
+        let (vals, dvals) = self.wac_values(&table, r);
+        let (s, ds, _, entries, node_coeff) = self.wac_sigma(omega, n, &table, r, &vals, &dvals);
+        let _ = s;
+        let z = 1.0 / (1.0 - ds);
+        self.wac_finish_cache(n, &table, omega, omega, z, ds, false, want_y, entries, r.z.len(), node_coeff)
+    }
+
+    /// CD-WAC counterpart of [`Self::build_target_cache`].
+    fn build_target_cache_wac(&self, n: usize, want_y: bool) -> QpCache {
+        let consts = self.consts(n);
+        let side = if n < self.nocc { -1.0 } else { 1.0 };
+        let table = self.qp_row_table(n);
+        self.ensure_wac_reference();
+        let guard = self.wac_ref.borrow();
+        let r = guard.as_ref().unwrap();
+        let (vals, dvals) = self.wac_values(&table, r);
+        let deeply_occupied =
+            self.e[n] < 0.0 && -self.e[n] > self.config.static_fallback_threshold;
+        if deeply_occupied || self.config.force_static_fallback.contains(&n) {
+            let freq = self.e[n];
+            let (s, ds, _, entries, node_coeff) = self.wac_sigma(freq, n, &table, r, &vals, &dvals);
+            return self.wac_finish_cache(
+                n, &table, consts + s, freq, 1.0, ds, true, want_y, entries, r.z.len(), node_coeff,
+            );
+        }
+        let mut x = self.e[n] + side * 0.02;
+        let mut converged = false;
+        for _ in 0..self.config.qpe_max_iter {
+            let (s, ds, _, _, _) = self.wac_sigma(x, n, &table, r, &vals, &dvals);
+            let f = consts + s - x;
+            let df = ds - 1.0;
+            if !df.is_finite() || df.abs() < 1.0e-14 {
+                break;
+            }
+            let step = -f / df;
+            x += step;
+            if step.abs() < self.config.qpe_tol {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            println!(
+                "warning!!! gw_grad (WAC) Newton did not converge for orbital {n}; using the \
+                 static on-shell energy"
+            );
+            let freq = self.e[n];
+            let (s, ds, _, entries, node_coeff) = self.wac_sigma(freq, n, &table, r, &vals, &dvals);
+            return self.wac_finish_cache(
+                n, &table, consts + s, freq, 1.0, ds, true, want_y, entries, r.z.len(), node_coeff,
+            );
+        }
+        let (_, ds, _, entries, node_coeff) = self.wac_sigma(x, n, &table, r, &vals, &dvals);
+        let z = 1.0 / (1.0 - ds);
+        if self.config.z_min > 0.0 && z < self.config.z_min {
+            println!(
+                "warning!!! gw_grad (WAC) orbital {n}: converged Z = {z:.4} is below z_min = \
+                 {:.3}; using the static on-shell energy",
+                self.config.z_min
+            );
+            let freq = self.e[n];
+            let (s, ds2, _, entries2, node_coeff2) = self.wac_sigma(freq, n, &table, r, &vals, &dvals);
+            return self.wac_finish_cache(
+                n, &table, consts + s, freq, 1.0, ds2, true, want_y, entries2, r.z.len(), node_coeff2,
+            );
+        }
+        self.wac_finish_cache(n, &table, x, x, z, ds, false, want_y, entries, r.z.len(), node_coeff)
     }
 
     /// All derivative pieces of the AC self-energy at one frequency.
@@ -4642,6 +5230,7 @@ impl<'a> GwGradEngine<'a> {
                 be_omega,
                 d2sigma_domega2: parts.d2sigma_domega2,
             },
+            wac: None,
         }
     }
 
@@ -4790,6 +5379,9 @@ impl<'a> GwGradEngine<'a> {
         if self.config.gw_variant == GwVariant::Ac {
             return self.build_target_cache_ac(n, want_y);
         }
+        if self.config.gw_variant == GwVariant::Wac {
+            return self.build_target_cache_wac(n, want_y);
+        }
         let consts = self.consts(n);
         let side = if n < self.nocc { -1.0 } else { 1.0 };
         let mut x = self.e[n] + side * 0.02;
@@ -4866,6 +5458,7 @@ impl<'a> GwGradEngine<'a> {
                 y0_static,
                 residues,
                 ac: AcQpData::default(),
+                wac: None,
             };
         }
         // Smooth exact-residue mode: the residue frequencies follow the QP
@@ -4961,6 +5554,7 @@ impl<'a> GwGradEngine<'a> {
                 y0_static,
                 residues,
                 ac: AcQpData::default(),
+                wac: None,
             };
         }
         // Newton on the **analytic** derivative of the QP equation.
@@ -5121,6 +5715,7 @@ impl<'a> GwGradEngine<'a> {
             y0_static,
             residues,
             ac: AcQpData::default(),
+            wac: None,
         }
     }
 
@@ -5186,7 +5781,7 @@ impl<'a> GwGradEngine<'a> {
         let no_res = dbg("REST_GWGRAD_NORES");
         let no_imag = dbg("REST_GWGRAD_NOIMAG");
         let no_static = dbg("REST_GWGRAD_NOSTATIC");
-        let QpPullbackScratch { bq, bj, be, bb, v_imag, v_static, v_res, z_order, .. } = scr;
+        let QpPullbackScratch { bq, bj, be, bb, v_imag, v_static, v_res, z_order, v_wac, .. } = scr;
         // `qia` in matrix form, once per chunk: the residue `dW/dz` projections are
         // then BLAS-2 products (see `residue_dwdz_m`).
         let qia_m = to_mat(&self.qia, naux, self.de_ia.len());
@@ -5555,6 +6150,149 @@ impl<'a> GwGradEngine<'a> {
                     let bev = if omega_mode { &cache.ac.be_omega } else { &cache.ac.be };
                     for m in 0..nmo {
                         be[k][m] += c * bev[m];
+                    }
+                }
+            }
+
+            // ---- CD-WAC residue term -------------------------------------
+            // Each reference value `W_c,nm(z_p)` contributes through
+            // `alpha_{m,p} = d Re P_m / d W_nm(z_p)`; `W_p = q^T(z_p - y0)`
+            // with `z_p = S (I - chi0(z_p))^-1 m` and `y0 = S m`.  The
+            // imaginary-axis part is the ordinary CD one and was handled above.
+            if let Some(wac) = cache.wac.as_ref() {
+                if !no_res && !wac.entries.is_empty() {
+                    let mmat = &cache.m_imag;
+                    let y0 = gemm_nn(&self.s_metric, naux, naux, mmat, naux, nmo);
+                    let y0m = to_mat(&y0, naux, nmo);
+                    let guard = self.wac_ref.borrow();
+                    let wr = guard
+                        .as_ref()
+                        .expect("gw_grad (WAC): reference screening factors missing in pullback");
+                    let nref = wac.n_ref.min(wr.z.len());
+                    for p in 0..nref {
+                        // z' = A_p^-1 m, then z = S z'
+                        let mut zc: Vec<Complex<f64>> =
+                            mmat.iter().map(|&x| Complex::new(x, 0.0)).collect();
+                        wr.lu[p].solve_in_place(&mut zc, nmo);
+                        let zr = gemm_nn(
+                            &self.s_metric,
+                            naux,
+                            naux,
+                            &zc.iter().map(|c| c.re).collect::<Vec<_>>(),
+                            naux,
+                            nmo,
+                        );
+                        let zi = gemm_nn(
+                            &self.s_metric,
+                            naux,
+                            naux,
+                            &zc.iter().map(|c| c.im).collect::<Vec<_>>(),
+                            naux,
+                            nmo,
+                        );
+                        let zmat = MatrixFull::from_vec(
+                            [naux, nmo],
+                            zr.iter()
+                                .zip(zi.iter())
+                                .map(|(&r, &i)| Complex::new(r, i))
+                                .collect(),
+                        )
+                        .unwrap();
+                        for k in 0..nk {
+                            let c = cs[k];
+                            if c == 0.0 {
+                                continue;
+                            }
+                            let mut am = vec![0.0f64; nmo];
+                            for e in wac.entries.iter() {
+                                am[e.m] = c * e.weight * e.alpha[p];
+                            }
+                            // bq: 2 a Re(z_m - y0_m)
+                            for e in wac.entries.iter() {
+                                let a = am[e.m];
+                                if a == 0.0 {
+                                    continue;
+                                }
+                                let col_m = cols[e.m];
+                                for q in 0..naux {
+                                    let idx = q + e.m * naux;
+                                    bq[k][col_m + q] += 2.0 * a * (zr[idx] - y0[idx]);
+                                }
+                            }
+                            // bj += Y0s Y0^T with the per-m coefficients
+                            let mut ys = MatrixFull::new([naux, nmo], 0.0);
+                            for m in 0..nmo {
+                                if am[m] == 0.0 {
+                                    continue;
+                                }
+                                for q in 0..naux {
+                                    ys.data[q + m * naux] = am[m] * y0[q + m * naux];
+                                }
+                            }
+                            let mut yy = MatrixFull::new([naux, naux], 0.0);
+                            _dgemm_full(&ys, 'N', &y0m, 'T', &mut yy, 1.0, 0.0);
+                            for (d, s) in bj[k].iter_mut().zip(yy.data.iter()) {
+                                *d += s;
+                            }
+                            // v_wac += Re(zs z^T)
+                            let mut zs = MatrixFull::from_vec(
+                                [naux, nmo],
+                                (0..naux * nmo)
+                                    .map(|idx| {
+                                        let m = idx / naux;
+                                        if am[m] == 0.0 {
+                                            Complex::new(0.0, 0.0)
+                                        } else {
+                                            zmat.data[idx] * am[m]
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                            .unwrap();
+                            let mut vc = MatrixFull::from_vec(
+                                [naux, naux],
+                                vec![Complex::new(0.0, 0.0); naux * naux],
+                            )
+                            .unwrap();
+                            vc.lapack_zgemm(
+                                &zs,
+                                &zmat,
+                                'N',
+                                'T',
+                                Complex::new(1.0, 0.0),
+                                Complex::new(0.0, 0.0),
+                            );
+                            for (d, s) in v_wac[k][p].iter_mut().zip(vc.data.iter()) {
+                                *d += s.re;
+                            }
+                        }
+                    }
+                }
+                // explicit `d/d e_m` of the residue argument
+                if !no_res {
+                    for k in 0..nk {
+                        let c = cs[k];
+                        if c == 0.0 {
+                            continue;
+                        }
+                        for e in wac.entries.iter() {
+                            be[k][e.m] += c * e.beta;
+                        }
+                    }
+                    // automatic reference grid: `omega_max = e_last - e_first`
+                    if wac.node_coeff != 0.0 {
+                        let guard = self.wac_ref.borrow();
+                        if let Some(wr) = guard.as_ref() {
+                            let (lo, hi) = wr.omega_max_movers;
+                            for k in 0..nk {
+                                let c = cs[k];
+                                if c == 0.0 {
+                                    continue;
+                                }
+                                be[k][hi] += c * wac.node_coeff;
+                                be[k][lo] -= c * wac.node_coeff;
+                            }
+                        }
                     }
                 }
             }
@@ -5938,6 +6676,7 @@ impl<'a> GwGradEngine<'a> {
             v_res,
             z_order,
             imag_factors,
+            v_wac,
             nrow_pair,
             ..
         } = scr;
@@ -5972,6 +6711,32 @@ impl<'a> GwGradEngine<'a> {
                     self.polar_pullback_parallel(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
                 }
             }
+            // CD-WAC references: complex `z_p`, response diagonal
+            // `d_ia = -4 de/(de^2 - z^2)` and its `de` derivative; `V` is the
+            // real part of the accumulated Gram matrix, so only `Re[d]`/`Re[dd]`
+            // enter the real covectors.
+            if !v_wac.is_empty() {
+                let guard = self.wac_ref.borrow();
+                if let Some(wr) = guard.as_ref() {
+                    for (p, v) in v_wac[k].iter().enumerate() {
+                        if p >= wr.z.len() || v.iter().all(|&x| x == 0.0) {
+                            continue;
+                        }
+                        let z = wr.z[p];
+                        let mut d = vec![0.0f64; self.de_ia.len()];
+                        let mut dd = vec![0.0f64; self.de_ia.len()];
+                        for (idx, &de) in self.de_ia.iter().enumerate() {
+                            let den = Complex::new(de * de, 0.0) - z * z;
+                            let dval = Complex::new(-4.0 * de, 0.0) / den;
+                            let ddval = Complex::new(-4.0, 0.0) / den
+                                + Complex::new(8.0 * de * de, 0.0) / (den * den);
+                            d[idx] = dval.re;
+                            dd[idx] = ddval.re;
+                        }
+                        self.polar_pullback_parallel(&mut bq, &mut be, k, v, &d, &dd, true);
+                    }
+                }
+            }
             // The static bucket is processed whenever it is nonzero: with the
             // `REST_GWGRAD_NOSTATIC` mask the coefficient keeps the axis and
             // residue `W(0)` compensations (`A_m` and `active_m`), so only the
@@ -5991,6 +6756,11 @@ impl<'a> GwGradEngine<'a> {
         // product per cache and frequency.
         for k in 0..nk {
             for v in v_imag[k].iter() {
+                for (d, s) in bj[k].iter_mut().zip(v.iter()) {
+                    *d -= s;
+                }
+            }
+            for v in v_wac[k].iter() {
                 for (d, s) in bj[k].iter_mut().zip(v.iter()) {
                     *d -= s;
                 }
@@ -6055,6 +6825,9 @@ impl<'a> GwGradEngine<'a> {
             scr.bb[k].iter_mut().for_each(|v| *v = 0.0);
             scr.v_res[k].clear();
             scr.z_order[k].clear();
+            for v in scr.v_wac[k].iter_mut() {
+                v.iter_mut().for_each(|x| *x = 0.0);
+            }
         }
     }
 
@@ -6081,6 +6854,9 @@ impl<'a> GwGradEngine<'a> {
             scr.bb[k].iter_mut().for_each(|v| *v = 0.0);
             scr.v_res[k].clear();
             scr.z_order[k].clear();
+            for v in scr.v_wac[k].iter_mut() {
+                v.iter_mut().for_each(|x| *x = 0.0);
+            }
         }
     }
 
@@ -6127,6 +6903,11 @@ impl<'a> GwGradEngine<'a> {
             }
             for (d, s) in dst.v_static[k].iter_mut().zip(src.v_static[k].iter()) {
                 *d += *s;
+            }
+            for (vd, vs) in dst.v_wac[k].iter_mut().zip(src.v_wac[k].iter()) {
+                for (d, s) in vd.iter_mut().zip(vs.iter()) {
+                    *d += *s;
+                }
             }
             for (zi, &z) in src.z_order[k].iter().enumerate() {
                 let idx = match dst.z_order[k]
@@ -6260,6 +7041,7 @@ impl<'a> GwGradEngine<'a> {
                 y0_static: c.y0_static.clone(),
                 residues: c.residues.clone(),
                 ac: c.ac.clone(),
+                wac: c.wac.clone(),
             })
             .collect();
         let refs: Vec<&QpCache> = owned.iter().collect();
@@ -8809,9 +9591,9 @@ impl<'a> GwCdGradEngine<'a> {
     ) -> Self {
         // the full-CD path never touches the low-rank machinery
         assert!(
-            config.gw_variant != GwVariant::Ac,
+            config.gw_variant != GwVariant::Ac && config.gw_variant != GwVariant::Wac,
             "GwCdGradEngine implements only the contour-deformation self-energy; \
-             use GwGradEngine for gw_variant = \"ac\""
+             use GwGradEngine for gw_variant = \"ac\" or \"wac\""
         );
         let mut config = config;
         config.skip_lr_cache = true;

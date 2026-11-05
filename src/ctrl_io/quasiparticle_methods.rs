@@ -6,6 +6,12 @@ pub enum GwVariant {
     Cd,
     Ac,
     Fscd,
+    /// Contour deformation with an analytic continuation of the screened
+    /// Coulomb interaction `W` (CD-WAC): the imaginary-axis integral is the CD
+    /// one, while the residue term evaluates `W_c,nm(zeta_m)` through a Padé
+    /// approximant built from reference `W` matrices (imaginary axis + near
+    /// real axis) instead of rebuilding the response at every residue.
+    Wac,
 }
 
 impl Default for GwVariant {
@@ -20,6 +26,7 @@ impl GwVariant {
             Self::Cd => "cd",
             Self::Ac => "ac",
             Self::Fscd => "fscd",
+            Self::Wac => "wac",
         }
     }
 }
@@ -521,6 +528,20 @@ pub struct QuasiParticle {
     pub ac_omega_max: f64,
     /// Positive broadening (Ha) used to evaluate Sigma(omega + i*eta).
     pub ac_eta: f64,
+    /// CD-WAC (`gw_variant = "wac"`): number of imaginary-axis reference
+    /// frequencies used for the Padé continuation of `W`.  `0` uses the whole
+    /// imaginary-axis quadrature grid (`num_freq` points).
+    pub wac_n_imag: usize,
+    /// CD-WAC: number of **real-axis** reference frequencies (uniformly spaced
+    /// between 0 and `wac_omega_max`, with a small positive imaginary offset).
+    pub wac_n_real: usize,
+    /// CD-WAC: largest real reference frequency (Ha).  `0.0` selects an
+    /// automatic value from the orbital-energy span (this makes the reference
+    /// grid geometry dependent; the analytic gradient differentiates that
+    /// dependence, but a pinned value is the recommended production setting).
+    pub wac_omega_max: f64,
+    /// CD-WAC: imaginary offset (Ha) of the near-real reference frequencies.
+    pub wac_delta: f64,
     /// Number of states below/above HOMO-LUMO for the self-energy evaluation
     /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
     /// contribute negligibly to the real-axis residues and inflate de_max, making
@@ -927,6 +948,10 @@ impl Default for QuasiParticle {
             ac_num_samples: 16,
             ac_omega_max: 5.0,
             ac_eta: 0.001,
+            wac_n_imag: 0,
+            wac_n_real: 20,
+            wac_omega_max: 50.0,
+            wac_delta: 1.0e-3,
             selfenergy_state_range: 100000,
             low_rank_demax_window: false,
             // response BSE grid sampling parameters (default: 2 points per dimension)
@@ -1143,6 +1168,10 @@ impl QuasiParticle {
         table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
         table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
         table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
+        table.insert("wac_n_imag".to_string(), toml::Value::Integer(self.wac_n_imag as i64));
+        table.insert("wac_n_real".to_string(), toml::Value::Integer(self.wac_n_real as i64));
+        table.insert("wac_omega_max".to_string(), toml::Value::Float(self.wac_omega_max));
+        table.insert("wac_delta".to_string(), toml::Value::Float(self.wac_delta));
         table.insert("low_rank_demax_window".to_string(), toml::Value::Boolean(self.low_rank_demax_window));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
@@ -1308,9 +1337,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                         "cd" => GwVariant::Cd,
                         "ac" => GwVariant::Ac,
                         "fscd" | "fs-cd" | "fs_cd" => GwVariant::Fscd,
+                        "wac" | "cd-wac" | "cd_wac" => GwVariant::Wac,
                         other => {
                             anyhow::bail!(
-                                "Invalid gw_variant '{}'. Supported values are 'cd', 'ac' and 'fscd'.",
+                                "Invalid gw_variant '{}'. Supported values are 'cd', 'ac', 'fscd' and 'wac'.",
                                 other
                             );
                         }
@@ -1319,7 +1349,7 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Null => GwVariant::Cd,
                 other => {
                     anyhow::bail!(
-                        "Invalid type for gw_variant: {:?}. Expected the string 'cd', 'ac' or 'fscd'.",
+                        "Invalid type for gw_variant: {:?}. Expected the string 'cd', 'ac', 'fscd' or 'wac'.",
                         other
                     );
                 }
@@ -1940,6 +1970,22 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
+            tmp_input.wac_n_imag = match tmp_ctrl.get("wac_n_imag").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
+            };
+            tmp_input.wac_n_real = match tmp_ctrl.get("wac_n_real").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.wac_omega_max = match tmp_ctrl.get("wac_omega_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(50.0),
+                _ => 50.0,
+            };
+            tmp_input.wac_delta = match tmp_ctrl.get("wac_delta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-3),
+                _ => 1.0e-3,
+            };
             // Parse response BSE grid sampling parameters
             tmp_input.response_bse_x_start = match tmp_ctrl.get("response_bse_x_start").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
@@ -2286,6 +2332,19 @@ mod tests {
 
             let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
             assert_eq!(qp.gw_variant, GwVariant::Ac);
+        }
+    }
+
+    #[test]
+    fn gw_variant_accepts_wac_case_insensitively() {
+        for value in ["wac", "WAC", "Wac", "cd-wac", "cd_wac"] {
+            let input = serde_json::json!({
+                "quasiparticle_methods": {
+                    "gw_variant": value
+                }
+            });
+            let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+            assert_eq!(qp.gw_variant, GwVariant::Wac);
         }
     }
 

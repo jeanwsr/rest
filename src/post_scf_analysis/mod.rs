@@ -644,14 +644,18 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             assert!(target < scf_data.mol.num_state, "gradient_orbital {target} out of range");
             let ac = qp_ctrl.gw_variant
                 == crate::ctrl_io::quasiparticle_methods::GwVariant::Ac;
-            if ac && qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") {
+            let wac = qp_ctrl.gw_variant
+                == crate::ctrl_io::quasiparticle_methods::GwVariant::Wac;
+            if (ac || wac) && qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") {
                 println!(
-                    "GW-BSE gradient: gw_variant = \"ac\" uses the low-rank AC engine \
+                    "GW-BSE gradient: gw_variant = \"{}\" uses the low-rank engine \
                      (the full-CD engine only implements the CD functional); \
-                     gradient_engine = \"cd\" is overridden."
+                     gradient_engine = \"cd\" is overridden.",
+                    qp_ctrl.gw_variant.as_str()
                 );
             }
             if !ac
+                && !wac
                 && qp_ctrl.gw_variant
                     == crate::ctrl_io::quasiparticle_methods::GwVariant::Fscd
             {
@@ -661,7 +665,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                      evaluation is not used by the gradient."
                 );
             }
-            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") && !ac;
+            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") && !ac && !wac;
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
             let (grad, omega, z) = if use_cd {
                 let engine = ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(scf_data, cfg, vxc);
