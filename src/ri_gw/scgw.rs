@@ -1100,6 +1100,7 @@ pub fn single_orbital_gw_ac(
         })
         .collect();
 
+    let t_samples = Instant::now();
     let samples: Vec<ImaginaryAxisSample> = ac_freqs
         .iter()
         .map(|&lambda| {
@@ -1107,7 +1108,9 @@ pub fn single_orbital_gw_ac(
             ImaginaryAxisSample::new_shifted(lambda, ef, sigma_c)
         })
         .collect();
+    let dt_samples = t_samples.elapsed().as_secs_f64();
 
+    let t_pade = Instant::now();
     let pade = match PadeApproximant::from_imaginary_axis(&samples) {
         Ok(p) => p,
         Err(e) => {
@@ -1118,6 +1121,7 @@ pub fn single_orbital_gw_ac(
         }
     };
 
+    let dt_pade = t_pade.elapsed().as_secs_f64();
     let qp_eq_func = |omega: f64| -> f64 {
         match pade.evaluate_retarded(omega, ac_eta) {
             Ok(sigma_c) => consts + sigma_c.re - omega,
@@ -1260,6 +1264,15 @@ pub fn single_orbital_gw_ac(
         );
     }
 
+    println!(
+        "AC phases for orbital #{}: imag-axis sampling {:.4} s ({} samples), Padé construction {:.4} s, root finding {:.4} s, total {:.4} s",
+        n,
+        dt_samples,
+        ac_freqs.len(),
+        dt_pade,
+        start.elapsed().as_secs_f64() - dt_samples - dt_pade,
+        start.elapsed().as_secs_f64()
+    );
     println!("GW of orbital #{} (AC) took {:?}", n, start.elapsed());
     if scf_data.mol.ctrl.print_level > 1 {
         println!("Shift = {}", qp_energy_no_fse - e_ks_n);
