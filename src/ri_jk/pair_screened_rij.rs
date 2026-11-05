@@ -351,56 +351,24 @@ pub fn compact_rimatr_rows(ri3fn: MatrixFull<f64>, kept: &[usize]) -> MatrixFull
 
     let mut data = ri3fn.data;
     if num_kept < num_baspar {
-        // Interleave-parallel compaction. The move shifts every column
-        // leftwards in place (`kept` ascending ⇒ `dst+slot <= src+p`), which
-        // makes a naive column-parallel split race: column B's writes land
-        // inside column A's read region whenever B-A < nbp/nk. Workers that
-        // own columns spaced `n_workers` apart (interleaved) and walk them
-        // in ascending order race with nobody when n_workers >= nbp/nk:
-        // the closest columns of two different workers are n_workers apart,
-        // and by that bound one's writes start at or beyond the other's
-        // read region; within a worker the original serial order (safe by
-        // construction) is preserved exactly. Falls back to the serial loop
-        // when the thread count cannot clear the bound (low compaction ⇒
-        // little to move anyway). Measured on ts2: 923k kept rows x 5181
-        // aux columns = 4.8 G element moves ran on one thread for ~10 s
-        // inside the CInt phase (xc_valley_report.md, appendix 4).
-        let min_gap = (num_baspar + num_kept - 1) / num_kept; // ceil(nbp/nk)
-        let max_workers = rayon::current_num_threads().max(1);
-        let n_workers = if max_workers >= min_gap && num_auxbas >= min_gap * 2 {
-            max_workers.min(num_auxbas / 2).max(2)
-        } else {
-            1
-        };
-        let kept = kept;
-        if n_workers > 1 {
-            // The interleaved column sets are disjoint, so the element moves
-            // of different workers never touch the same location; the raw
-            // pointer is only a way to give each closure its own mutable view
-            // of the non-overlapping regions (same pattern as the Schwartz
-            // engine's output writes).
-            let data_ptr = std::sync::atomic::AtomicPtr::new(data.as_mut_ptr());
-            let data_len = data.len();
-            (0..n_workers).into_par_iter().for_each(|w| {
-                let data: &mut [f64] =
-                    unsafe { std::slice::from_raw_parts_mut(data_ptr.load(std::sync::atomic::Ordering::Relaxed), data_len) };
-                let mut p_aux = w;
-                while p_aux < num_auxbas {
-                    let src = p_aux * num_baspar;
-                    let dst = p_aux * num_kept;
-                    for (slot, &p) in kept.iter().enumerate() {
-                        data[dst + slot] = data[src + p];
-                    }
-                    p_aux += n_workers;
-                }
-            });
-        } else {
-            for p_aux in 0..num_auxbas {
-                let src = p_aux * num_baspar;
-                let dst = p_aux * num_kept;
-                for (slot, &p) in kept.iter().enumerate() {
-                    data[dst + slot] = data[src + p];
-                }
+        // Serial left-to-right compaction (original implementation, kept
+        // deliberately). In-place left-shift compaction cannot be safely
+        // parallelized on the column axis: a column's write region starts
+        // inside the read region of columns to its left (B*nk < (A+1)*nbp
+        // whenever B-A < nbp/nk, which covers the nearest neighbours for
+        // any realistic retention), so any two workers on nearby columns
+        // race, and per-column staging buffers only remove the
+        // self-dependence, not the cross-column one. Two prototypes
+        // (interleaved and per-column-staged) both corrupted the data on
+        // ts2/water10 (energies of 1e17 Ha). The 10 s single-thread window
+        // it costs on ts2 (xc_valley_report.md, appendix 4) is accepted;
+        // the structural fix is a tighter upstream pre-screen or a
+        // separate output buffer, not in-place parallelism.
+        for p_aux in 0..num_auxbas {
+            let src = p_aux * num_baspar;
+            let dst = p_aux * num_kept;
+            for (slot, &p) in kept.iter().enumerate() {
+                data[dst + slot] = data[src + p];
             }
         }
         data.truncate(num_kept * num_auxbas);
