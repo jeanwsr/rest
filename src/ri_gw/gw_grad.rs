@@ -1,5 +1,26 @@
-//! Analytic nuclear gradients of low-rank contour-deformation (LR-CD) G0W0
-//! quasiparticle energies.
+//! Analytic nuclear gradients of low-rank contour-deformation (LR-CD) and
+//! analytic-continuation (AC) G0W0 quasiparticle energies.
+//!
+//! The self-energy representation is selected by
+//! [`GwGradConfig::gw_variant`], which mirrors the energy path's
+//! `gw_variant = "cd" | "ac" | "fscd"` keyword:
+//!
+//! * `"cd"` (default) differentiates the contour-deformation functional
+//!   described below;
+//! * `"ac"` differentiates the analytic-continuation (Padé) functional of
+//!   `ri_gw::scgw::single_orbital_gw_ac`: `Sigma_c` is sampled on the
+//!   imaginary axis, a Thiele continued fraction is built from the samples
+//!   and evaluated at `omega + i eta`.  The gradient differentiates that
+//!   approximant with respect to every sample and with respect to the Fermi
+//!   shift (which moves all nodes), see [`crate::ri_gw::ac_grad`]; the exact
+//!   coefficients are then fed through the same RI/CPHF pullback as the CD
+//!   kernel.  Because the AC functional is a **linear** functional of the
+//!   imaginary-axis screened rows `W_c[n,m](iu_k)`, the pullback only needs
+//!   the per-`(k,m)` coefficient stored in [`AcQpData`], plus the explicit
+//!   mean-field energy derivative.  This also covers the BSE diagonal, whose
+//!   QP energies are built from these caches;
+//! * `"fscd"` currently differentiates the CD functional (the frequency
+//!   sampling of the residue sum is not used by the gradient).
 //!
 //! This module ports the validated PySCF implementation
 //! `pyscf/gw/gw_lr_cd_grad.py` (+ `gw_cd_grad*.py`) to REST.  It reproduces
@@ -79,6 +100,8 @@
 //! factorisation of the screening matrix — no low-rank truncation — and
 //! exact moving residue frequencies.  See the section header below.
 
+use crate::ctrl_io::quasiparticle_methods::GwVariant;
+use crate::ri_gw::ac_grad::pade_derivatives;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre_grids};
 use crate::scf_io::SCF;
@@ -295,6 +318,27 @@ const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 pub struct GwGradConfig {
     /// number of imaginary-axis quadrature points (REST `num_freq`)
     pub num_freq: usize,
+    /// How the correlation self-energy is represented:
+    ///
+    /// * [`GwVariant::Cd`] — the contour-deformation decomposition (imaginary
+    ///   axis quadrature + real-axis residues) that this module was written
+    ///   for;
+    /// * [`GwVariant::Ac`] — analytic continuation: `Sigma_c` is sampled on
+    ///   the imaginary axis and the retarded value is obtained from a Thiele
+    ///   Padé approximant, exactly as the `gw_variant = "ac"` energy path
+    ///   (`ri_gw::scgw::single_orbital_gw_ac`).  The gradient differentiates
+    ///   the same Padé functional (see [`crate::ri_gw::ac_grad`]);
+    /// * [`GwVariant::Fscd`] — the frequency-sampled CD residue evaluation.
+    ///   The gradient currently differentiates the CD functional, and a
+    ///   warning is printed once.
+    pub gw_variant: GwVariant,
+    /// Number of imaginary-axis samples of the Padé approximant (REST
+    /// `ac_num_samples`), used only by [`GwVariant::Ac`].
+    pub ac_num_samples: usize,
+    /// Positive broadening `eta` of the retarded Padé evaluation
+    /// (`Sigma_c(omega + i eta)`), REST `ac_eta`, used only by
+    /// [`GwVariant::Ac`].
+    pub ac_eta: f64,
     /// imaginary-axis grid selector, mirrors `mol.ctrl.freq_grid_type`
     pub freq_grid_type: usize,
     /// frequency cut-off for grids 1/2, mirrors `mol.ctrl.freq_cut_off`
@@ -628,6 +672,9 @@ impl Default for GwGradConfig {
     fn default() -> Self {
         GwGradConfig {
             num_freq: 20,
+            gw_variant: GwVariant::Cd,
+            ac_num_samples: 16,
+            ac_eta: 0.001,
             freq_grid_type: 0,
             freq_cut_off: 50.0,
             eta: 0.001,
@@ -687,6 +734,9 @@ impl GwGradConfig {
             .clone()
             .expect("gw_grad: quasiparticle_methods ctrl block required");
         GwGradConfig {
+            gw_variant: qp.gw_variant,
+            ac_num_samples: qp.ac_num_samples.max(2),
+            ac_eta: if qp.ac_eta > 0.0 { qp.ac_eta } else { 1.0e-3 },
             freq_grid_type: scf.mol.ctrl.freq_grid_type,
             freq_cut_off: scf.mol.ctrl.freq_cut_off,
             eta: qp.cdgw_eta,
@@ -1936,6 +1986,62 @@ pub struct QpCache {
     pub y0_static: Vec<f64>,
     /// active residue poles (see [`Residue`])
     pub residues: Vec<Residue>,
+    /// Analytic-continuation (Padé) response data; empty for the CD functional.
+    pub ac: AcQpData,
+}
+
+/// Derivative information of the analytic-continuation (Padé) self-energy of
+/// one QP cache.
+///
+/// The AC self-energy is a **linear functional of the imaginary-axis screened
+/// rows** `W_c[n,m](iu_k)` (the Padé approximant is built from the samples
+/// `Sigma_c(i lambda_s)`, each of which is a linear combination of those rows).
+/// The pullback therefore only needs the per-`(k, m)` coefficient of that
+/// functional, plus the explicit dependence on the mean-field energies
+/// (`e_m` and the Fermi shift `ef`).  See [`crate::ri_gw::ac_grad`] for the
+/// derivative construction.
+#[derive(Clone, Debug, Default)]
+pub struct AcQpData {
+    /// `d Re Sigma_c / d W_c[n,m](iu_k)`, `[n_quad][nmo]`.  Empty when the
+    /// cache uses the contour-deformation functional.
+    pub w_coeff: Vec<Vec<f64>>,
+    /// `d Re Sigma_c / d e_m` at fixed `W` (kernel derivative plus the
+    /// `ef(R)` chain, `ef = (e_HOMO + e_LUMO)/2`), `[nmo]`.
+    pub be: Vec<f64>,
+    /// `d/d omega` of [`Self::w_coeff`], the omega channel of the linearized
+    /// branch, `[n_quad][nmo]`.
+    pub w_coeff_omega: Vec<Vec<f64>>,
+    /// `d/d omega` of [`Self::be`], `[nmo]`.
+    pub be_omega: Vec<f64>,
+    /// `d^2 Re Sigma_c / d omega^2` (the `d e_n/dR` chain of the linearized
+    /// omega channel).
+    pub d2sigma_domega2: f64,
+}
+
+impl AcQpData {
+    /// `true` when this cache carries AC (Padé) response data.
+    pub fn is_ac(&self) -> bool {
+        !self.w_coeff.is_empty()
+    }
+}
+
+/// Imaginary-axis samples of one AC (Padé) self-energy row.
+struct AcSetup {
+    /// `lambda_s`, the imaginary frequency of every sample
+    lambdas: Vec<f64>,
+    /// `Sigma_c,nn(i lambda_s)`
+    values: Vec<Complex<f64>>,
+}
+
+/// Value and response coefficients of the AC self-energy at one frequency.
+struct AcParts {
+    sigma: f64,
+    dsigma_domega: f64,
+    d2sigma_domega2: f64,
+    w_coeff: Vec<Vec<f64>>,
+    be: Vec<f64>,
+    w_coeff_omega: Vec<Vec<f64>>,
+    be_omega: Vec<f64>,
 }
 
 /// The LR-CD G0W0 analytic-gradient engine for one geometry.
@@ -4189,6 +4295,7 @@ impl<'a> GwGradEngine<'a> {
             w0: table.w0.clone(),
             y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
             residues,
+            ac: AcQpData::default(),
         }
     }
 
@@ -4213,6 +4320,7 @@ impl<'a> GwGradEngine<'a> {
             w0: table.w0.clone(),
             y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
             residues,
+            ac: AcQpData::default(),
         }
     }
 
@@ -4244,6 +4352,7 @@ impl<'a> GwGradEngine<'a> {
             w0: table.w0.clone(),
             y0_static,
             residues,
+            ac: AcQpData::default(),
         }
     }
 
@@ -4275,6 +4384,9 @@ impl<'a> GwGradEngine<'a> {
     /// quasiparticle solution.  One self-energy evaluation instead of one per
     /// Newton step.
     fn cache_at_omega(&self, n: usize, omega: f64, want_y: bool) -> QpCache {
+        if self.config.gw_variant == GwVariant::Ac {
+            return self.ac_cache_at_omega(n, omega, want_y);
+        }
         let table = self.qp_row_table(n);
         let (_contour, _imag, y_imag, residues) =
             self.sigma_c_parts_with(omega, n, true, want_y, &table);
@@ -4298,7 +4410,374 @@ impl<'a> GwGradEngine<'a> {
             w0,
             y0_static,
             residues,
+            ac: AcQpData::default(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // analytic continuation (Padé) self-energy
+    // ------------------------------------------------------------------
+
+    /// Imaginary-axis frequencies `lambda_s` the AC approximant samples,
+    /// selected exactly like the energy path (`ri_gw::ac::get_ac_idx` with
+    /// PySCF's `2/3` step ratio).
+    fn ac_frequencies(&self) -> Vec<f64> {
+        let npts = self.config.ac_num_samples.max(2);
+        let idx = crate::ri_gw::ac::get_ac_idx(self.config.num_freq, npts, 2.0 / 3.0);
+        idx.iter()
+            .map(|&i| {
+                let i0 = i
+                    .saturating_sub(1)
+                    .min(self.quad.len().saturating_sub(1));
+                self.quad.get(i0).map(|&(u, _)| u).unwrap_or(0.0)
+            })
+            .collect()
+    }
+
+    /// Fermi shift of the AC sample kernel, `ef = (e_HOMO + e_LUMO)/2`
+    /// (the mean-field reference of G0W0, exactly the `gwqp_g` the energy
+    /// path hands to `calculate_sigma_c_imag_freq`).
+    fn ac_fermi_level(&self) -> f64 {
+        let homo = self.nocc.saturating_sub(1);
+        let lumo = self.nocc.min(self.nmo.saturating_sub(1));
+        0.5 * (self.e[homo] + self.e[lumo])
+    }
+
+    /// Sample values `Sigma_c,nn(i lambda_s)` of one orbital row.
+    ///
+    /// This is the row form of `ri_gw::calculate_sigma_c_imag_freq`: the
+    /// screened row `W_c[n,m](iu_k)` is contracted with the same PySCF-style
+    /// kernel on the full imaginary-axis quadrature.
+    fn ac_setup(&self, table: &QpRowTable) -> AcSetup {
+        let lambdas = self.ac_frequencies();
+        let ef = self.ac_fermi_level();
+        let pi = std::f64::consts::PI;
+        let values: Vec<Complex<f64>> = lambdas
+            .iter()
+            .map(|&lambda| {
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
+                    for m in 0..self.nmo {
+                        let wc = table.w_imag[wi][m];
+                        if wc == 0.0 {
+                            continue;
+                        }
+                        let d = Complex::new(ef - self.e[m], lambda);
+                        let den = d * d + Complex::new(u * u, 0.0);
+                        if den.norm() == 0.0 {
+                            continue;
+                        }
+                        let g0 = d * (wgt / den);
+                        re += (-1.0 / pi) * wc * g0.re;
+                        im += (-1.0 / pi) * wc * g0.im;
+                    }
+                }
+                Complex::new(re, im)
+            })
+            .collect();
+        AcSetup { lambdas, values }
+    }
+
+    /// All derivative pieces of the AC self-energy at one frequency.
+    ///
+    /// Besides the value and the `omega` derivatives this builds the
+    /// coefficients of the *linear functional* the pullback consumes:
+    /// `d Sigma_c / d W_c[n,m](iu_k)` and the explicit energy derivative
+    /// `d Sigma_c / d e_m` (kernel plus the `ef(e_HOMO, e_LUMO)` chain).
+    /// The corresponding `omega`-differentiated coefficients feed the
+    /// linearized branch's second-order channel.
+    fn ac_parts(&self, table: &QpRowTable, setup: &AcSetup, omega: f64) -> Option<AcParts> {
+        let ef = self.ac_fermi_level();
+        let z = Complex::new(omega, self.config.ac_eta);
+        let deriv = pade_derivatives(&setup.lambdas, ef, &setup.values, z)?;
+        let pi = std::f64::consts::PI;
+        let npts = setup.values.len();
+        let np = npts + 1;
+        let (nquad, nmo) = (self.quad.len(), self.nmo);
+        let mut w_coeff = vec![vec![0.0f64; nmo]; nquad];
+        let mut w_coeff_omega = vec![vec![0.0f64; nmo]; nquad];
+        let mut be = vec![0.0f64; nmo];
+        let mut be_omega = vec![0.0f64; nmo];
+        // `ef` enters both the node positions and the sample kernel.
+        let mut ef_chain = deriv.dvalue_dparam[np - 1].re;
+        let mut ef_chain_omega = deriv.d2value_dz_dparam[np - 1].re;
+        for wi in 0..nquad {
+            let (u, wgt) = self.quad[wi];
+            let u2 = Complex::new(u * u, 0.0);
+            for m in 0..nmo {
+                let wc = table.w_imag[wi][m];
+                if wc == 0.0 {
+                    continue;
+                }
+                let de = ef - self.e[m];
+                // `y_s = sum_k (-1/pi) W_nm(iu_k) g0`, so the derivative with
+                // respect to `W` carries no `W` factor, while the derivative
+                // with respect to the energies carries `W` once (`k_e`).
+                let k_w = Complex::new(-1.0 / pi, 0.0);
+                let k_e = Complex::new(-wc / pi, 0.0);
+                let mut cw = 0.0f64;
+                let mut cwo = 0.0f64;
+                let mut cded = 0.0f64;
+                let mut cded_o = 0.0f64;
+                for s in 0..npts {
+                    let d = Complex::new(de, setup.lambdas[s]);
+                    let den = d * d + u2;
+                    let inv = Complex::new(1.0, 0.0) / den;
+                    let g0 = d * inv * wgt;
+                    // d g0 / d ef = wgt (u^2 - d^2)/den^2; d g0 / d e_m = -that
+                    let dg = (u2 - d * d) * inv * inv * wgt;
+                    cw += (deriv.dvalue_dparam[s] * k_w * g0).re;
+                    cwo += (deriv.d2value_dz_dparam[s] * k_w * g0).re;
+                    cded -= (deriv.dvalue_dparam[s] * k_e * dg).re;
+                    cded_o -= (deriv.d2value_dz_dparam[s] * k_e * dg).re;
+                    ef_chain += (deriv.dvalue_dparam[s] * k_e * dg).re;
+                    ef_chain_omega += (deriv.d2value_dz_dparam[s] * k_e * dg).re;
+                }
+                w_coeff[wi][m] = cw;
+                w_coeff_omega[wi][m] = cwo;
+                be[m] += cded;
+                be_omega[m] += cded_o;
+            }
+        }
+        let homo = self.nocc.saturating_sub(1);
+        let lumo = self.nocc.min(nmo.saturating_sub(1));
+        be[homo] += 0.5 * ef_chain;
+        be[lumo] += 0.5 * ef_chain;
+        be_omega[homo] += 0.5 * ef_chain_omega;
+        be_omega[lumo] += 0.5 * ef_chain_omega;
+        Some(AcParts {
+            sigma: deriv.value.re,
+            dsigma_domega: deriv.dvalue_dz.re,
+            d2sigma_domega2: deriv.d2value_dz2.re,
+            w_coeff,
+            be,
+            w_coeff_omega,
+            be_omega,
+        })
+    }
+
+    /// Debug/validation aid: the raw AC setup of one orbital (sample
+    /// frequencies, Fermi shift and sample values).  Used by the finite
+    /// difference diagnostics of the AC chain rule.
+    #[doc(hidden)]
+    pub fn ac_debug_setup(&self, n: usize) -> (Vec<f64>, f64, Vec<Complex<f64>>) {
+        let table = self.qp_row_table(n);
+        let setup = self.ac_setup(&table);
+        (setup.lambdas, self.ac_fermi_level(), setup.values)
+    }
+
+    /// Debug/validation aid: AC value, coefficient table and screened rows at
+    /// one frequency.
+    #[doc(hidden)]
+    pub fn ac_debug_coeff(
+        &self,
+        n: usize,
+        omega: f64,
+    ) -> (f64, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let table = self.qp_row_table(n);
+        let setup = self.ac_setup(&table);
+        let parts = self.ac_parts(&table, &setup, omega).unwrap();
+        (parts.sigma, parts.w_coeff, table.w_imag)
+    }
+
+    /// Assemble a [`QpCache`] from AC pieces.  The static-subtraction fields
+    /// (`w0`, `y0_static`, `residues`) are empty: the AC functional contains
+    /// no `W(0)` subtraction and no real-axis residues.
+    #[allow(clippy::too_many_arguments)]
+    fn ac_finish_cache(
+        &self,
+        n: usize,
+        table: &QpRowTable,
+        parts: &AcParts,
+        omega: f64,
+        freq: f64,
+        z_factor: f64,
+        static_fallback: bool,
+        linearized: bool,
+        lin_shift: f64,
+        want_y: bool,
+    ) -> QpCache {
+        let (_c, _i, y_imag, _res) = self.sigma_c_parts_with(freq, n, true, want_y, table);
+        // Validation masks for the two channels of the AC pullback.
+        let mut w_coeff = parts.w_coeff.clone();
+        let mut w_coeff_omega = parts.w_coeff_omega.clone();
+        let mut be = parts.be.clone();
+        let mut be_omega = parts.be_omega.clone();
+        if std::env::var("REST_AC_NO_WCOEFF").is_ok() {
+            for row in w_coeff.iter_mut() { row.iter_mut().for_each(|v| *v = 0.0); }
+            for row in w_coeff_omega.iter_mut() { row.iter_mut().for_each(|v| *v = 0.0); }
+        }
+        if std::env::var("REST_AC_NO_BE").is_ok() {
+            be.iter_mut().for_each(|v| *v = 0.0);
+            be_omega.iter_mut().for_each(|v| *v = 0.0);
+        }
+        // The omega-differentiated coefficients are only read by the
+        // second-order channel of the **linearized** branch; dropping them
+        // keeps the resident size of the production (root/static) caches at
+        // one extra `nquad x nmo` table instead of three.
+        if !linearized {
+            w_coeff_omega.clear();
+            be_omega.clear();
+        }
+        QpCache {
+            target: n,
+            omega,
+            freq,
+            z_factor,
+            dsigma_domega: parts.dsigma_domega,
+            static_fallback,
+            linearized,
+            lin_shift,
+            w_imag: table.w_imag.clone(),
+            y_imag: if want_y { y_imag } else { Vec::new() },
+            m_imag: self.compact_m_imag(&table.m, !want_y),
+            w0: Vec::new(),
+            y0_static: Vec::new(),
+            residues: Vec::new(),
+            ac: AcQpData {
+                w_coeff,
+                be,
+                w_coeff_omega,
+                be_omega,
+                d2sigma_domega2: parts.d2sigma_domega2,
+            },
+        }
+    }
+
+    /// AC cache at a fixed frequency (pinned QP energy, or the final assembly
+    /// of a root/branch).
+    fn ac_cache_at_omega(&self, n: usize, omega: f64, want_y: bool) -> QpCache {
+        let table = self.qp_row_table(n);
+        let setup = self.ac_setup(&table);
+        let parts = self
+            .ac_parts(&table, &setup, omega)
+            .expect("gw_grad: AC Padé construction broke down (continued fraction)");
+        let z = 1.0 / (1.0 - parts.dsigma_domega);
+        self.ac_finish_cache(n, &table, &parts, omega, omega, z, false, false, 0.0, want_y)
+    }
+
+    /// Static on-shell AC cache, `E = consts + Re Sigma_c(e_n)`, `Z = 1`.
+    fn ac_static_cache(&self, n: usize, consts: f64, table: &QpRowTable, setup: &AcSetup, want_y: bool) -> QpCache {
+        let freq = self.e[n];
+        let parts = self
+            .ac_parts(table, setup, freq)
+            .expect("gw_grad: AC Padé construction broke down (continued fraction)");
+        let omega = consts + parts.sigma;
+        self.ac_finish_cache(n, table, &parts, omega, freq, 1.0, true, false, 0.0, want_y)
+    }
+
+    /// Linearized (one-step Newton) AC cache at the mean-field frequency.
+    fn ac_linearized_cache(
+        &self,
+        n: usize,
+        consts: f64,
+        table: &QpRowTable,
+        setup: &AcSetup,
+        want_y: bool,
+        capped: bool,
+    ) -> QpCache {
+        let freq = self.e[n];
+        let parts = self
+            .ac_parts(table, setup, freq)
+            .expect("gw_grad: AC Padé construction broke down (continued fraction)");
+        let mut z = 1.0 / (1.0 - parts.dsigma_domega);
+        if !(z > 0.0) {
+            println!(
+                "warning!!! gw_grad (AC) orbital {n}: linearized Z = {z:.4} is not positive; \
+                 using the static on-shell energy"
+            );
+            return self.ac_static_cache(n, consts, table, setup, want_y);
+        }
+        let shift = consts + parts.sigma - freq;
+        if capped {
+            let cap = self.config.linear_step_cap;
+            let step = z * shift;
+            if cap > 0.0 && step.abs() > cap {
+                z = if shift != 0.0 { cap / shift.abs() * z.signum() } else { 0.0 };
+            }
+        }
+        let omega = freq + z * shift;
+        self.ac_finish_cache(n, table, &parts, omega, freq, z, false, true, shift, want_y)
+    }
+
+    /// AC counterpart of [`Self::build_target_cache`].
+    fn build_target_cache_ac(&self, n: usize, want_y: bool) -> QpCache {
+        let consts = self.consts(n);
+        let side = if n < self.nocc { -1.0 } else { 1.0 };
+        let table = self.qp_row_table(n);
+        let setup = self.ac_setup(&table);
+        let deeply_occupied =
+            self.e[n] < 0.0 && -self.e[n] > self.config.static_fallback_threshold;
+        if deeply_occupied || self.config.force_static_fallback.contains(&n) {
+            return self.ac_static_cache(n, consts, &table, &setup, want_y);
+        }
+        if n >= self.nocc && self.e[n] > self.config.linear_fallback_threshold {
+            return self.ac_linearized_cache(n, consts, &table, &setup, want_y, true);
+        }
+        if self.config.force_linearized.contains(&n) {
+            return self.ac_linearized_cache(n, consts, &table, &setup, want_y, false);
+        }
+        let value = |omega: f64| -> f64 {
+            match self.ac_parts(&table, &setup, omega) {
+                Some(p) => consts + p.sigma - omega,
+                None => f64::NAN,
+            }
+        };
+        if self.config.qpe_graphical {
+            let (have_crossing, xg) =
+                crate::ri_gw::linear_interpolation_solver(&value, self.e[n], side, 21, 0.1);
+            if have_crossing {
+                return self.ac_cache_at_omega(n, xg, want_y);
+            }
+            println!(
+                "warning!!! gw_grad (AC) graphical solver found no crossing for orbital {n}; \
+                 using the linearized (one-step Newton) functional"
+            );
+            return self.ac_linearized_cache(n, consts, &table, &setup, want_y, true);
+        }
+        // Newton on the analytic derivative of the Padé QP equation.  The
+        // approximant is smooth in `omega`, so this converges quadratically
+        // wherever the root is not on top of a Padé pole.
+        let mut x = self.e[n] + side * 0.02;
+        let mut converged = false;
+        for _ in 0..self.config.qpe_max_iter {
+            let parts = match self.ac_parts(&table, &setup, x) {
+                Some(p) => p,
+                None => break,
+            };
+            let f = consts + parts.sigma - x;
+            let df = parts.dsigma_domega - 1.0;
+            if !df.is_finite() || df.abs() < 1.0e-14 {
+                break;
+            }
+            let step = -f / df;
+            x += step;
+            if step.abs() < self.config.qpe_tol {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            println!(
+                "warning!!! gw_grad (AC) Newton did not converge for orbital {n}; \
+                 using the linearized (one-step Newton) functional"
+            );
+            return self.ac_linearized_cache(n, consts, &table, &setup, want_y, true);
+        }
+        let parts = self
+            .ac_parts(&table, &setup, x)
+            .expect("gw_grad: AC Padé construction broke down (continued fraction)");
+        let z = 1.0 / (1.0 - parts.dsigma_domega);
+        if self.config.z_min > 0.0 && z < self.config.z_min {
+            println!(
+                "warning!!! gw_grad (AC) orbital {n}: converged Z = {z:.4} is below z_min = \
+                 {:.3}; using the linearized (one-step Newton) functional",
+                self.config.z_min
+            );
+            return self.ac_linearized_cache(n, consts, &table, &setup, want_y, true);
+        }
+        self.ac_finish_cache(n, &table, &parts, x, x, z, false, false, 0.0, want_y)
     }
 
     fn build_target_cache_with(&self, n: usize, want_y: bool) -> QpCache {
@@ -4307,6 +4786,9 @@ impl<'a> GwGradEngine<'a> {
         // branch cascade below never runs for a pinned orbital.
         if let Some(omega) = self.pinned_omega(n) {
             return self.cache_at_omega(n, omega, want_y);
+        }
+        if self.config.gw_variant == GwVariant::Ac {
+            return self.build_target_cache_ac(n, want_y);
         }
         let consts = self.consts(n);
         let side = if n < self.nocc { -1.0 } else { 1.0 };
@@ -4383,6 +4865,7 @@ impl<'a> GwGradEngine<'a> {
                 w0,
                 y0_static,
                 residues,
+                ac: AcQpData::default(),
             };
         }
         // Smooth exact-residue mode: the residue frequencies follow the QP
@@ -4477,6 +4960,7 @@ impl<'a> GwGradEngine<'a> {
                 w0,
                 y0_static,
                 residues,
+                ac: AcQpData::default(),
             };
         }
         // Newton on the **analytic** derivative of the QP equation.
@@ -4636,6 +5120,7 @@ impl<'a> GwGradEngine<'a> {
             w0,
             y0_static,
             residues,
+            ac: AcQpData::default(),
         }
     }
 
@@ -4739,8 +5224,15 @@ impl<'a> GwGradEngine<'a> {
             // term, which moves the tangent point `e_n`.  `B` has no
             // omega-dependence, so its `b_x` and exchange channels contribute
             // nothing in omega mode (the standard pass already carries `Z`).
+            // AC (Padé) caches replace the CD kernel with the coefficients of
+            // the linear functional `Sigma_c = sum_{k,m} c_km W_c[n,m](iu_k)`.
+            let ac = cache.ac.is_ac();
             let dsigma2 = if omega_mode && !no_imag {
-                self.sigma_d2_from_parts(cache.freq, &cache.w_imag, &cache.w0)
+                if ac {
+                    cache.ac.d2sigma_domega2
+                } else {
+                    self.sigma_d2_from_parts(cache.freq, &cache.w_imag, &cache.w0)
+                }
             } else {
                 0.0
             };
@@ -4929,16 +5421,21 @@ impl<'a> GwGradEngine<'a> {
                 // subtracts the accumulated `V` matrices.
                 let t_gram = Instant::now();
                 for m in 0..nmo {
-                    let t = cache.freq - self.e[m];
-                    let b = {
-                    let __d = t * t + u * u;
-                    let (__k1, __k2) = if omega_mode {
-                        (2.0 * (u * u - t * t) / (__d * __d),
-                         -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d))
+                    let b = if ac {
+                        if omega_mode {
+                            cache.ac.w_coeff_omega[wi][m]
+                        } else {
+                            cache.ac.w_coeff[wi][m]
+                        }
                     } else {
-                        (2.0 * t / __d, 2.0 * (u * u - t * t) / (__d * __d))
-                    };
-                    -wgt / TWO_PI * __k1
+                        let t = cache.freq - self.e[m];
+                        let __d = t * t + u * u;
+                        let __k1 = if omega_mode {
+                            2.0 * (u * u - t * t) / (__d * __d)
+                        } else {
+                            2.0 * t / __d
+                        };
+                        -wgt / TWO_PI * __k1
                     };
                     let base = m * naux;
                     for r in 0..naux {
@@ -4990,8 +5487,10 @@ impl<'a> GwGradEngine<'a> {
                     if c == 0.0 {
                         continue;
                     }
-                    // dq covector of the pairs (n, m) and the explicit eps1 term
-                    if !no_be_expl {
+                    // dq covector of the pairs (n, m) and the explicit eps1 term.
+                    // AC caches carry the whole `e_m` derivative (kernel plus the
+                    // `ef` chain) in `cache.ac.be`, added once after this loop.
+                    if !no_be_expl && !ac {
                         let f = c * wgt / TWO_PI;
                         for m in 0..nmo {
                             let t = cache.freq - self.e[m];
@@ -5008,16 +5507,21 @@ impl<'a> GwGradEngine<'a> {
                     // `sc = y - y0` is already the covector's source vector, so
                     // the update reads one stream instead of subtracting two
                     for m in 0..nmo {
-                        let t = cache.freq - self.e[m];
-                        let a = {
-                    let __d = t * t + u * u;
-                    let (__k1, __k2) = if omega_mode {
-                        (2.0 * (u * u - t * t) / (__d * __d),
-                         -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d))
-                    } else {
-                        (2.0 * t / __d, 2.0 * (u * u - t * t) / (__d * __d))
-                    };
-                        -c * wgt / TWO_PI * __k1
+                        let a = if ac {
+                            c * if omega_mode {
+                                cache.ac.w_coeff_omega[wi][m]
+                            } else {
+                                cache.ac.w_coeff[wi][m]
+                            }
+                        } else {
+                            let t = cache.freq - self.e[m];
+                            let __d = t * t + u * u;
+                            let __k1 = if omega_mode {
+                                2.0 * (u * u - t * t) / (__d * __d)
+                            } else {
+                                2.0 * t / __d
+                            };
+                            -c * wgt / TWO_PI * __k1
                         };
                         let base = m * naux;
                         let col_m = cols[m];
@@ -5035,6 +5539,22 @@ impl<'a> GwGradEngine<'a> {
                     if grad_timing() {
                         T_PULL.with(|c| c.borrow_mut()[2] += t_bj.elapsed().as_secs_f64());
                         T_PULL.with(|c| c.borrow_mut()[3] += t_acc.elapsed().as_secs_f64());
+                    }
+                }
+            }
+
+            // AC: the explicit mean-field energy channel `d Sigma_c/d e_m`
+            // (kernel derivative **plus** the `ef = (e_HOMO + e_LUMO)/2`
+            // chain), once per cache rather than once per quadrature point.
+            if ac && !no_imag && !no_be_expl {
+                for k in 0..nk {
+                    let c = cs[k];
+                    if c == 0.0 {
+                        continue;
+                    }
+                    let bev = if omega_mode { &cache.ac.be_omega } else { &cache.ac.be };
+                    for m in 0..nmo {
+                        be[k][m] += c * bev[m];
                     }
                 }
             }
@@ -5739,6 +6259,7 @@ impl<'a> GwGradEngine<'a> {
                 w0: c.w0.clone(),
                 y0_static: c.y0_static.clone(),
                 residues: c.residues.clone(),
+                ac: c.ac.clone(),
             })
             .collect();
         let refs: Vec<&QpCache> = owned.iter().collect();
@@ -7428,6 +7949,14 @@ impl GwGradEngine<'_> {
     /// graphical solver has a residual of order the linear-interpolation
     /// error (~1e-5); an unconverged fallback root stands out at ~1e-2.
     pub fn qp_equation_value(&self, omega: f64, n: usize) -> f64 {
+        if self.config.gw_variant == GwVariant::Ac {
+            let table = self.qp_row_table(n);
+            let setup = self.ac_setup(&table);
+            return match self.ac_parts(&table, &setup, omega) {
+                Some(p) => self.consts(n) + p.sigma - omega,
+                None => f64::NAN,
+            };
+        }
         self.consts(n) + self.sigma_c(omega, n) - omega
     }
 }
@@ -8279,6 +8808,11 @@ impl<'a> GwCdGradEngine<'a> {
         vxc: GwVxc,
     ) -> Self {
         // the full-CD path never touches the low-rank machinery
+        assert!(
+            config.gw_variant != GwVariant::Ac,
+            "GwCdGradEngine implements only the contour-deformation self-energy; \
+             use GwGradEngine for gw_variant = \"ac\""
+        );
         let mut config = config;
         config.skip_lr_cache = true;
         let base = GwGradEngine::new_with_raw_and_vxc(scf, config, raw, vxc);

@@ -49,6 +49,7 @@ use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 pub mod ac;
+pub mod ac_grad;
 pub mod fscd;
 pub mod renormalized_singles;
 pub mod scgw;

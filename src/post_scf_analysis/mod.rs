@@ -642,7 +642,26 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 qp_ctrl.gradient_orbital as usize
             };
             assert!(target < scf_data.mol.num_state, "gradient_orbital {target} out of range");
-            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd");
+            let ac = qp_ctrl.gw_variant
+                == crate::ctrl_io::quasiparticle_methods::GwVariant::Ac;
+            if ac && qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") {
+                println!(
+                    "GW-BSE gradient: gw_variant = \"ac\" uses the low-rank AC engine \
+                     (the full-CD engine only implements the CD functional); \
+                     gradient_engine = \"cd\" is overridden."
+                );
+            }
+            if !ac
+                && qp_ctrl.gw_variant
+                    == crate::ctrl_io::quasiparticle_methods::GwVariant::Fscd
+            {
+                println!(
+                    "GW-BSE gradient: gw_variant = \"fscd\" currently differentiates the \
+                     contour-deformation functional; the frequency-sampled residue \
+                     evaluation is not used by the gradient."
+                );
+            }
+            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") && !ac;
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
             let (grad, omega, z) = if use_cd {
                 let engine = ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(scf_data, cfg, vxc);
@@ -652,8 +671,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 engine.analytic_gradient(target)
             };
             println!(
-                "GW quasiparticle energy of orbital {target}: {omega:.12} Ha  (Z = {z:.6}, engine = \"{}\")",
-                if use_cd {"cd"} else {"lr"}
+                "GW quasiparticle energy of orbital {target}: {omega:.12} Ha  (Z = {z:.6}, engine = \"{}\", gw_variant = \"{}\")",
+                if use_cd {"cd"} else {"lr"},
+                qp_ctrl.gw_variant.as_str()
             );
             report_analytic_gradient(scf_data, "GW", &grad);
             report_state_and_total_gradient(scf_data, "GW", &grad.clone());

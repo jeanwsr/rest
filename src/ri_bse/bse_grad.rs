@@ -2169,6 +2169,7 @@ pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
         w0: Vec::new(),
         y0_static: Vec::new(),
         residues: Vec::new(),
+        ac: crate::ri_gw::gw_grad::AcQpData::default(),
     }
 }
 
