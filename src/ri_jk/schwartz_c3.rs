@@ -154,7 +154,18 @@ impl ScreenedC3Engine {
         let out_len = out.len();
         let out_ptr = std::sync::atomic::AtomicPtr::new(out.as_mut_ptr());
 
-        tasks.into_par_iter().with_min_len(32).for_each_init(
+        // Reorder by aux shell before the parallel dispatch. `kept_tasks`
+        // enumerates pair-major, so the heavy pairs (large q_cond, kept on
+        // nearly every aux shell) contribute long runs of expensive blocks
+        // that a static split lumps onto one worker — measured on ts2 as a
+        // ~10 s single-thread tail while the other workers idle on the rayon
+        // latch (xc_valley_report.md, appendix 4). Interleaving by aux shell
+        // spreads the heavy pairs across workers; the block writes are
+        // disjoint, so the result is bit-for-bit unchanged.
+        let mut tasks = tasks;
+        tasks.sort_unstable_by_key(|&(_, psh)| psh);
+
+        tasks.into_par_iter().with_min_len(4).for_each_init(
             || (vec![0.0_f64; buf_size], vec![0.0_f64; cache_size]),
             |(buf, cache), (task, psh)| {
                 let pair = self.pairs.pairs[task];
@@ -277,7 +288,11 @@ impl ScreenedC3Engine {
         let out_len = out.len();
         let out_ptr = std::sync::atomic::AtomicPtr::new(out.as_mut_ptr());
 
-        tasks.into_par_iter().with_min_len(32).for_each_init(
+        // same interleaving as `evaluate_s2ij`: spread heavy pairs across workers
+        let mut tasks = tasks;
+        tasks.sort_unstable_by_key(|&(_, psh, _)| psh);
+
+        tasks.into_par_iter().with_min_len(4).for_each_init(
             || (vec![0.0_f64; buf_size], vec![0.0_f64; cache_size]),
             |(buf, cache), (task, psh, forward)| {
                 let pair = self.pairs.pairs[task];

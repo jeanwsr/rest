@@ -3605,12 +3605,19 @@ impl SCF {
         //}
 
 
+        let direct_done = std::env::var("REST_XC_DIRECT").is_ok()
+            && self.grids.as_ref().map_or(false, |g| g.ao_compressed.is_some());
         for i_spin in (0..spin_channel) {
             let mut vxc_s = vxc.get_mut(i_spin).unwrap();
             let mut vxc_mf_s = vxc_mf.get_mut(i_spin).unwrap();
 
-            vxc_mf_s.self_add(&vxc_mf_s.transpose());
-            vxc_mf_s.self_multiple(0.5);
+            if direct_done {
+                // the direct kernel wrote the upper triangle of (C + C^T)
+                vxc_mf_s.self_multiple(0.5);
+            } else {
+                vxc_mf_s.self_add(&vxc_mf_s.transpose());
+                vxc_mf_s.self_multiple(0.5);
+            }
             *vxc_s = vxc_mf_s.to_matrixupper();
         }
 
@@ -3807,12 +3814,19 @@ impl SCF {
         //}
 
 
+        let direct_done = std::env::var("REST_XC_DIRECT").is_ok()
+            && self.grids.as_ref().map_or(false, |g| g.ao_compressed.is_some());
         for i_spin in (0..spin_channel) {
             let mut vxc_s = vxc.get_mut(i_spin).unwrap();
             let mut vxc_mf_s = vxc_mf.get_mut(i_spin).unwrap();
 
-            vxc_mf_s.self_add(&vxc_mf_s.transpose());
-            vxc_mf_s.self_multiple(0.5);
+            if direct_done {
+                // the direct kernel wrote the upper triangle of (C + C^T)
+                vxc_mf_s.self_multiple(0.5);
+            } else {
+                vxc_mf_s.self_add(&vxc_mf_s.transpose());
+                vxc_mf_s.self_multiple(0.5);
+            }
             *vxc_s = vxc_mf_s.to_matrixupper();
         }
 

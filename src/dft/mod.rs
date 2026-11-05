@@ -2131,6 +2131,79 @@ pub fn xc_exc_code(xc_func: &LibXCFunctional, rho: &MatrixFull<f64>, sigma:&Matr
     compute_exc_by_family(xc_func, spin_channel, rho, sigma, &MatrixFull::empty(), &MatrixFull::empty())
 }
 
+/// Direct upper-triangle accumulation kernel (prototype, `REST_XC_DIRECT=1`).
+///
+/// Per batch, computes the 64x64-tile rank-k updates for both `ao · vao^T`
+/// and `vao · ao^T` and adds their sum straight into the global vxc upper
+/// triangle at the batch's global AO indices. The per-batch square matrix and
+/// the scatter pass disappear, and the working set (two tile accumulators plus
+/// two 64-wide columns) stays in L1/L2. The result is the upper triangle of
+/// `(C + C^T)`, i.e. exactly twice the symmetrized vxc upper triangle; the
+/// caller must replace its usual `(M + M^T)/2` symmetrization with a plain
+/// `* 0.5` (see `generate_vxc_rayon`).
+///
+/// `ao`/`vao` are column-major `[m x k]` blocks with leading dimensions
+/// `ld_ao`/`ld_vao`; `ridx` maps batch-local rows to global AO indices; `v`
+/// is the global matrix with leading dimension `ld_v`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub fn direct_acc_upper(
+    ao: &[f64], ld_ao: usize,
+    vao: &[f64], ld_vao: usize,
+    m: usize, k: usize,
+    ridx: &[usize],
+    v: &mut [f64], ld_v: usize,
+) {
+    let mut ct = [0.0f64; 64 * 64];
+    let mut ct2 = [0.0f64; 64 * 64];
+    let mut jt = 0usize;
+    while jt < m {
+        let nj = (m - jt).min(64);
+        let mut it = 0usize;
+        while it <= jt {
+            let ni = (m - it).min(64);
+            for x in ct.iter_mut() { *x = 0.0; }
+            for x in ct2.iter_mut() { *x = 0.0; }
+            for g in 0..k {
+                let a_i = &ao[it + g * ld_ao ..];
+                let b_j = &vao[jt + g * ld_vao ..];
+                let a2_i = &vao[it + g * ld_vao ..];
+                let b2_j = &ao[jt + g * ld_ao ..];
+                unsafe {
+                    for i in 0..ni {
+                        let ai = a_i.get_unchecked(i);
+                        let br = b_j.get_unchecked(..nj);
+                        let cr = ct.get_unchecked_mut(i * 64 .. i * 64 + nj);
+                        for j in 0..nj { *cr.get_unchecked_mut(j) += ai * *br.get_unchecked(j); }
+                        let bi = a2_i.get_unchecked(i);
+                        let br2 = b2_j.get_unchecked(..nj);
+                        let cr2 = ct2.get_unchecked_mut(i * 64 .. i * 64 + nj);
+                        for j in 0..nj { *cr2.get_unchecked_mut(j) += bi * *br2.get_unchecked(j); }
+                    }
+                }
+            }
+            // add ct[i,j] + ct2[i,j] into the global upper triangle
+            for j in 0..nj {
+                let gj = ridx[jt + j];
+                let dst_col = gj * ld_v;
+                unsafe {
+                    for i in 0..ni {
+                        let gi = *ridx.get_unchecked(it + i);
+                        if gi <= gj {
+                            let e = *v.get_unchecked(gi + dst_col)
+                                + *ct.get_unchecked(i * 64 + j)
+                                + *ct2.get_unchecked(i * 64 + j);
+                            *v.get_unchecked_mut(gi + dst_col) = e;
+                        }
+                    }
+                }
+            }
+            it += 64;
+        }
+        jt += 64;
+    }
+}
+
 pub fn contract_vxc_0(mat_a: &mut MatrixFull<f64>, mat_b: &MatrixFullSlice<f64>, slice_c: &[f64], scaling_factor: Option<f64>) {
     match scaling_factor {
         None =>  {
@@ -3955,6 +4028,19 @@ impl Grids {
                             }
                         }
                     }
+                } else if std::env::var("REST_XC_DIRECT").is_ok() {
+                    // prototype: direct upper-triangle accumulation, no batch
+                    // square, no scatter. See `direct_acc_upper` for the exact
+                    // maths; the caller's symmetrize step must be replaced by
+                    // a plain *0.5 when this path is active.
+                    let ao_base = &batch_ao.data[g_local_start * n_active ..];
+                    let ld = n_active;
+                    direct_acc_upper(
+                        ao_base, ld,
+                        &vxc_ao_comp[i_spin].data[..], ld,
+                        n_active, n_batch, indices,
+                        &mut loc_vxc_mat[i_spin].data[..], num_basis,
+                    );
                 } else {
                     let mut loc_mat_batch = MatrixFull::new([n_active, n_active], 0.0);
                     _dgemm(
