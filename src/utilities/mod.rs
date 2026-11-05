@@ -3,6 +3,7 @@ pub mod memory_monitor;
 pub mod rstsr_util;
 pub mod buffer_pool;
 pub mod log;
+pub mod basic_math;
 
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;

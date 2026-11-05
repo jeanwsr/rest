@@ -1,6 +1,6 @@
 use tensors::{MatrixFull, MatrixFullSlice};
 
-use crate::basis_io::basic_math::specific_double_factorial;
+use crate::utilities::basic_math::specific_double_factorial;
 
 use super::DMatrix;
 
