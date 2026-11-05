@@ -3207,8 +3207,13 @@ impl SCF {
             }
         }
 
+        let num_state_before = self.mol.num_state;
         (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
 
+        if self.mol.num_state < num_state_before {
+            info!("The overlap matrix has {} linearly dependent direction(s): {} of {} basis functions carry an orbital.",
+                num_state_before - self.mol.num_state, self.mol.num_state, num_state_before);
+        }
     }
 
     pub fn semi_diagonalize_hamiltonian(&mut self) {
@@ -5920,10 +5925,13 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
     #[cfg(not(feature = "mpi"))]
     { (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside_fast(scf_data); }
 
-    //println!("diagonalize_hamiltonian_outside: num_state {}", num_state);
-
-
-    (eigenvectors, eigenvalues, scf_data.mol.num_state)
+    // `num_state` (not `scf_data.mol.num_state`) is returned on purpose: a near-singular
+    // overlap makes `_hamiltonian_fast_solver` drop the linearly dependent directions, so
+    // the eigenvector matrix has fewer columns than there are basis functions. Publishing
+    // the reduced count keeps `mol.num_state`, the eigenvalue list and the MO tensors in
+    // agreement; the `lapack_dspevx` singular-overlap branch of `prepare_necessary_integrals`
+    // reduces `mol.num_state` the same way.
+    (eigenvectors, eigenvalues, num_state)
 }
 
 #[cfg(feature = "scalapack")]
@@ -6053,6 +6061,10 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
                     }
                     eigenvectors[i_spin] = eigenvector_spin;
                     eigenvalues[i_spin] = eigenvalue_spin;
+                    // A near-singular overlap drops the linearly dependent directions, so the
+                    // distributed solver may return fewer states than there are basis
+                    // functions; publish that count like the serial path does.
+                    if num_state_inv < num_state { num_state = num_state_inv; }
                 }
             },
             SCFType::ROHF => {
@@ -6080,6 +6092,7 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
                 }
                 eigenvectors[0] = eigenvector;
                 eigenvalues[0] = eigenvalue;
+                if num_state_inv < num_state { num_state = num_state_inv; }
             }
         };
         (eigenvectors, eigenvalues, num_state)
