@@ -5,22 +5,48 @@ use FlagSide::L as Left;
 use FlagSide::R as Right;
 
 /// Run `f` with the OpenBLAS (pthread-build) global thread count temporarily
-/// capped, restoring the previous value afterwards. The cap never *raises*
-/// the thread count above what the caller has already configured: the
-/// effective count is `min(current, cap)`, with `cap` taken from
-/// `REST_J2C_CD_THREADS` (default 8, the dsyevd precedent). Rationale: the
-/// global count is set at startup from `ctrl.num_threads` (ctrl_io), and a
-/// run configured for fewer threads than the cap — `num_threads = 1` being
-/// the clearest case — must not silently spawn extra BLAS threads inside a
-/// "cap". Only used for one-shot setup factorizations (j2c CD), never from
-/// rayon workers, so the global save/restore is race-free.
-fn with_openblas_threads_cap<T, F: FnOnce() -> T>(f: F) -> T {
-    const DEFAULT_CAP: usize = 8;
-    let cap = std::env::var("REST_J2C_CD_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_CAP)
-        .max(1);
+/// capped, restoring the previous value afterwards. The effective count is
+/// `min(current, cap)` — the cap never *raises* the thread count above what
+/// the caller configured (the global count is set at startup from
+/// `num_threads`, and a `num_threads = 1` run must not spawn extra BLAS
+/// threads inside a "cap").
+///
+/// The automatic cap (`cd_threads == 0`) is `min(8, naux / 512, NUMA-node
+/// cores)`: the measured LAPACK parallel sweet spot is ~8 threads (dpotrf
+/// 5181^3 reaches ~400 GFLOPS at 8 threads with no gain beyond, dsyevd
+/// measured 3.7x at 8 and a 1.9x regression at 56 — rest_tensors 55ae8238),
+/// small matrices degenerate below one panel per thread (rule of thumb: one
+/// 512-wide panel per thread), and threads spanning NUMA nodes contend on
+/// the memory domain (the xc09 14-thread/28-thread valley). A positive
+/// `cd_threads` overrides the automatic choice, still clamped by `current`.
+/// Only used for one-shot setup factorizations (j2c CD), never from rayon
+/// workers, so the global save/restore is race-free.
+fn with_openblas_threads_cap<T, F: FnOnce() -> T>(naux: usize, cd_threads: usize, f: F) -> T {
+    let numa_local_cores = || -> usize {
+        // cores of one NUMA node, from /sys/devices/system/node/node0/cpulist
+        // ("0-13,28-41" style); any read/parse failure disables the term
+        std::fs::read_to_string("/sys/devices/system/node/node0/cpulist")
+            .ok()
+            .map(|s| {
+                s.trim()
+                    .split(',')
+                    .map(|range| {
+                        range.split_once('-').map_or(1, |(a, b)| {
+                            b.trim().parse::<usize>().unwrap_or(0).saturating_sub(
+                                a.trim().parse::<usize>().unwrap_or(0),
+                            ) + 1
+                        })
+                    })
+                    .sum()
+            })
+            .filter(|&n| n > 0)
+            .unwrap_or(usize::MAX)
+    };
+    let cap = if cd_threads > 0 {
+        cd_threads
+    } else {
+        8.min((naux / 512).max(1)).min(numa_local_cores())
+    };
     extern "C" {
         fn openblas_get_num_threads() -> std::os::raw::c_int;
         fn openblas_set_num_threads(n: std::os::raw::c_int);
@@ -55,13 +81,13 @@ pub fn decomp_j2c_eig(j2c: TsrView<f64>, threshold: f64) -> J2CDecompose {
 /// - If `threshold` is Some, will first try Cholesky decomposition, if it fails or some diagonal
 ///   element is smaller than the threshold, will make matrix sufficiently positive-definite with
 ///   the given threshold and then perform Cholesky decomposition again.
-pub fn decomp_j2c_cd(j2c: TsrView<f64>, threshold: Option<f64>, uplo: FlagUpLo) -> J2CDecompose {
-    // OpenBLAS-pthread builds parallelize dpotrf, but the speedup collapses
-    // well before full-core counts (the dsyevd precedent measured 3.7x at 8
-    // threads and a 1.9x slowdown at 56 — commit 55ae8238 of rest_tensors).
-    // Cap the thread count for the factorization with the same default the
-    // dsyevd path uses, tunable through REST_J2C_CD_THREADS.
-    let j2c_l_result = with_openblas_threads_cap(|| rt::linalg::cholesky_f((j2c.view(), uplo)));
+pub fn decomp_j2c_cd(j2c: TsrView<f64>, threshold: Option<f64>, uplo: FlagUpLo, cd_threads: usize) -> J2CDecompose {
+    // The thread cap for the factorization: automatic (`cd_threads == 0`) or
+    // the explicit override, in both cases clamped by the current global
+    // count. See `with_openblas_threads_cap` for the automatic formula.
+    let naux = j2c.shape()[0];
+    let j2c_l_result =
+        with_openblas_threads_cap(naux, cd_threads, || rt::linalg::cholesky_f((j2c.view(), uplo)));
     if let Some(threshold) = threshold {
         if let Ok(j2c_l) = j2c_l_result {
             // check diagonal elements if smaller than threshold
@@ -98,7 +124,12 @@ pub fn get_j2c_decomp(mol: &CInt, device: &DeviceBLAS, j2c_decomp_option: J2CDec
 
     // first try cholesky decomposition, fall back by policy
     match j2c_decomp_option.policy {
-        J2CDecompPolicy::Cd => decomp_j2c_cd(j2c.view(), j2c_decomp_option.threshold, j2c_decomp_option.uplo),
+        J2CDecompPolicy::Cd => decomp_j2c_cd(
+            j2c.view(),
+            j2c_decomp_option.threshold,
+            j2c_decomp_option.uplo,
+            j2c_decomp_option.cd_threads,
+        ),
         J2CDecompPolicy::Eig => decomp_j2c_eig(j2c.view(), j2c_decomp_option.threshold.unwrap_or(J2C_THRESH)),
     }
 }
@@ -429,7 +460,7 @@ fn test_check_recoverable() {
 
     let vec = vec![10.0, 1.0, 2.0, 1.0, 20.0, 3.0, 2.0, 3.0, 30.0];
     let j2c = rt::asarray((vec, [3, 3].f(), &device));
-    let decomp_cd = decomp_j2c_cd(j2c.view(), None, Upper);
+    let decomp_cd = decomp_j2c_cd(j2c.view(), None, Upper, 0);
     let decomp_eig = decomp_j2c_eig(j2c.view(), 1e-5);
 
     let j2c_recon_cd = match decomp_cd {
