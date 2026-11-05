@@ -4,6 +4,30 @@ use super::prelude_dev::*;
 use FlagSide::L as Left;
 use FlagSide::R as Right;
 
+/// Run `f` with the OpenBLAS (pthread-build) global thread count temporarily
+/// capped at `REST_J2C_CD_THREADS` (default 8, the dsyevd precedent), restoring
+/// the previous value afterwards. On OpenMP-built OpenBLAS the setter maps to
+/// the OpenMP team size, which is equally honoured, so the cap is a no-op to
+/// correctness on either build. Only used for one-shot setup factorizations
+/// (j2c CD), never from rayon workers, so the global save/restore is race-free.
+fn with_openblas_threads_cap<T, F: FnOnce() -> T>(f: F) -> T {
+    const DEFAULT_THREADS: usize = 8;
+    let n = std::env::var("REST_J2C_CD_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_THREADS)
+        .max(1);
+    extern "C" {
+        fn openblas_get_num_threads() -> std::os::raw::c_int;
+        fn openblas_set_num_threads(n: std::os::raw::c_int);
+    }
+    let saved = unsafe { openblas_get_num_threads() } as usize;
+    unsafe { openblas_set_num_threads(n as std::os::raw::c_int) };
+    let result = f();
+    unsafe { openblas_set_num_threads(saved as std::os::raw::c_int) };
+    result
+}
+
 /// Decompose 2c-2e ERI matrix using eigen decomposition.
 ///
 /// Eigenvalues smaller than the threshold will be discarded, and the corresponding eigenvectors
@@ -27,7 +51,12 @@ pub fn decomp_j2c_eig(j2c: TsrView<f64>, threshold: f64) -> J2CDecompose {
 ///   element is smaller than the threshold, will make matrix sufficiently positive-definite with
 ///   the given threshold and then perform Cholesky decomposition again.
 pub fn decomp_j2c_cd(j2c: TsrView<f64>, threshold: Option<f64>, uplo: FlagUpLo) -> J2CDecompose {
-    let j2c_l_result = rt::linalg::cholesky_f((j2c.view(), uplo));
+    // OpenBLAS-pthread builds parallelize dpotrf, but the speedup collapses
+    // well before full-core counts (the dsyevd precedent measured 3.7x at 8
+    // threads and a 1.9x slowdown at 56 — commit 55ae8238 of rest_tensors).
+    // Cap the thread count for the factorization with the same default the
+    // dsyevd path uses, tunable through REST_J2C_CD_THREADS.
+    let j2c_l_result = with_openblas_threads_cap(|| rt::linalg::cholesky_f((j2c.view(), uplo)));
     if let Some(threshold) = threshold {
         if let Ok(j2c_l) = j2c_l_result {
             // check diagonal elements if smaller than threshold

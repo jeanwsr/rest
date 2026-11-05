@@ -351,15 +351,33 @@ pub fn compact_rimatr_rows(ri3fn: MatrixFull<f64>, kept: &[usize]) -> MatrixFull
 
     let mut data = ri3fn.data;
     if num_kept < num_baspar {
-        for p_aux in 0..num_auxbas {
-            let src = p_aux * num_baspar;
-            let dst = p_aux * num_kept;
-            for (slot, &p) in kept.iter().enumerate() {
-                data[dst + slot] = data[src + p];
-            }
-        }
-        data.truncate(num_kept * num_auxbas);
-        data.shrink_to_fit();
+        // Parallel compaction into a fresh output buffer. The in-place
+        // left-shift variant (`kept` ascending ⇒ `dst+slot <= src+p`) is
+        // serial-only: a column's writes start inside the read regions of
+        // columns to its left, so any column-parallel split races (two
+        // in-place prototypes corrupted energies to 1e11-1e17 Ha on
+        // ts2/w30 before being reverted). Writing into a separate buffer
+        // makes every column's reads and writes independent — the column
+        // loop parallelizes cleanly, and the old buffer is dropped as soon
+        // as the new one is complete. Peak memory is old + new for the
+        // duration of the move (ts2: 79 + 38 GB on a 744 GB node).
+        // Measured on ts2: 923k kept rows x 5181 aux columns = 4.8 G
+        // element moves ran on one thread for ~10-12 s per call, and the
+        // function is called twice per preparation (in-build pre-screen
+        // compaction and storage-level pruning) — the t≈20-33 s and
+        // t≈64-73 s single-thread windows in the cpuwatch trace.
+        let kept = kept;
+        let mut out = vec![0.0_f64; num_kept * num_auxbas];
+        out.par_chunks_mut(num_kept)
+            .enumerate()
+            .for_each(|(p_aux, out_col)| {
+                let src_col = &data[p_aux * num_baspar..(p_aux + 1) * num_baspar];
+                for (slot, &p) in kept.iter().enumerate() {
+                    out_col[slot] = src_col[p];
+                }
+            });
+        drop(data);
+        data = out;
     }
 
     MatrixFull::from_vec([num_kept, num_auxbas], data).unwrap()
