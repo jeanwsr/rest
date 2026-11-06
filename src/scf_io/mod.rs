@@ -7383,13 +7383,16 @@ pub fn get_grad_dm(
     ovlp: &MatrixFull<f64>,
     density: &MatrixFull<f64>,
 ) -> MatrixFull<f64> {
-    // FDS = F * D * S
-    let mut error = fock.clone().ddot(&mut density.clone()).unwrap();
-    error = error.ddot(&mut ovlp.clone()).unwrap();
+    // FDS = F * D * S — the previous version cloned every operand before each
+    // dgemm (four full-matrix copies per call, ~120 MB on ts2); `ddot` takes
+    // its operand by shared reference already, so the clones were pure
+    // allocation-and-copy overhead in the DIIS tail.
+    let fd = fock.ddot(density).unwrap();
+    let mut error = fd.ddot(ovlp).unwrap();
 
     // SDF = S * D * F
-    let mut sdf = ovlp.clone().ddot(&mut density.clone()).unwrap();
-    sdf = sdf.ddot(&mut fock.clone()).unwrap();
+    let sd = ovlp.ddot(density).unwrap();
+    let sdf = sd.ddot(fock).unwrap();
 
     error.self_sub(&sdf);
     error
