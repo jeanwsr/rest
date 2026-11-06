@@ -434,6 +434,294 @@ pub fn pade_derivatives(
     })
 }
 
+
+// ============================================================================
+// Linear Hermite-Padé interpolation (value + first derivative constraints)
+// ============================================================================
+
+/// Result of a linear Hermite-Padé evaluation.
+#[derive(Clone, Debug)]
+pub struct HermitePadeEval {
+    /// `R(u)`
+    pub value: Complex64,
+    /// `dR/du`
+    pub dvalue_du: Complex64,
+    /// `d^2R/du^2`
+    pub d2value_du2: Complex64,
+    /// `dR/dw_p` for every reference value
+    pub dvalue_dw: Vec<Complex64>,
+    /// `dR/dg_p` for every reference derivative `g_p = dW/du`
+    pub dvalue_dg: Vec<Complex64>,
+}
+
+/// Solve the complex linear system `A x = b` with partial pivoting.
+fn complex_lu_solve(a: &mut [Complex64], n: usize, b: &mut [Complex64]) -> Option<()> {
+    for k in 0..n {
+        let mut piv = k;
+        let mut best = a[k + k * n].norm();
+        for i in (k + 1)..n {
+            let v = a[i + k * n].norm();
+            if v > best {
+                best = v;
+                piv = i;
+            }
+        }
+        if best < 1.0e-300 {
+            return None;
+        }
+        if piv != k {
+            for j in 0..n {
+                a.swap(k + j * n, piv + j * n);
+            }
+            b.swap(k, piv);
+        }
+        let akk = a[k + k * n];
+        for i in (k + 1)..n {
+            let f = a[i + k * n] / akk;
+            if f.norm() == 0.0 {
+                continue;
+            }
+            a[i + k * n] = Complex64::new(0.0, 0.0);
+            for j in (k + 1)..n {
+                a[i + j * n] -= f * a[k + j * n];
+            }
+            b[i] -= f * b[k];
+        }
+    }
+    for k in (0..n).rev() {
+        let mut acc = b[k];
+        for j in (k + 1)..n {
+            acc -= a[k + j * n] * b[j];
+        }
+        b[k] = acc / a[k + k * n];
+    }
+    Some(())
+}
+
+/// Linear Hermite-Padé interpolation in the variable `u = z^2`.
+///
+/// Fits
+///
+/// ```text
+/// R(u) = N(u)/D(u),  D(u) = 1 + sum_{k=1..n} b_k u^k,
+/// N(u) = sum_{k=0..m} a_k u^k,
+/// ```
+///
+/// to values `w_p = W(u_p)` and derivatives `g_p = dW/du|_(u_p)`.
+/// With `P` reference points we use `m = P-1`, `n = P`, i.e. `2P` unknowns
+/// and `2P` conditions.  The returned `dvalue_dw`/`dvalue_dg` are the exact
+/// partial derivatives of the interpolant with respect to the data, obtained
+/// by an adjoint solve of the same linear system.
+///
+/// **Numerical caveat.**  The square `(P, P-1)` Hermite-Padé system becomes
+/// severely ill-conditioned when the data are well represented by a
+/// lower-order rational function (the interpolation problem is then nearly
+/// non-unique), which is the typical situation for a screened Coulomb
+/// interaction with many poles.  The value and the first derivative remain
+/// accurate, but the data partials `dvalue_dw`/`dvalue_dg` can lose all
+/// significance.  Use a regularized least-squares formulation (or confluent
+/// Thiele) before relying on those partials in a gradient.
+///
+/// Returns `None` when the linear system is singular or the evaluation point
+/// hits the denominator; the caller can then fall back to a value-only Padé.
+pub fn hermite_pade(
+    nodes: &[Complex64],
+    values: &[Complex64],
+    derivs: &[Complex64],
+    u: Complex64,
+) -> Option<HermitePadeEval> {
+    let p = values.len();
+    if p < 2 || nodes.len() != p || derivs.len() != p {
+        return None;
+    }
+    let m = p;
+    let n = p - 1;
+    let nunk = m + 1 + n;
+    if nunk != 2 * p {
+        return None;
+    }
+    // scale the variable: v = (u - shift)/scale
+    let shift = nodes.iter().sum::<Complex64>() / (p as f64);
+    let mut scale = 0.0f64;
+    for &x in nodes {
+        scale = scale.max((x - shift).norm());
+    }
+    if !(scale > 0.0) {
+        scale = 1.0;
+    }
+    let vnodes: Vec<Complex64> = nodes.iter().map(|&x| (x - shift) / scale).collect();
+    let v = (u - shift) / scale;
+    let gv: Vec<Complex64> = derivs.iter().map(|&g| g * scale).collect();
+
+    let mut a_mat = vec![Complex64::new(0.0, 0.0); nunk * nunk];
+    let mut rhs = vec![Complex64::new(0.0, 0.0); nunk];
+    for (pp, &vp) in vnodes.iter().enumerate() {
+        let w = values[pp];
+        let g = gv[pp];
+        let row_v = 2 * pp;
+        let row_d = 2 * pp + 1;
+        // value: N(vp) - w D(vp) = w
+        let mut vk = Complex64::new(1.0, 0.0);
+        for k in 0..=m {
+            a_mat[row_v + k * nunk] += vk;
+            vk *= vp;
+        }
+        vk = vp; // v^1
+        for k in 1..=n {
+            a_mat[row_v + (m + k) * nunk] -= w * vk;
+            vk *= vp;
+        }
+        rhs[row_v] = w;
+        // derivative: N'(vp) - g D(vp) - w D'(vp) = g
+        let mut vk1 = Complex64::new(1.0, 0.0);
+        for k in 1..=m {
+            // k vp^(k-1)
+            a_mat[row_d + k * nunk] += Complex64::new(k as f64, 0.0) * vk1;
+            vk1 *= vp;
+        }
+        vk = vp;
+        let mut vk0 = Complex64::new(1.0, 0.0);
+        for k in 1..=n {
+            a_mat[row_d + (m + k) * nunk] -= g * vk;
+            a_mat[row_d + (m + k) * nunk] -=
+                w * Complex64::new(k as f64, 0.0) * vk0;
+            vk *= vp;
+            vk0 *= vp;
+        }
+        rhs[row_d] = g;
+    }
+    // Tikhonov regularization: the multi-point Hermite-Pade problem is
+    // notoriously ill-conditioned (nearly non-unique when the data are close
+    // to a lower-order rational function); a tiny diagonal shift makes the
+    // data partials well defined.
+    let lambda = 1.0e-10;
+    let mut a_reg = a_mat.clone();
+    for d in 0..nunk {
+        a_reg[d + d * nunk] += Complex64::new(lambda, 0.0);
+    }
+    let mut a_solve = a_reg.clone();
+    let mut c = rhs.clone();
+    complex_lu_solve(&mut a_solve, nunk, &mut c)?;
+
+    // value and derivatives at v
+    let mut nval = Complex64::new(0.0, 0.0);
+    let mut n1 = Complex64::new(0.0, 0.0);
+    let mut n2 = Complex64::new(0.0, 0.0);
+    let mut vk = Complex64::new(1.0, 0.0);
+    for k in 0..=m {
+        nval += c[k] * vk;
+        if k >= 1 {
+            n1 += c[k] * Complex64::new(k as f64, 0.0) * powi(v, k - 1);
+        }
+        if k >= 2 {
+            n2 += c[k]
+                * Complex64::new((k * (k - 1)) as f64, 0.0)
+                * powi(v, k - 2);
+        }
+        vk *= v;
+    }
+    let mut dval = Complex64::new(1.0, 0.0);
+    let mut d1 = Complex64::new(0.0, 0.0);
+    let mut d2 = Complex64::new(0.0, 0.0);
+    let mut vk = v;
+    for k in 1..=n {
+        let bk = c[m + k];
+        dval += bk * vk;
+        d1 += bk * Complex64::new(k as f64, 0.0) * powi(v, k - 1);
+        if k >= 2 {
+            d2 += bk
+                * Complex64::new((k * (k - 1)) as f64, 0.0)
+                * powi(v, k - 2);
+        }
+        vk *= v;
+    }
+    if dval.norm() < 1.0e-300 {
+        return None;
+    }
+    let dv = dval;
+    let value = nval / dv;
+    let dvalue_dv = (n1 * dv - nval * d1) / (dv * dv);
+    let d2value_dv2 = (n2 * dv - nval * d2) / (dv * dv)
+        - 2.0 * (n1 * dv - nval * d1) * d1 / (dv * dv * dv);
+
+    // adjoint: A^T lambda = dF/dc
+    let mut dfdc = vec![Complex64::new(0.0, 0.0); nunk];
+    let invd = Complex64::new(1.0, 0.0) / dv;
+    let mut vk = Complex64::new(1.0, 0.0);
+    for k in 0..=m {
+        dfdc[k] = vk * invd;
+        vk *= v;
+    }
+    let mut vk = v;
+    for k in 1..=n {
+        dfdc[m + k] = -vk * nval / (dv * dv);
+        vk *= v;
+    }
+    let mut at = vec![Complex64::new(0.0, 0.0); nunk * nunk];
+    for i in 0..nunk {
+        for j in 0..nunk {
+            at[i + j * nunk] = a_reg[j + i * nunk];
+        }
+    }
+    let mut lambda = dfdc.clone();
+    complex_lu_solve(&mut at, nunk, &mut lambda)?;
+
+    let mut dvalue_dw = vec![Complex64::new(0.0, 0.0); p];
+    let mut dvalue_dg = vec![Complex64::new(0.0, 0.0); p];
+    for pp in 0..p {
+        let vp = vnodes[pp];
+        let w = values[pp];
+        let row_v = 2 * pp;
+        let row_d = 2 * pp + 1;
+        // db/dw = e_{row_v}; dA/dw only in the b-columns
+        let mut dot = lambda[row_v];
+        // value row: dA/dw has -v^k in b_k columns
+        let mut vk = vp;
+        for k in 1..=n {
+            dot += lambda[row_v] * vk * c[m + k]; // subtract dA*c: contribution -v^k*c_b
+            vk *= vp;
+        }
+        // derivative row: dA/dw has -k v^(k-1) in b_k columns
+        let mut vk0 = Complex64::new(1.0, 0.0);
+        vk = vp;
+        for k in 1..=n {
+            dot += lambda[row_d]
+                * Complex64::new(k as f64, 0.0)
+                * vk0
+                * c[m + k];
+            vk *= vp;
+            vk0 *= vp;
+        }
+        dvalue_dw[pp] = dot;
+
+        // db/dg = e_{row_d}; dA/dg has -v^k in b_k columns of the derivative row
+        let mut dotg = lambda[row_d];
+        vk = vp;
+        for k in 1..=n {
+            dotg += lambda[row_d] * vk * c[m + k];
+            vk *= vp;
+        }
+        // dF/dg_u = dF/dg_v / scale
+        dvalue_dg[pp] = dotg * (1.0 / scale);
+    }
+
+    Some(HermitePadeEval {
+        value,
+        dvalue_du: dvalue_dv / scale,
+        d2value_du2: d2value_dv2 / (scale * scale),
+        dvalue_dw,
+        dvalue_dg,
+    })
+}
+
+fn powi(z: Complex64, k: usize) -> Complex64 {
+    let mut out = Complex64::new(1.0, 0.0);
+    for _ in 0..k {
+        out *= z;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +765,54 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn hermite_pade_reproduces_values_and_derivatives() {
+        // A rational function of the same type as the fit (P=4: N degree 4,
+        // D degree 3), so the Hermite-Pade problem is uniquely determined.
+        let num = [
+            Complex64::new(1.0, 0.2),
+            Complex64::new(-0.3, 0.1),
+            Complex64::new(0.5, -0.2),
+            Complex64::new(0.2, 0.3),
+            Complex64::new(-0.1, 0.05),
+        ];
+        let den = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.4, -0.1),
+            Complex64::new(-0.2, 0.15),
+            Complex64::new(0.1, 0.05),
+        ];
+        let f = |u: Complex64| -> Complex64 {
+            let mut n = Complex64::new(0.0, 0.0);
+            let mut p = Complex64::new(1.0, 0.0);
+            for c in num.iter() {
+                n += *c * p;
+                p *= u;
+            }
+            let mut d = Complex64::new(0.0, 0.0);
+            let mut p = Complex64::new(1.0, 0.0);
+            for c in den.iter() {
+                d += *c * p;
+                p *= u;
+            }
+            n / d
+        };
+        let df = |u: Complex64| -> Complex64 {
+            let h = 1.0e-6;
+            (f(u + h) - f(u - h)) / (2.0 * h)
+        };
+        let nodes: Vec<Complex64> = (0..4)
+            .map(|i| Complex64::new(0.03 + 0.02 * i as f64, -0.01 * i as f64))
+            .collect();
+        let vals: Vec<Complex64> = nodes.iter().map(|&u| f(u)).collect();
+        let ders: Vec<Complex64> = nodes.iter().map(|&u| df(u)).collect();
+        let u = Complex64::new(0.09, 0.015);
+        let r = hermite_pade(&nodes, &vals, &ders, u).unwrap();
+        assert!((r.value - f(u)).norm() < 1.0e-7);
+        assert!((r.dvalue_du - df(u)).norm() < 1.0e-6);
+    }
+
 
     #[test]
     fn derivatives_match_finite_differences() {

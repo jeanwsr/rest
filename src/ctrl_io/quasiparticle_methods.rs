@@ -542,6 +542,16 @@ pub struct QuasiParticle {
     pub wac_omega_max: f64,
     /// CD-WAC: imaginary offset (Ha) of the near-real reference frequencies.
     pub wac_delta: f64,
+    /// CD-WAC: real-axis reference-grid spacing rule.
+    ///
+    /// * `0` -- quadratic, `r_i = wac_omega_max * (i/(n-1))^2` (historical);
+    /// * `1` -- linear;
+    /// * `2` -- geometric (dense near zero, sparse at `wac_omega_max`);
+    /// * `3` -- Chebyshev nodes of the second kind on `[0, wac_omega_max]`;
+    /// * `4` -- pole-adapted: quantiles of the transition-energy distribution
+    ///   `|e_a - e_i|`, so that the reference points resolve the RPA poles of
+    ///   `W` instead of the empty high-frequency region.
+    pub wac_grid: usize,
     /// Number of states below/above HOMO-LUMO for the self-energy evaluation
     /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
     /// contribute negligibly to the real-axis residues and inflate de_max, making
@@ -742,7 +752,9 @@ pub struct QuasiParticle {
     /// * `"mo"` (default): the historical route.  Every RI tensor is produced
     ///   by the MO transformation `ao2mo_rayon` (`scf_data.rimatr` →
     ///   `dsymm` against the *full* eigenvector, once per auxiliary function
-    ///   and, in `w_c_matrix_from_scf`, once per block of target orbitals).
+    ///   and per block of target orbitals; `generate_w_c` hoists that transform
+    ///   out of the frequency loop, so the block transform runs once per block
+    ///   and is shared by every imaginary frequency node).
     /// * `"ao"`: the AO-basis route in `ri_gw::tensor_ao`.  The packed AO RI
     ///   tensor is folded with MO coefficients directly,
     ///   `(Q|nm) = sum_{mu,nu} J_Q[mu,nu] X[mu,n] X[nu,m]`, and the half
@@ -952,6 +964,7 @@ impl Default for QuasiParticle {
             wac_n_real: 20,
             wac_omega_max: 50.0,
             wac_delta: 1.0e-3,
+            wac_grid: 0,
             selfenergy_state_range: 100000,
             low_rank_demax_window: false,
             // response BSE grid sampling parameters (default: 2 points per dimension)
@@ -1172,6 +1185,7 @@ impl QuasiParticle {
         table.insert("wac_n_real".to_string(), toml::Value::Integer(self.wac_n_real as i64));
         table.insert("wac_omega_max".to_string(), toml::Value::Float(self.wac_omega_max));
         table.insert("wac_delta".to_string(), toml::Value::Float(self.wac_delta));
+        table.insert("wac_grid".to_string(), toml::Value::Integer(self.wac_grid as i64));
         table.insert("low_rank_demax_window".to_string(), toml::Value::Boolean(self.low_rank_demax_window));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
@@ -1985,6 +1999,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.wac_delta = match tmp_ctrl.get("wac_delta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-3),
                 _ => 1.0e-3,
+            };
+            tmp_input.wac_grid = match tmp_ctrl.get("wac_grid").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
             };
             // Parse response BSE grid sampling parameters
             tmp_input.response_bse_x_start = match tmp_ctrl.get("response_bse_x_start").unwrap_or(&serde_json::Value::Null) {

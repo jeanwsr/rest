@@ -553,42 +553,161 @@ pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_
     }
 
     // Task E: Limit rayon concurrency for generate_w_c to cap per-worker memory.
-    // After Tasks B+C, each worker allocates ~1 GB (response + inverse in-place).
-    // With many frequency points this could still be significant.
     let max_workers = std::env::var("REST_GW_MAX_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     let n_threads = max_workers.min(omega_1.len()).max(1);
 
-    // Save OMP threads and set to 1 inside workers to prevent BLAS thread explosion
-    // (w_c_matrix_from_scf calls generate_ri3mo_rayon_for_multiple_times which uses
-    // rayon + BLAS internally — nested parallelism would create too many BLAS threads)
+    // Save OMP threads and set to 1 inside workers to prevent BLAS thread explosion.
     let saved_omp = omp_get_num_threads_wrapper();
 
-    let (sender,receiver) = channel();
+    let start_mo = scf_data.mol.start_mo;
+    let nmo = num_state - start_mo;
+    let num_auxbas = ri_ov.size[0];
+    let nfreq = omega_1.len();
+
     let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
-    pool.install(|| {
-        rayon::prelude::IndexedParallelIterator::zip(omega_1.par_iter(), weight.par_iter()).for_each_with(sender, |s, (omega_1, weight)| {
-            omp_set_num_threads_wrapper(1);
-            let start=Instant::now();
-            let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I',0.0);
-            let inverse_dielectric=inverse_dielectric_matrix(response,'I');
-            let w_c=w_c_matrix_from_scf(&inverse_dielectric,num_state,scf_data);
-            println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
-            s.send((*omega_1,*weight,w_c)).expect("unsuccessful collection of w_c")
+
+    // ---- one AO→MO pass per row block, shared by a tile of frequencies ----
+    // Historically the AO→MO transform of (μν|P) lived inside the frequency
+    // loop, so every one of the `nfreq` nodes paid the full `nmo/25`
+    // transforms — the dsymm inside `generate_ri3mo_rayon_for_multiple_times`
+    // is independent of the row count, which made that redundancy the dominant
+    // cost.  The block transform is frequency independent, so it is hoisted
+    // here and the per-node work becomes a dgemm with that node's inverse
+    // dielectric, exactly the structure of `low_rank_vchi_vsqrt`.
+    //
+    // Frequencies are processed in tiles: the tile's inverse dielectric
+    // matrices are the only per-node objects held at once, and the row block is
+    // shared by the whole tile.  The tile size is `min(n_threads, mem_tile)`,
+    // where `REST_GW_WC_MEM_MIB` bounds `mem_tile * naux^2 * 8` bytes (unset =
+    // no bound, i.e. one tile and exactly one transform pass per row block when
+    // the worker cap also allows `nfreq` workers).
+    let mem_tile = w_c_frequency_tile(num_auxbas, nfreq, w_c_memory_cap_mib());
+    let tile = n_threads.min(mem_tile).min(nfreq).max(1);
+    let mut w_c_all: Vec<MatrixFull<f64>> = Vec::with_capacity(nfreq);
+    let t_start = Instant::now();
+    for chunk_start in (0..nfreq).step_by(tile) {
+        let chunk_end = (chunk_start + tile).min(nfreq);
+        let inverses: Vec<MatrixFull<f64>> = pool.install(|| {
+            omega_1[chunk_start..chunk_end]
+                .par_iter()
+                .map(|&omega_1| {
+                    omp_set_num_threads_wrapper(1);
+                    let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,omega_1,'I',0.0);
+                    inverse_dielectric_matrix(response,'I')
+                })
+                .collect()
         });
-    });
-    let w_c_at_freqs:Vec<(f64,f64,MatrixFull<f64>)>=receiver.into_iter().collect();
+        let mut w_c_tile: Vec<MatrixFull<f64>> = (0..chunk_end - chunk_start)
+            .map(|_| MatrixFull::new([num_state,num_state],0.0))
+            .collect();
+        let block = 25_usize.min(nmo).max(1);
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = scf_data
+                .generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                )
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+                .into_matfull_i_jk();
+            pool.install(|| {
+                w_c_tile.par_iter_mut().zip(inverses.par_iter()).for_each(|(w_c, inv)| {
+                    omp_set_num_threads_wrapper(1);
+                    fill_w_c_rows_from_block(w_c, &ri_block, inv, row_start, block_n, nmo, num_auxbas);
+                });
+            });
+            row_start = row_end;
+        }
+        w_c_all.extend(w_c_tile);
+    }
     omp_set_num_threads_wrapper(saved_omp);
-    w_c_at_freqs
+    println!(
+        "Evaluation of W_c on {} frequency nodes (one AO→MO pass per row block, {} tile(s)) took {:?}",
+        nfreq,
+        nfreq.div_ceil(tile),
+        t_start.elapsed()
+    );
+
+    omega_1.drain(..).zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect()
 }
+
+/// How many frequency nodes' inverse dielectrics may be resident at once.
+///
+/// Each node contributes one `naux × naux` matrix, so the frequency-parallel
+/// working set is `tile * naux^2 * 8` bytes.  `REST_GW_WC_MEM_MIB` caps that
+/// (0 or unset = no cap); when the cap binds, the AO→MO row-block transform is
+/// repeated `ceil(nfreq/tile)` times instead of being paid once.
+fn w_c_frequency_tile(naux: usize, nfreq: usize, cap_mib: usize) -> usize {
+    let nfreq = nfreq.max(1);
+    if cap_mib == 0 || naux == 0 {
+        return nfreq;
+    }
+    let per_node = naux.saturating_mul(naux).saturating_mul(8).max(1);
+    (cap_mib.saturating_mul(1024 * 1024) / per_node).clamp(1, nfreq)
+}
+
+fn w_c_memory_cap_mib() -> usize {
+    std::env::var("REST_GW_WC_MEM_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Fill the rows `[row_start, row_start+block_n)` of `w_c` from one
+/// already MO-transformed block of `(P|n m)`.
+///
+/// `ri_block` is column-major `[num_auxbas, block_n*nmo]` with the column index
+/// `local_n + local_m*block_n` (the layout produced by the `row_dim × col_dim`
+/// AO→MO transform), so one row of `W_c` is gathered from `nmo` strided
+/// columns, contracted with `ε⁻¹`, and dotted back.
+fn fill_w_c_rows_from_block(
+    w_c: &mut MatrixFull<f64>,
+    ri_block: &MatrixFull<f64>,
+    inverse_dielectric: &MatrixFull<f64>,
+    row_start: usize,
+    block_n: usize,
+    nmo: usize,
+    num_auxbas: usize,
+) {
+    let mut ri_row_n = MatrixFull::new([num_auxbas, nmo], 0.0);
+    let mut tmp = MatrixFull::new([num_auxbas, nmo], 0.0);
+    for local_n in 0..block_n {
+        let global_n = row_start + local_n;
+        for local_m in 0..nmo {
+            let src = (local_n + local_m * block_n) * num_auxbas;
+            let dst = local_m * num_auxbas;
+            ri_row_n.data[dst..dst + num_auxbas]
+                .copy_from_slice(&ri_block.data[src..src + num_auxbas]);
+        }
+        tmp.data.iter_mut().for_each(|x| *x = 0.0);
+        _dgemm_full(inverse_dielectric, 'N', &ri_row_n, 'N', &mut tmp, 1.0, 0.0);
+        for local_m in 0..nmo {
+            let col_start = local_m * num_auxbas;
+            let dot: f64 = ri_row_n.data[col_start..col_start + num_auxbas]
+                .iter()
+                .zip(tmp.data[col_start..col_start + num_auxbas].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            w_c[[global_n, local_m]] = dot;
+            w_c[[local_m, global_n]] = dot;
+        }
+    }
+}
+
 pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
     omp_get_num_threads_wrapper();
     let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
     let max_freq = scf_data.mol.ctrl.freq_cut_off;
     let mut sp = format!("The frequency integration is tabulated by {:3} grids using", num_freq);
-    let (mut omega_1,weight) = if freq_grid_type==0 {
+    let (omega_1,weight) = if freq_grid_type==0 {
         sp = format!("{} the modified Gauss-Legendre grids",sp);
         ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
     } else if freq_grid_type==1 {
@@ -604,15 +723,69 @@ pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_en
     if scf_data.mol.ctrl.print_level>1 {
         println!("{}", sp);
     }
-    omega_1.iter().zip(weight.iter()).map(|(omega_1, weight)| {
-        let start=Instant::now();
-        let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I',0.0);
-        let inverse_dielectric=inverse_dielectric_matrix(response,'I');
-        let w_c=w_c_matrix_from_scf(&inverse_dielectric,num_state,scf_data);
-        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
-        (*omega_1,*weight,w_c)
-    }).collect()
+
+    let start_mo = scf_data.mol.start_mo;
+    let nmo = num_state - start_mo;
+    let num_auxbas = ri_ov.size[0];
+    let nfreq = omega_1.len();
+
+    // Same memory-bound tiling as the parallel driver: never hold more than
+    // `tile` inverse dielectrics (the row-block transform is repeated per tile
+    // when the cap binds).
+    let tile = w_c_frequency_tile(num_auxbas, nfreq, w_c_memory_cap_mib());
+    let mut w_c_all: Vec<MatrixFull<f64>> = Vec::with_capacity(nfreq);
+    let block = 25_usize.min(nmo).max(1);
+    let t_start = Instant::now();
+    for chunk_start in (0..nfreq).step_by(tile) {
+        let chunk_end = (chunk_start + tile).min(nfreq);
+        // inverses for this tile only (the memory-bounded working set)
+        let inverses: Vec<MatrixFull<f64>> = omega_1[chunk_start..chunk_end]
+            .iter()
+            .map(|&omega_1| {
+                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,omega_1,'I',0.0);
+                inverse_dielectric_matrix(response,'I')
+            })
+            .collect();
+        let mut w_c_tile: Vec<MatrixFull<f64>> = (0..chunk_end - chunk_start)
+            .map(|_| MatrixFull::new([num_state,num_state],0.0))
+            .collect();
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = scf_data
+                .generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                )
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+                .into_matfull_i_jk();
+            for (ifreq, w_c) in w_c_tile.iter_mut().enumerate() {
+                fill_w_c_rows_from_block(
+                    w_c,
+                    &ri_block,
+                    &inverses[ifreq],
+                    row_start,
+                    block_n,
+                    nmo,
+                    num_auxbas,
+                );
+            }
+            row_start = row_end;
+        }
+        w_c_all.extend(w_c_tile);
+    }
+    println!(
+        "Evaluation of W_c on {} frequency nodes (one AO→MO pass per row block) took {:?}",
+        nfreq,
+        t_start.elapsed()
+    );
+    omega_1.into_iter().zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect()
 }
+
 pub struct WcAtFreq {
     pub omega: f64,
     pub weight: f64,
@@ -638,17 +811,79 @@ pub fn generate_w_c_spin(
         ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
     };
     let nspin = scf_data.mol.spin_channel;
-    omega_1.into_iter().zip(weight.into_iter()).map(|(omega, weight)| {
-        let response = response_matrix_total(scf_data, quasiparticle_energies_w, occ_params, ri_ov, omega, 'I', 0.0);
-        let inverse_dielectric = inverse_dielectric_matrix(response, 'I');
-        let w_c_0 = w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[0].num_state, scf_data, 0);
-        let w_c_1 = if nspin == 2 {
-            w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[1].num_state, scf_data, 1)
-        } else {
-            w_c_0.clone()
-        };
-        WcAtFreq{ omega, weight, w_c:[w_c_0, w_c_1] }
-    }).collect()
+    let nfreq = omega_1.len();
+    let start_mo = scf_data.mol.start_mo;
+
+    // One inverse dielectric per frequency node (same `ri_ov` for all nodes).
+    let inverses: Vec<MatrixFull<f64>> = omega_1
+        .iter()
+        .map(|&omega| {
+            let response = response_matrix_total(
+                scf_data, quasiparticle_energies_w, occ_params, ri_ov, omega, 'I', 0.0,
+            );
+            inverse_dielectric_matrix(response, 'I')
+        })
+        .collect();
+
+    // The AO→MO transform is frequency independent: one pass per row block,
+    // shared by every node (see `generate_w_c`).
+    // the second spin block mirrors the first in the closed-shell case, so its
+    // dimension must follow `occ_params[0]` there
+    let n1 = if nspin == 2 {
+        occ_params[1].num_state
+    } else {
+        occ_params[0].num_state
+    };
+    let mut w_c_all: Vec<[MatrixFull<f64>; 2]> = (0..nfreq)
+        .map(|_| {
+            [
+                MatrixFull::new([occ_params[0].num_state, occ_params[0].num_state], 0.0),
+                MatrixFull::new([n1, n1], 0.0),
+            ]
+        })
+        .collect();
+    for spin in 0..nspin {
+        let num_state = occ_params[spin].num_state;
+        let nmo = num_state - start_mo;
+        let num_auxbas = inverses.first().map_or(0, |m| m.size[0]);
+        let block = 25_usize.min(nmo).max(1);
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = select_ri3mo_spin(
+                scf_data.generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                ),
+                spin,
+            );
+            for (ifreq, w_c) in w_c_all.iter_mut().enumerate() {
+                fill_w_c_rows_from_block(
+                    &mut w_c[spin],
+                    &ri_block,
+                    &inverses[ifreq],
+                    row_start,
+                    block_n,
+                    nmo,
+                    num_auxbas,
+                );
+            }
+            row_start = row_end;
+        }
+    }
+    // Closed shell: both spin blocks are identical by construction.
+    if nspin == 1 {
+        for w_c in w_c_all.iter_mut() {
+            w_c[1] = w_c[0].clone();
+        }
+    }
+    omega_1
+        .into_iter()
+        .zip(weight.into_iter())
+        .zip(w_c_all)
+        .map(|((omega, weight), w_c)| WcAtFreq { omega, weight, w_c })
+        .collect()
 }
 
 pub fn calculate_imag_spin(

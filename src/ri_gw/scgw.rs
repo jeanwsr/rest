@@ -1561,14 +1561,17 @@ pub fn gw_near_fermi_surface_ac(
     let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
         .iter()
         .map(|&n| {
-            let ri_row_n = ri_gw::compute_ri3mo_row(scf_data, n);
+            // `single_orbital_gw_ac` only forwards `ri_ov`/`ri_row_n` to the
+            // Newton driver, whose AC closure never reads them (the QP equation
+            // is built from `w_c_at_freqs`).  Building `ri_row_n` here would pay
+            // a full AO→MO transform per orbital for nothing, so reuse `ri_ov`.
             (
                 n,
                 single_orbital_gw_ac(
                     scf_data,
                     &v_matrix,
                     &ri_ov,
-                    &ri_row_n,
+                    &ri_ov,
                     &w_c_at_freqs,
                     n,
                     num_freq,

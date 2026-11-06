@@ -360,6 +360,10 @@ pub struct GwGradConfig {
     pub wac_omega_max: f64,
     /// CD-WAC: imaginary offset (Ha) of the near-real reference frequencies.
     pub wac_delta: f64,
+    /// CD-WAC: real-axis reference-grid spacing rule (see
+    /// `QuasiParticle::wac_grid`).  `0` quadratic (historical), `1` linear,
+    /// `2` geometric, `3` Chebyshev, `4` pole-adapted.
+    pub wac_grid: usize,
     /// imaginary-axis grid selector, mirrors `mol.ctrl.freq_grid_type`
     pub freq_grid_type: usize,
     /// frequency cut-off for grids 1/2, mirrors `mol.ctrl.freq_cut_off`
@@ -700,6 +704,7 @@ impl Default for GwGradConfig {
             wac_n_real: 20,
             wac_omega_max: 50.0,
             wac_delta: 1.0e-3,
+            wac_grid: 0,
             freq_grid_type: 0,
             freq_cut_off: 50.0,
             eta: 0.001,
@@ -766,6 +771,7 @@ impl GwGradConfig {
             wac_n_real: qp.wac_n_real,
             wac_omega_max: qp.wac_omega_max,
             wac_delta: if qp.wac_delta > 0.0 { qp.wac_delta } else { 1.0e-3 },
+            wac_grid: qp.wac_grid,
             freq_grid_type: scf.mol.ctrl.freq_grid_type,
             freq_cut_off: scf.mol.ctrl.freq_cut_off,
             eta: qp.cdgw_eta,
@@ -4651,7 +4657,8 @@ impl<'a> GwGradEngine<'a> {
     /// quadrature the CD imaginary integral uses) and, when
     /// [`GwGradConfig::wac_n_real`] is positive, near-real points
     /// `r_i + i*wac_delta` on a quadratic grid between 0 and
-    /// [`GwGradConfig::wac_omega_max`].  The quadratic spacing puts most points
+    /// [`GwGradConfig::wac_omega_max`].  The spacing rule is selected by
+    /// [`GwGradConfig::wac_grid`]; the default quadratic grid puts most points
     /// at the small frequencies that matter for valence residues while still
     /// covering the deep-core range.
     fn ensure_wac_reference(&self) {
@@ -4674,7 +4681,31 @@ impl<'a> GwGradEngine<'a> {
         let delta = self.config.wac_delta;
         let n_real = self.config.wac_n_real;
         let pinned = self.config.wac_omega_max > 0.0;
-        let mut t2s: Vec<f64> = Vec::new();
+        // Shape of the real-axis reference grid on `[0, 1]`; the physical node
+        // is `omega_max * shape[i] + i*delta`.  All shapes are geometry
+        // independent, so a pinned `omega_max` keeps the whole grid pinned.
+        let shape: Vec<f64> = (0..n_real)
+            .map(|i| {
+                let t = if n_real <= 1 {
+                    0.0
+                } else {
+                    i as f64 / (n_real - 1) as f64
+                };
+                match self.config.wac_grid {
+                    // linear
+                    1 => t,
+                    // geometric (dense near zero: most of the valence pole
+                    // weight sits below 1 Ha)
+                    2 => (4.0 * t).exp_m1() / 4.0f64.exp_m1(),
+                    // Chebyshev-Lobatto: dense at both ends of the window
+                    3 => 0.5 * (1.0 - (std::f64::consts::PI * t).cos()),
+                    // steeper geometric
+                    4 => (8.0 * t).exp_m1() / 8.0f64.exp_m1(),
+                    // historical quadratic
+                    _ => t * t,
+                }
+            })
+            .collect();
         let mut movers = (0usize, self.nmo.saturating_sub(1));
         if n_real > 0 {
             let (omega_max, span) = if pinned {
@@ -4694,11 +4725,8 @@ impl<'a> GwGradEngine<'a> {
                 let span = self.e[hi] - self.e[lo];
                 (span.max(1.0), if span > 1.0 { 1.0 } else { 0.0 })
             };
-            for i in 0..n_real {
-                let t = i as f64 / (n_real - 1).max(1) as f64;
-                let t2 = t * t;
-                t2s.push(t2);
-                z.push(Complex::new(omega_max * t2, delta));
+            for &s_i in shape.iter() {
+                z.push(Complex::new(omega_max * s_i, delta));
             }
         }
         let u: Vec<Complex<f64>> = z.iter().map(|&zz| zz * zz).collect();
@@ -4709,7 +4737,7 @@ impl<'a> GwGradEngine<'a> {
                 } else {
                     let span = self.e[movers.1] - self.e[movers.0];
                     if span > 1.0 {
-                        t2s[p - imag_index.len()]
+                        shape[p - imag_index.len()]
                     } else {
                         0.0
                     }
@@ -4721,7 +4749,7 @@ impl<'a> GwGradEngine<'a> {
                 if p < imag_index.len() || pinned || n_real == 0 {
                     Complex::new(0.0, 0.0)
                 } else {
-                    let t2 = t2s[p - imag_index.len()];
+                    let t2 = shape[p - imag_index.len()];
                     // the automatic `omega_max = max(span, 1)` only moves when
                     // the span exceeds 1 Ha
                     let span = self.e[movers.1] - self.e[movers.0];
@@ -4989,6 +5017,107 @@ impl<'a> GwGradEngine<'a> {
             residues: Vec::new(),
             ac: AcQpData::default(),
             wac: Some(WacQpData { entries, n_ref, node_coeff }),
+        }
+    }
+
+    /// Exact complex screening row `W_c,nm(z)` (and `dW/dz`) at one
+    /// frequency, computed with a fresh response LU.  Diagnostic only: the
+    /// production WAC path never calls this.
+    #[allow(dead_code)]
+    fn wac_w_at(
+        &self,
+        table: &QpRowTable,
+        z: Complex<f64>,
+    ) -> (Vec<Complex<f64>>, Vec<Complex<f64>>) {
+        let (naux, nov) = (self.naux, self.de_ia.len());
+        let nmo = self.nmo;
+        self.with_qtia(|qtia| {
+            let mut chi = wac_chi0(qtia, naux, nov, &self.de_ia, z);
+            for x in chi.data.iter_mut() {
+                *x = -*x;
+            }
+            for d in 0..naux {
+                chi[[d, d]] += Complex::new(1.0, 0.0);
+            }
+            let re: Vec<f64> = chi.data.iter().map(|c| c.re).collect();
+            let im: Vec<f64> = chi.data.iter().map(|c| c.im).collect();
+            let lu = CdLuFactor::factor(&re, &im, naux);
+            let wts: Vec<Complex<f64>> = self
+                .de_ia
+                .iter()
+                .map(|&de| {
+                    let den = Complex::new(de * de, 0.0) - z * z;
+                    Complex::new(-8.0 * de, 0.0) * z / (den * den)
+                })
+                .collect();
+            let dchi = wac_chi0_weights(qtia, naux, nov, &wts);
+            let qn = &table.m;
+            let mut y: Vec<Complex<f64>> = qn.iter().map(|&x| Complex::new(x, 0.0)).collect();
+            lu.solve_in_place(&mut y, nmo);
+            let mut w = vec![Complex::new(0.0, 0.0); nmo];
+            let mut dw = vec![Complex::new(0.0, 0.0); nmo];
+            for m in 0..nmo {
+                let mut acc = Complex::new(0.0, 0.0);
+                let mut dacc = Complex::new(0.0, 0.0);
+                for a in 0..naux {
+                    let q = qn[a + m * naux];
+                    let ya = y[a + m * naux];
+                    acc += q * (ya - Complex::new(q, 0.0));
+                    for b in 0..naux {
+                        dacc += ya * dchi[[a, b]] * y[b + m * naux];
+                    }
+                }
+                w[m] = acc;
+                dw[m] = dacc;
+            }
+            (w, dw)
+        })
+    }
+
+    /// Diagnostic: compare the Padé-continued `W_c,nm` and `dW/dz` at every
+    /// active residue node of orbital `n` with the exact complex response.
+    #[allow(dead_code)]
+    pub fn wac_debug_residue(&self, n: usize) {
+        let cache = self.build_target_cache(n);
+        let omega = cache.omega;
+        let table = self.qp_row_table(n);
+        self.ensure_wac_reference();
+        let guard = self.wac_ref.borrow();
+        let r = guard.as_ref().unwrap();
+        let (vals, _dvals) = self.wac_values(&table, r);
+        let eta = self.config.eta;
+        let ef = 0.5 * (self.e[self.nocc - 1] + self.e[self.nocc]);
+        let sign = if omega > ef { 1.0 } else { -1.0 };
+        let start = if sign > 0.0 { self.nocc } else { 0 };
+        let end = if sign > 0.0 { self.nmo } else { self.nocc };
+        println!("WAC debug: n={n} omega={omega:.10} sign={sign} nref={}", r.z.len());
+        for m in start..end {
+            let de = if sign > 0.0 { omega - self.e[m] } else { self.e[m] - omega };
+            if de <= -self.config.res_tol {
+                continue;
+            }
+            let pf = if de.abs() < self.config.res_tol { 0.5 } else { 1.0 };
+            let ze = Complex::new(de, eta);
+            let column: Vec<Complex<f64>> = vals.iter().map(|row| row[m]).collect();
+            let p = match pade_derivatives_greedy(&r.u, &column, ze * ze) {
+                Some(p) => p,
+                None => {
+                    println!("   m={m:2} zeta={de:.6}: PADE BREAKDOWN");
+                    continue;
+                }
+            };
+            let (w_ex, dw_ex) = self.wac_w_at(&table, ze);
+            let du = 2.0 * ze * sign;
+            let dpade_dz = p.dvalue_dz;
+            println!(
+                "   m={m:2} zeta={de:+.6} pf={pf:.1} |W_ex|={:.4e} |W_p|={:.4e} err={:.3e} rel={:.2e} |dWdz ex|={:.4e} err={:.3e}",
+                w_ex[m].norm(),
+                p.value.norm(),
+                (p.value - w_ex[m]).norm(),
+                (p.value - w_ex[m]).norm() / w_ex[m].norm().max(1e-30),
+                (dw_ex[m] * du).norm(),
+                (dpade_dz * du - dw_ex[m] * du).norm(),
+            );
         }
     }
 
