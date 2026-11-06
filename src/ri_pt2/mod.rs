@@ -422,8 +422,15 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count_start("c_r5dft");
 
         #[cfg(feature = "mpi")]
-        //let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
-        let use_25d = false;
+        // Restore the dynamic 2.5D dispatch (was hardcoded to `false` in
+        // bb2a537e while the ASlide branch was being wired up, which silently
+        // bypassed the 2.5D modules and left SCSRPA with no MPI path at all:
+        // its 1D fallback is an unconditional panic placeholder and ASlide is
+        // `unreachable!` for it — measured as the C6H6_R-xDH7 MPI regression
+        // failure). `check_conditions_25d` carries all the original guards
+        // (n_occ >= ranks for block partitioning, memory gate, per-family
+        // 1D-fallback availability), so the dispatch is safe to re-enable.
+        let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
         #[cfg(feature = "mpi")]
         let use_ASlide = check_conditions_ASlide(&scf_data, mpi_operator, &dfa_family_pos);
         #[cfg(not(feature = "mpi"))]
