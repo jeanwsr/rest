@@ -530,6 +530,12 @@ pub fn v_matrix_old(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
     v_matrix
     //No need to worry about cutoff
 }
+/// Imaginary-axis `W_c` grid, returned in **ascending frequency order**.
+///
+/// The order is part of the contract: consumers such as the AC Padé sampling
+/// (`get_ac_idx` indexes the quadrature grid) read the node frequency out of
+/// this vector, so a producer-order-dependent result would be a latent,
+/// thread-scheduling-dependent bug.
 pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
     omp_get_num_threads_wrapper();
     let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
@@ -636,7 +642,40 @@ pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_
         t_start.elapsed()
     );
 
-    omega_1.drain(..).zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect()
+    let out: Vec<(f64,f64,MatrixFull<f64>)> = omega_1.drain(..).zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect();
+    dump_w_c_if_requested(&out);
+    out
+}
+
+/// `REST_GW_WC_DUMP=<path>`: append one line per frequency node with the node
+/// frequency, its quadrature weight and two checksums of `W_c` (sum and sum of
+/// absolute values, over the full matrix).  This is the cheap A/B probe for
+/// "did the W grid change?": two builds must produce identical lines.
+fn dump_w_c_if_requested(out: &[(f64,f64,MatrixFull<f64>)]) {
+    let path = match std::env::var("REST_GW_WC_DUMP") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut rows: Vec<(f64, f64, f64, f64)> = out
+        .iter()
+        .map(|(omega, weight, w_c)| {
+            let sum: f64 = w_c.data.iter().sum();
+            let abs: f64 = w_c.data.iter().map(|x| x.abs()).sum();
+            (*omega, *weight, sum, abs)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut text = String::new();
+    for (omega, weight, sum, abs) in rows {
+        text.push_str(&format!("{omega:+.16e} {weight:+.16e} {sum:+.16e} {abs:+.16e}\n"));
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        Err(e) => println!("REST_GW_WC_DUMP: cannot open {path}: {e}"),
+    }
 }
 
 /// How many frequency nodes' inverse dielectrics may be resident at once.
@@ -783,7 +822,9 @@ pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_en
         nfreq,
         t_start.elapsed()
     );
-    omega_1.into_iter().zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect()
+    let out: Vec<(f64,f64,MatrixFull<f64>)> = omega_1.into_iter().zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect();
+    dump_w_c_if_requested(&out);
+    out
 }
 
 pub struct WcAtFreq {

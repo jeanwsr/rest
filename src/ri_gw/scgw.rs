@@ -1091,12 +1091,19 @@ pub fn single_orbital_gw_ac(
     // skipping ω=0, with step_ratio=2/3 (PySCF default).
     let ac_step_ratio = 2.0 / 3.0;
     let ac_indices = ri_gw::ac::get_ac_idx(_num_freq, ac_num_samples, ac_step_ratio);
+    // `get_ac_idx` indexes the *quadrature grid*, so the sample frequencies must
+    // be read off a frequency-sorted copy of the W grid.  `w_c_at_freqs` is a
+    // bag of nodes (the historical driver returned it in channel completion
+    // order), and indexing it positionally would couple the Padé nodes to the
+    // producer's scheduling order — a latent, thread-count-dependent result.
+    let mut node_order: Vec<usize> = (0..w_c_at_freqs.len()).collect();
+    node_order.sort_by(|&a, &b| w_c_at_freqs[a].0.total_cmp(&w_c_at_freqs[b].0));
     let ac_freqs: Vec<f64> = ac_indices
         .iter()
         .map(|&idx| {
             // idx ranges from 1 to num_freq (1-based), mapping to quad_freqs[idx-1]
-            let idx0 = idx.saturating_sub(1).min(w_c_at_freqs.len().saturating_sub(1));
-            w_c_at_freqs[idx0].0
+            let idx0 = idx.saturating_sub(1).min(node_order.len().saturating_sub(1));
+            w_c_at_freqs[node_order[idx0]].0
         })
         .collect();
 
