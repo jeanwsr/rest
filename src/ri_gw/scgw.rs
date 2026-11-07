@@ -399,15 +399,41 @@ fn gw_near_fermi_surface_spin_lowrank(
 
         let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[spin][calc_orbs[0].0];
         let vir_shift = calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[spin][calc_orbs[calc_orbs.len() - 1].0];
+        // `gw_extrapolation = false`: no orbital is extrapolated; the BSE
+        // window is asserted to lie inside the explicitly solved window.
+        let (mut lo_shift, mut hi_shift) = (occ_shift, vir_shift);
+        if !qp_ctrl.gw_extrapolation {
+            let (bse_occ_start, bse_num_state) =
+                ri_gw::bse_active_bounds(scf_data, op.homo, op.lumo);
+            let calc_lo = calc_orbs[0].0;
+            let calc_hi = calc_orbs[calc_orbs.len() - 1].0;
+            assert!(
+                bse_occ_start >= calc_lo && bse_num_state <= calc_hi + 1,
+                "gw_extrapolation = false, but the BSE window is not inside the explicitly \
+                 solved GW window (#{}..#{}); widen gw_extrapolate_*_threshold or tighten \
+                 bse_cutoff_energy",
+                calc_lo,
+                calc_hi
+            );
+            println!(
+                "[gw] extrapolation disabled: {} orbitals solved explicitly (#{}..#{}), the BSE \
+                 window lies inside it -- no quasiparticle energy is extrapolated",
+                calc_orbs.len(),
+                calc_lo,
+                calc_hi
+            );
+            lo_shift = 0.0;
+            hi_shift = 0.0;
+        }
         let mut gwqp: Vec<f64> = Vec::new();
         for i in 0..calc_orbs[0].0 {
-            gwqp.push(scf_data.eigenvalues[spin][i] + occ_shift)
+            gwqp.push(scf_data.eigenvalues[spin][i] + lo_shift)
         }
         for (_, e) in calc_orbs.iter() {
             gwqp.push(*e);
         }
         for i in calc_orbs[calc_orbs.len() - 1].0 + 1..op.num_state {
-            gwqp.push(scf_data.eigenvalues[spin][i] + vir_shift)
+            gwqp.push(scf_data.eigenvalues[spin][i] + hi_shift)
         }
         out[spin] = gwqp;
     }
@@ -1591,6 +1617,42 @@ pub fn gw_near_fermi_surface_ac(
     let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
     let vir_shift =
         calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    // `gw_extrapolation = false`: no orbital is extrapolated.  The BSE window
+    // must then be a subset of the explicitly solved window -- it is asserted,
+    // not assumed, because a silent extrapolation is exactly what made the GW
+    // archive and the gradient refer to different Hamiltonians (2026-11-07).
+    if !qp_ctrl.gw_extrapolation {
+        let (bse_occ_start, bse_num_state) = ri_gw::bse_active_bounds(
+            scf_data,
+            homo,
+            homo + 1,
+        );
+        let calc_lo = calc_orbs[0].0;
+        let calc_hi = calc_orbs[calc_orbs.len() - 1].0;
+        assert!(
+            bse_occ_start >= calc_lo && bse_num_state <= calc_hi + 1,
+            "gw_extrapolation = false, but the BSE window (occupied #{}.., virtuals ..#{}) \
+             is not inside the explicitly solved GW window (#{}..#{}): \
+             widen gw_extrapolate_occ_threshold/gw_extrapolate_vir_threshold \
+             or tighten bse_cutoff_energy",
+            bse_occ_start,
+            bse_num_state.saturating_sub(1),
+            calc_lo,
+            calc_hi
+        );
+        println!(
+            "[gw] extrapolation disabled: {} orbitals solved explicitly (#{}..#{}), the BSE \
+             window lies inside it (occupied #{}.., virtuals ..#{}); the {} orbitals outside \
+             keep their KS energy and are used only inside the screening response -- no \
+             quasiparticle energy is extrapolated",
+            calc_orbs.len(),
+            calc_lo,
+            calc_hi,
+            bse_occ_start,
+            bse_num_state.saturating_sub(1),
+            num_state - calc_orbs.len()
+        );
+    }
     let mut gwqp: Vec<f64> = Vec::new();
     if scf_data.mol.ctrl.print_level > 1 {
         println!("low extrapolations:{}", calc_orbs[0].0);
@@ -1601,14 +1663,19 @@ pub fn gw_near_fermi_surface_ac(
         );
         println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
     }
+    let (lo_shift, hi_shift) = if qp_ctrl.gw_extrapolation {
+        (occ_shift, vir_shift)
+    } else {
+        (0.0, 0.0)
+    };
     for i in 0..calc_orbs[0].0 {
-        gwqp.push(scf_data.eigenvalues[0][i] + occ_shift)
+        gwqp.push(scf_data.eigenvalues[0][i] + lo_shift)
     }
     for i in 0..calc_orbs.len() {
         gwqp.push(calc_orbs[i].1)
     }
     for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
-        gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
+        gwqp.push(scf_data.eigenvalues[0][i] + hi_shift)
     }
     ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold, threshold);
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());

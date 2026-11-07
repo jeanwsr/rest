@@ -451,6 +451,14 @@ pub struct QuasiParticle {
     pub hermite_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
+    /// When `false`, no orbital outside the explicitly solved GW window is
+    /// extrapolated: the window is the only source of quasiparticle energies and
+    /// the BSE transition space is asserted to lie inside it.  Outside the
+    /// window the orbitals keep their KS energy (they still enter the screening
+    /// response, which is an independent-particle quantity).  Cards can switch
+    /// the (historical, default) extrapolation back on with
+    /// `gw_extrapolation = true`.
+    pub gw_extrapolation: bool,
     pub gw_extrapolate_occ_threshold:f64,
     pub gw_extrapolate_vir_threshold:f64,
     pub external_field_freq:f64,
@@ -920,6 +928,7 @@ impl Default for QuasiParticle {
             hermite_self_energy:false,
             hermite_coeff_path:String::from("./hermite_coeff.txt"),
             bse_qp_polarization:false,
+            gw_extrapolation: true,
             gw_extrapolate_occ_threshold:0.1,
             gw_extrapolate_vir_threshold:0.1,
             gw_or_bse:String::new(),
@@ -1139,6 +1148,7 @@ impl QuasiParticle {
         table.insert("hermite_coeff_path".to_string(), toml::Value::String(self.hermite_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
+        table.insert("gw_extrapolation".to_string(), toml::Value::Boolean(self.gw_extrapolation));
         table.insert("gw_extrapolate_occ_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_occ_threshold));
         table.insert("gw_extrapolate_vir_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_vir_threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
@@ -1553,6 +1563,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.gw_linearize_derivative_h= match tmp_ctrl.get("gw_linearize_derivative_h").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
                 other => {1e-10},
+            };
+            tmp_input.gw_extrapolation = match tmp_ctrl.get("gw_extrapolation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
             };
             tmp_input.gw_extrapolate_occ_threshold= match tmp_ctrl.get("gw_extrapolate_occ_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
