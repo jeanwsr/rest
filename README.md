@@ -213,6 +213,7 @@ guessfile = "my_checkpoint.rchk"
      threshold = 1.0e-13      # 缺省 1.0e-13
      uplo = "upper"           # 仅 Cholesky 使用；开发者选项，缺省 "upper"
      distributed = "auto"     # 仅 Cholesky + MPI 使用，缺省 "auto"
+     cd_threads = 0           # 仅 Cholesky 使用；0=自动，缺省 0
 ````
 
 - `policy`：取值String。
@@ -222,6 +223,7 @@ guessfile = "my_checkpoint.rchk"
 - `threshold`：取值f64。缺省 1.0e-13。`policy = "cd"` 时，若 Cholesky 因子对角元小于该阈值，先将矩阵补正到满足该阈值的正定程度再重新分解；`policy = "eig"` 时，只保留大于该阈值的特征值来构造 $J^{-1/2}$。
 - `uplo`：取值String。`"upper"`（缺省）或 `"lower"`，仅对 Cholesky 有效。列主序下通常使用 upper；lower 仅供调试与测试。
 - `distributed`：取值String。`"auto"`（缺省）/`"on"`/`"off"`。仅在（1）编译了 `scalapack` 与 `mpi` 特性、（2）MPI 进程数 ≥ 2、（3）`policy = "cd"` 三条同时满足时生效，其余组合一律回退到 rank-0 串行路径（特征分解没有分布式实现）。`auto` 仅在辅助基函数数 $n_{aux} \ge 8192$ 且进程数 ≥ 32 时才启用分布式 Cholesky 与三角求解；小体系测试可用 `on` 强制打开。
+- `cd_threads`：取值i32。仅对 Cholesky 有效。OpenBLAS 在 Cholesky 分解（dpotrf）期间使用的最大线程数。`0`（缺省）为自动：取 $\min(8,\ n_{aux}/512,\ \text{NUMA 节点核数},\ \texttt{num\_threads})$——实测 LAPACK 并行甜点在 8 线程附近（线程更多反而退化），矩阵太小则按面板数缩减，跨 NUMA 节点的线程争内存域。正整数显式覆盖自动值，但仍然不会超过 `num_threads` 设定的全局线程数：单线程运行不会因该键多占核。
 
 **与其他关键词的关系**：`algorithm_jk`/`algorithm_j`/`algorithm_k` 决定 $Y_{\mu\nu,P}$ 是常驻内存（`ri-incore`）还是即算即用（`ri-direct`），`j2c_decomp` 决定 $Y$ 的构造方式，两者正交、可自由组合。`ri-incore` 需要约 $0.5\,n_{ao}^2 n_{aux}$ 个双精度数的存储，通常是内存峰值的主要来源。
 

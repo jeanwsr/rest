@@ -77,6 +77,16 @@ pub struct J2CDecompOption {
     /// systems; use `On` to force for testing). Only meaningful for `policy = Cd`.
     #[serde_inline_default(J2CDistributedMode::Auto)]
     pub distributed: J2CDistributedMode,
+    /// Maximum OpenBLAS threads for the Cholesky factorization of the 2c-2e metric.
+    /// `0` (the default) selects the automatic cap: `min(num_threads, 8, naux/512,
+    /// cores of one NUMA node)`. The automatic cap follows the measured LAPACK
+    /// parallel sweet spot (dpotrf/dsyevd peak at ~8 threads, regress at
+    /// full-core counts, and threads spanning NUMA nodes contend on the memory
+    /// domain; xc09 measurements). A positive value overrides the automatic
+    /// choice but is still clamped by the global thread count set from
+    /// `num_threads`, so a single-threaded run never spawns extra BLAS threads.
+    #[serde_inline_default(0)]
+    pub cd_threads: usize,
 }
 
 impl Default for J2CDecompOption {
@@ -86,6 +96,7 @@ impl Default for J2CDecompOption {
             threshold: Some(J2C_THRESH),
             uplo: Upper,
             distributed: J2CDistributedMode::Auto,
+            cd_threads: 0,
         }
     }
 }

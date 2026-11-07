@@ -3,7 +3,7 @@ use crate::constants::{SQRT_THRESHOLD};
 use crate::mpi_io::MPIOperator;
 use rayon::prelude::*;
 use tensors::matrix_blas_lapack::{_dgemm_full, _dsymm, _pinv, _get_sqrt_and_inv_sqrt};
-use tensors::{BasicMatrix, MathMatrix, MatrixFull, MatrixUpper, TensorOpt, TensorOptMut, TensorSlice};
+use tensors::{BasicMatrix, MathMatrix, ParMathMatrix, MatrixFull, MatrixUpper, TensorOpt, TensorOptMut, TensorSlice};
 use log::{debug, warn};
 
 
@@ -443,7 +443,7 @@ impl ScfTraceRecord {
                 if let SCFType::ROHF = scf.scftype {
                     let mut next_roothaan = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
                     coeff.iter().enumerate().for_each(|(i, value)| {
-                        next_roothaan.self_scaled_add(&self.target_vector[i + start_dim][0], *value);
+                        next_roothaan.par_self_scaled_add(&self.target_vector[i + start_dim][0], *value);
                     });
                     let next_roothaan = next_roothaan.to_matrixupper();
 
@@ -458,7 +458,7 @@ impl ScfTraceRecord {
                 (0..spin_channel).into_iter().for_each(|i_spin| {
                     let mut next_hamiltonian = MatrixFull::new(self.target_vector[0][i_spin].size.clone(),0.0);
                     coeff.iter().enumerate().for_each(|(i,value)| {
-                        next_hamiltonian.self_scaled_add(&self.target_vector[i+start_dim][i_spin], *value);
+                        next_hamiltonian.par_self_scaled_add(&self.target_vector[i+start_dim][i_spin], *value);
                     });
                     let next_hamiltonian = next_hamiltonian.to_matrixupper();
 
@@ -538,12 +538,12 @@ impl ScfTraceRecord {
                 // The SCF loop diagonalizes F̃ → idempotent D_next.
                 if let SCFType::ROHF = scf.scftype {
                     let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                    for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                     scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                 } else {
                     for i_spin in 0..spin_channel {
                         let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                         scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
                 }
@@ -600,12 +600,12 @@ impl ScfTraceRecord {
                 if ediis_ok {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -617,12 +617,12 @@ impl ScfTraceRecord {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.target_vector[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.target_vector[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -686,12 +686,12 @@ impl ScfTraceRecord {
                 if adiis_ok {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -703,12 +703,12 @@ impl ScfTraceRecord {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.target_vector[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.target_vector[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -955,17 +955,26 @@ pub fn diis_solver(em: &Vec<Vec<f64>>,
     //let mut sum_inv_norm_rdm = [0.0,0.0];
     let mut sum_inv_norm_rdm = 0.0_f64;
 
-    // now prepare the norm matrix of the residual density matrix
+    // now prepare the norm matrix of the residual density matrix.
+    // Parallel over the independent (i, j) inner products; each dot uses a
+    // fixed-block deterministic reduction (chunks of DOT_BLK elements, block
+    // sums combined in ascending block order), so the value of every entry is
+    // bitwise independent of the number of worker threads.
     let mut opta = MatrixFull::new([dim,dim],0.0);
-    (start_dim..dim_vec).into_iter().for_each(|i| {
-        (start_dim..dim_vec).into_iter().for_each(|j| {
-            let mut inv_norm_rdm = em[i].iter()
-                .zip(em[j].iter())
-                .fold(0.0,|c,(d,e)| {c + d*e});
-            opta.set2d([i-start_dim,j-start_dim],inv_norm_rdm);
-            //sum_inv_norm_rdm += inv_norm_rdm;
+    const DOT_BLK: usize = 1 << 18;
+    let dots: Vec<((usize, usize), f64)> = (start_dim..dim_vec).into_par_iter().flat_map(|i| {
+        (start_dim..dim_vec).into_par_iter().map(move |j| {
+            let d = &em[i][..];
+            let e = &em[j][..];
+            let total = d.chunks(DOT_BLK).zip(e.chunks(DOT_BLK))
+                .map(|(db, eb)| db.iter().zip(eb.iter()).fold(0.0, |c, (x, y)| c + x * y))
+                .fold(0.0, |a, b| a + b);
+            ((i, j), total)
         })
-    });
+    }).collect();
+    for ((i, j), v) in dots {
+        opta.set2d([i-start_dim,j-start_dim],v);
+    }
     let inv_opta = _pinv(&opta, Some(pinv_threshold)).unwrap();
     let sum_inv = inv_opta.data.iter().sum::<f64>();
     if sum_inv.abs() < 1.0e-6 {

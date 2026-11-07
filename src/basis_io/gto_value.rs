@@ -38,7 +38,8 @@ pub fn spheric_gto_value_matrixfull(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basi
     });
     //println!("debug num_bas_c and num_bas_s: {},{}", num_bas_c, num_bas_s);
     //let mut outmat_c = MatrixFull::new([num_grids,num_bas_c],0.0);
-    let mut outmat_s = MatrixFull::new([num_grids,num_bas_s],0.0);
+    // shells tile all columns via the copy below: no zeroing needed
+    let mut outmat_s = uninit_matrix(num_grids, num_bas_s);
     let mut ibas_start = 0;
     for ibas in &bas.electron_shells {
         let iang = ibas.angular_momentum[0] as usize;
@@ -98,7 +99,8 @@ pub fn spheric_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], ba
     });
     //println!("debug num_bas_c and num_bas_s: {},{}", num_bas_c, num_bas_s);
     //let mut outmat_c = MatrixFull::new([num_grids,num_bas_c],0.0);
-    let mut outmat_s = MatrixFull::new([num_grids,num_bas_s],0.0);
+    // shells tile all columns via the copy below: no zeroing needed
+    let mut outmat_s = uninit_matrix(num_grids, num_bas_s);
     let mut ibas_start = 0;
     for ibas in &bas.electron_shells {
         let iang = ibas.angular_momentum[0] as usize;
@@ -184,6 +186,14 @@ pub fn cartesian_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], 
     outmat_c
 }
 
+#[inline]
+fn uninit_matrix(rows: usize, cols: usize) -> MatrixFull<f64> {
+    let n = rows * cols;
+    let mut buf = Vec::with_capacity(n);
+    unsafe { buf.set_len(n); }
+    unsafe { MatrixFull::from_vec_unchecked([rows, cols], buf) }
+}
+
 pub fn gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> MatrixFull<f64> { 
     if basis_type.eq(&"spheric".to_string()) {
         return spheric_gto_value_serial(r, gto_center, bas);
@@ -208,7 +218,8 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
     });
     //println!("debug num_bas_c and num_bas_s: {},{}", num_bas_c, num_bas_s);
     //let mut outmat_c = MatrixFull::new([num_grids,num_bas_c],0.0);
-    let mut outmat_s = MatrixFull::new([num_bas_s, num_grids],0.0);
+    // shells tile the full [num_bas_s, num_grids] range via copy_from: no zeroing
+    let mut outmat_s = uninit_matrix(num_bas_s, num_grids);
     let mut ibas_start = 0;
     for ibas in &bas.electron_shells {
         let iang = ibas.angular_momentum[0] as usize;
@@ -223,7 +234,7 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
             });
 
             //time_records.count_start("1-2");
-            let mut tmp_spheric= MatrixFull::new([s_len,num_grids],0.0);
+            let mut tmp_spheric = uninit_matrix(s_len, num_grids);
             tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
                 &c2s_mat.to_matrixfullslice(),
                 &tmp_cart.to_matrixfullslice(), 
@@ -299,11 +310,12 @@ pub fn gto_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &
                 tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
             });
             if basis_type.eq(&"spheric".to_string()) {
-                let mut tmp_spheric = MatrixFull::new([(2*iang + 1) as usize, 1],0.0);
+                // beta 1.0 -> 0.0 (C was pre-zeroed and never read): bitwise identical
+                let mut tmp_spheric = uninit_matrix((2*iang + 1) as usize, 1);
                 tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
                     &tmp_cart.to_matrixfullslice(), 
                     &c2s_matrix_const(iang as usize).to_matrixfullslice(),
-                     'T','N',1.0,1.0);
+                     'T','N',1.0,0.0);
                 //tmp_spheric.lapack_dgemm(&mut tmp_cart, &mut c2s_matrix(iang as usize), 'T', 'N', 1.0, 0.0);
                 value.extend(tmp_spheric.data);
             } else {
@@ -686,8 +698,7 @@ pub fn gto_1st_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_typ
             });
             if basis_type.eq(&"spheric".to_string()) {
                 tmp_cart.iter().zip(value.iter_mut()).for_each(|(tmp_cart, value)| {
-                    let mut tmp_spheric = MatrixFull::new([(2*iang + 1) as usize, 1],0.0);
-                    //tmp_spheric.lapack_dgemm(tmp_cart, &mut c2s_matrix(iang as usize), 'T', 'N', 1.0, 0.0);
+                    let mut tmp_spheric = uninit_matrix((2*iang + 1) as usize, 1);
                     tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
                         &tmp_cart.to_matrixfullslice(), 
                         &c2s_matrix_const(iang as usize).to_matrixfullslice(), 
