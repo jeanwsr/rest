@@ -24,6 +24,18 @@ use itertools::{Itertools, izip};
 use tensors::{BasicMatrix, MathMatrix, ParMathMatrix};
 // use tensors::external_libs::{general_dgemm_f, matr_copy};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
+
+/// Uninitialized [rows × cols] matrix for buffers that are fully overwritten
+/// before their first read (beta = 0 GEMM outputs, full-coverage gathers).
+/// Zeroing such buffers is pure write traffic (~18% of the contract phase at
+/// 28 threads on ts2, measured in the memset-hygiene pass).
+#[inline]
+fn uninit_matrix(rows: usize, cols: usize) -> MatrixFull<f64> {
+    let n = rows * cols;
+    let mut buf = Vec::with_capacity(n);
+    unsafe { buf.set_len(n); }
+    unsafe { MatrixFull::from_vec_unchecked([rows, cols], buf) }
+}
 use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 //use numgrid::{self, radial_grid_lmg_bse};
 // use self::gen_grids::radial_grid_lmg_bse;
@@ -4376,7 +4388,9 @@ impl Grids {
                 // and a stride multiply per element, and this gather is the
                 // dominant serial cost on large grids.
                 let nao = dm[0].size[0];
-                let mut dm_sub = vec![MatrixFull::new([n_active, n_active], 0.0); spin_channel];
+                // the gather below writes every element: no zeroing needed
+                let mut dm_sub: Vec<MatrixFull<f64>> =
+                    (0..spin_channel).map(|_| uninit_matrix(n_active, n_active)).collect();
                 for i_spin in 0..spin_channel {
                     let dm_s = &dm[i_spin].data;
                     let sub = &mut dm_sub[i_spin].data;
@@ -4389,7 +4403,7 @@ impl Grids {
                 }
 
                 for i_spin in 0..spin_channel {
-                    let mut wao = MatrixFull::new([n_active, n_batch], 0.0);
+                    let mut wao = uninit_matrix(n_active, n_batch);
                     _dgemm(
                         &dm_sub[i_spin], (0..n_active, 0..n_active), 'N',
                         batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
@@ -5239,7 +5253,9 @@ impl Grids {
             // indices of `dm_sub` are restricted to it: the gather and the GEMM
             // shrink by `nao / n_active` with no change to the summed expression
             // (the rows outside the active set were computed but never read).
-            let mut dm_sub = vec![MatrixFull::new([n_active, n_active], 0.0); spin_channel];
+            // the gather below writes every element: no zeroing needed
+            let mut dm_sub: Vec<MatrixFull<f64>> =
+                (0..spin_channel).map(|_| uninit_matrix(n_active, n_active)).collect();
             for i_spin in 0..spin_channel {
                 let dm_s = &dm[i_spin];
                 let dm_sub_s = &mut dm_sub[i_spin];
@@ -5251,7 +5267,7 @@ impl Grids {
             }
 
             for i_spin in 0..spin_channel {
-                let mut wao = MatrixFull::new([n_active, n_batch], 0.0);
+                let mut wao = uninit_matrix(n_active, n_batch);
                 _dgemm(
                     &dm_sub[i_spin], (0..n_active, 0..n_active), 'N',
                     batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
@@ -5298,7 +5314,9 @@ impl Grids {
                     // final contraction sums over (`ao_indices`), columns are the AOP
                     // block's active set (`aop_indices`, equal to `ao_indices` by the
                     // row-aligned storage).
-                    let mut dm_sub = vec![MatrixFull::new([n_active_ao, n_active_aop], 0.0); spin_channel];
+                    // the gather below writes every element: no zeroing needed
+                    let mut dm_sub: Vec<MatrixFull<f64>> =
+                        (0..spin_channel).map(|_| uninit_matrix(n_active_ao, n_active_aop)).collect();
                     for i_spin in 0..spin_channel {
                         let dm_s = &dm[i_spin];
                         for (j_local, &nu_global) in aop_indices.iter().enumerate() {
@@ -5311,7 +5329,7 @@ impl Grids {
                     for i_spin in 0..spin_channel {
                         for x in 0usize..3usize {
                             let aop_x_batch = &aop_c.batches[ibatch][x];
-                            let mut wao = MatrixFull::new([n_active_ao, n_batch], 0.0);
+                            let mut wao = uninit_matrix(n_active_ao, n_batch);
                             _dgemm(
                                 &dm_sub[i_spin], (0..n_active_ao, 0..n_active_aop), 'N',
                                 aop_x_batch, (0..n_active_aop, g_local_start..g_local_end), 'N',
@@ -5585,7 +5603,7 @@ impl Grids {
                     {
                         for x in 0usize..3usize {
                             let aop_x_batch = &aop_batches[x];
-                            let mut wao_p = MatrixFull::new([n_active_ao, n_batch], 0.0);
+                            let mut wao_p = uninit_matrix(n_active_ao, n_batch);
                             _dgemm(
                                 &dm_sub_aop[i_spin],
                                 (0..n_active_ao, 0..n_active_aop),
@@ -5857,15 +5875,16 @@ impl Grids {
                 }
 
                 // wmo_ao[n_active_ao, nocc] = mo_sub × sqrt(occ), pre-scaled per spin
-                let mut wmo_ao = MatrixFull::new([n_active_ao, nocc], 0.0);
+                // the gather below writes every element: no zeroing needed
+                let mut wmo_ao = uninit_matrix(n_active_ao, nocc);
                 for (i_local, &mu_global) in ao_indices.iter().enumerate() {
                     for j in 0..nocc {
                         wmo_ao[[i_local, j]] = mo_scaled[[mu_global, j]];
                     }
                 }
 
-                // tmo[nocc, n_batch] = wmo_ao^T × ao_batch
-                let mut tmo = MatrixFull::new([nocc, n_batch], 0.0);
+                // tmo[nocc, n_batch] = wmo_ao^T × ao_batch (beta = 0: no zeroing)
+                let mut tmo = uninit_matrix(nocc, n_batch);
                 _dgemm(
                     &wmo_ao,
                     (0..n_active_ao, 0..nocc),
@@ -5901,7 +5920,7 @@ impl Grids {
 
                         for ic in 0usize..3usize {
                             let aop_ic_batch = &aop_batches[ic];
-                            let mut tmop = MatrixFull::new([nocc, n_batch], 0.0);
+                            let mut tmop = uninit_matrix(nocc, n_batch);
                             _dgemm(
                                 &wmo_ao,
                                 (0..n_active_ao, 0..nocc),
