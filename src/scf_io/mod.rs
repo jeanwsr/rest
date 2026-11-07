@@ -3515,8 +3515,7 @@ impl SCF {
             let mut vxc_s = vxc.get_mut(i_spin).unwrap();
             let mut vxc_mf_s = vxc_mf.get_mut(i_spin).unwrap();
 
-            vxc_mf_s.self_add(&vxc_mf_s.transpose());
-            vxc_mf_s.self_multiple(0.5);
+            vxc_mf_s.symmetrize_half();
             //vxc_mf_s.formated_output(10, "full");
             *vxc_s = vxc_mf_s.to_matrixupper();
         }
@@ -3620,8 +3619,8 @@ impl SCF {
                 // the direct kernel wrote the upper triangle of (C + C^T)
                 vxc_mf_s.self_multiple(0.5);
             } else {
-                vxc_mf_s.self_add(&vxc_mf_s.transpose());
-                vxc_mf_s.self_multiple(0.5);
+                // fused 0.5*(A + A^T): no transposed copy, single pass
+                vxc_mf_s.symmetrize_half();
             }
             *vxc_s = vxc_mf_s.to_matrixupper();
         }
@@ -3829,8 +3828,8 @@ impl SCF {
                 // the direct kernel wrote the upper triangle of (C + C^T)
                 vxc_mf_s.self_multiple(0.5);
             } else {
-                vxc_mf_s.self_add(&vxc_mf_s.transpose());
-                vxc_mf_s.self_multiple(0.5);
+                // fused 0.5*(A + A^T): no transposed copy, single pass
+                vxc_mf_s.symmetrize_half();
             }
             *vxc_s = vxc_mf_s.to_matrixupper();
         }
