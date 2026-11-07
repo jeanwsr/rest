@@ -1153,12 +1153,18 @@ pub fn xc_exc_vxc(funcs: &[(f64, LibXCFunctional)], grids: &Grids, spin_channel:
                         }
                         let mut max_vxc = 0f64;
                         let mut first_diff = None;
+                        // The compressed path now scatters only the upper triangle
+                        // (accumulating C_ij + C_ji), completed later by the caller's
+                        // 0.5(V+V^T) symmetrize. Compare the completed operator forms
+                        // on both sides so this debug check keeps its meaning.
                         for s in 0..spin_channel {
-                            for mu in 0..num_basis {
-                                for nu in 0..num_basis {
-                                    let d = (vxc_mat_dense[s][[mu, nu]] - vxc_mat_comp[s][[mu, nu]]).abs();
+                            for m in 0..num_basis {
+                                for n in 0..num_basis {
+                                    let cd = 0.5 * (vxc_mat_comp[s][[m, n]] + vxc_mat_comp[s][[n, m]]);
+                                    let dd = 0.5 * (vxc_mat_dense[s][[m, n]] + vxc_mat_dense[s][[n, m]]);
+                                    let d = (dd - cd).abs();
                                     if d > max_vxc { max_vxc = d; }
-                                    if d > 1e-8 && first_diff.is_none() { first_diff = Some((s, mu, nu, vxc_mat_dense[s][[mu, nu]], vxc_mat_comp[s][[mu, nu]])); }
+                                    if d > 1e-8 && first_diff.is_none() { first_diff = Some((s, m, n, dd, cd)); }
                                 }
                             }
                         }
@@ -4042,23 +4048,41 @@ impl Grids {
                         &mut loc_vxc_mat[i_spin].data[..], num_basis,
                     );
                 } else {
-                    let mut loc_mat_batch = MatrixFull::new([n_active, n_active], 0.0);
+                    // The dgemm below runs with beta = 0, which overwrites every
+                    // element of the C range (0..n_active, 0..n_active) without
+                    // reading the prior contents (BLAS semantics). Zeroing the
+                    // fresh allocation is therefore pure waste: on ts2 it
+                    // memsets ~4 MB per batch per worker (~18% of the contract
+                    // phase, 28t measurement) whose values are never consumed.
+                    let n_c = n_active * n_active;
+                    let mut c_buf = Vec::with_capacity(n_c);
+                    unsafe { c_buf.set_len(n_c); }
+                    let mut loc_mat_batch =
+                        unsafe { MatrixFull::from_vec_unchecked([n_active, n_active], c_buf) };
                     _dgemm(
                         batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
                         &vxc_ao_comp[i_spin], (0..n_active, 0..n_batch), 'T',
                         &mut loc_mat_batch, (0..n_active, 0..n_active), 1.0, 0.0,
                     );
-                    // Scatter to the global vxc matrix. `loc_mat_batch` is symmetric in the
-                    // batch-local indices and both matrices are column-major, so with `j_l`
-                    // outermost the destination column `nu` is fixed and the inner loop walks
-                    // `mu`: source and destination are then both sequential. Measured on
-                    // (H2O)10 / PBE0: scatter phase −24%. A per-batch pair gate was tried and
-                    // rejected (only ~6-9% of the pairs were skippable while building the
-                    // per-AO maxima cost ~3x the scatter phase).
+                    // Scatter to the global vxc matrix. Both matrices are column-major,
+                    // so with `j_l` outermost the destination column `nu` is fixed and
+                    // the inner loop walks `mu`: source and destination are then both
+                    // sequential. Measured on (H2O)10 / PBE0: scatter phase −24%.
                     // Raw-slice scatter: bypass the Index<[usize;2]> trait chain
                     // (get2d → index2d → contain_of → zip/map/sum → data.get → unwrap),
                     // which costs 4+ function calls and 2 bounds checks per element.
                     // With column-major layout, element (i,j) sits at data[i + j*size[0]].
+                    //
+                    // Upper-triangle-only scatter: the batch square C = AO·vxc_ao^T is
+                    // completed by the caller's symmetrize (V ← 0.5(V+V^T)), so writing
+                    // both triangles duplicates every RMW. Here we write only mu <= nu
+                    // positions; off-diagonal entries accumulate the (i,j) AND (j,i)
+                    // source terms (C_ij + C_ji), the diagonal takes C_ii once. Then
+                    // 0.5(U + U^T) over the merged upper-only V reproduces exactly the
+                    // full-scatter result: diag 0.5(2·ΣC_ii) = ΣC_ii, off-diag
+                    // 0.5(Σ(C_ij+C_ji)) = 0.5(ΣC_ij + ΣC_ji). Verified 2×2 both for
+                    // symmetric and non-symmetric C. Halves the V RMW traffic and the
+                    // C read (the source transpose term is a cache-friendly row walk).
                     {
                         let stride = num_basis;
                         let dst: &mut [f64] = &mut loc_vxc_mat[i_spin].data[..];
@@ -4066,8 +4090,13 @@ impl Grids {
                         for j_l in 0..n_active {
                             let dst_col = indices[j_l] * stride;
                             let src_col = j_l * n_active;
-                            for (i_l, &mu) in indices.iter().enumerate() {
-                                dst[mu + dst_col] += src[i_l + src_col];
+                            for i_l in 0..=j_l {
+                                let mu = indices[i_l];
+                                let mut v = src[i_l + src_col];
+                                if i_l < j_l {
+                                    v += src[j_l + i_l * n_active];
+                                }
+                                dst[mu + dst_col] += v;
                             }
                         }
                     }
