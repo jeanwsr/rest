@@ -5,7 +5,7 @@ use rest_tensors::MatrixFull;
 use rayon::prelude::*;
 use itertools::{Itertools, izip};
 use tensors::{MathMatrix, ParMathMatrix};
-use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_nn_serial};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_nn, _dgemm_nn_serial};
 use std::convert::TryInto;
 use std::f64::consts::{PI, E};
 use libm;
@@ -59,7 +59,11 @@ pub fn spheric_gto_value_matrixfull(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basi
             });
 
             //time_records.count_start("1-2");
-            let tmp_spheric = _dgemm_nn(&tmp_cart.to_matrixfullslice(), &c2s_mat.to_matrixfullslice());
+            // C[num_grids, s_len] = tmp_cart[num_grids, c_len] x c2s[c_len, s_len]
+            let mut tmp_spheric = uninit_matrix(num_grids, s_len);
+            _dgemm(&tmp_cart, (0..num_grids, 0..c_len), 'N',
+                   &c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                   &mut tmp_spheric, (0..num_grids, 0..s_len), 1.0, 0.0);
             //time_records.count("1-2");
 
             outmat_s.iter_columns_mut(ibas_start..ibas_start+s_len)
@@ -120,7 +124,11 @@ pub fn spheric_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], ba
             });
 
             //time_records.count_start("1-2");
-            let tmp_spheric = _dgemm_nn_serial(&tmp_cart.to_matrixfullslice(), &c2s_mat.to_matrixfullslice());
+            // C[num_grids, s_len] = tmp_cart[num_grids, c_len] x c2s[c_len, s_len]
+            let mut tmp_spheric = uninit_matrix(num_grids, s_len);
+            _dgemm(&tmp_cart, (0..num_grids, 0..c_len), 'N',
+                   &c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                   &mut tmp_spheric, (0..num_grids, 0..s_len), 1.0, 0.0);
             //time_records.count("1-2");
 
             outmat_s.iter_columns_mut(ibas_start..ibas_start+s_len)
@@ -235,10 +243,10 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
 
             //time_records.count_start("1-2");
             let mut tmp_spheric = uninit_matrix(s_len, num_grids);
-            tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                &c2s_mat.to_matrixfullslice(),
-                &tmp_cart.to_matrixfullslice(), 
-                'T', 'N', 1.0, 0.0);
+            // C[s_len, num_grids] = c2s[c_len, s_len]^T x tmp_cart[c_len, num_grids]
+            _dgemm(&c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'T',
+                   &tmp_cart, (0..c_len, 0..num_grids), 'N',
+                   &mut tmp_spheric, (0..s_len, 0..num_grids), 1.0, 0.0);
 
             outmat_s.copy_from_matr(ibas_start..ibas_start+s_len, 0..num_grids, 
                 &tmp_spheric, 0..s_len, 0..num_grids);
@@ -310,12 +318,15 @@ pub fn gto_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &
                 tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
             });
             if basis_type.eq(&"spheric".to_string()) {
-                // beta 1.0 -> 0.0 (C was pre-zeroed and never read): bitwise identical
-                let mut tmp_spheric = uninit_matrix((2*iang + 1) as usize, 1);
-                tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                    &tmp_cart.to_matrixfullslice(), 
-                    &c2s_matrix_const(iang as usize).to_matrixfullslice(),
-                     'T','N',1.0,0.0);
+                let s_len = (2*iang + 1) as usize;
+                let c_len = ((iang+1)*(iang+2)/2) as usize;
+                // C[1, s_len] = tmp_cart[c_len, 1]^T x c2s[c_len, s_len]
+                // (s_len contiguous values; the old code used the layout
+                //  equivalence of [s_len,1] and [1,s_len] buffers)
+                let mut tmp_spheric = uninit_matrix(1, s_len);
+                _dgemm(&tmp_cart, (0..c_len, 0..1), 'T',
+                       &c2s_matrix_const(iang as usize).to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                       &mut tmp_spheric, (0..1, 0..s_len), 1.0, 0.0);
                 //tmp_spheric.lapack_dgemm(&mut tmp_cart, &mut c2s_matrix(iang as usize), 'T', 'N', 1.0, 0.0);
                 value.extend(tmp_spheric.data);
             } else {
@@ -360,7 +371,11 @@ pub fn spheric_gto_1st_value_batch(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis
             //let mut tmp_spheric = MatrixFull::new([num_grids,s_len],0.0);
             paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
                 //tmp_spheric.lapack_dgemm(tmp_cart_x, &mut c2s_mat, 'N','N',1.0,0.0);
-                let tmp_spheric = _dgemm_nn(&tmp_cart_x.to_matrixfullslice(),&c2s_mat.to_matrixfullslice());
+                // C[num_grids, s_len] = tmp_cart_x[num_grids, c_len] x c2s[c_len, s_len]
+                let mut tmp_spheric = uninit_matrix(num_grids, s_len);
+                _dgemm(&*tmp_cart_x, (0..num_grids, 0..c_len), 'N',
+                       &c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                       &mut tmp_spheric, (0..num_grids, 0..s_len), 1.0, 0.0);
                 paox_x.iter_columns_mut(ibas_start..ibas_start+s_len)
                 .zip(tmp_spheric.iter_columns_full()).for_each(|(to,from)| {
                     to.par_iter_mut().zip(from.par_iter()).for_each(|(to,from)| {*to = *from});
@@ -413,7 +428,11 @@ pub fn spheric_gto_1st_value_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas
             //let mut tmp_spheric = MatrixFull::new([num_grids,s_len],0.0);
             paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
                 //tmp_spheric.lapack_dgemm(tmp_cart_x, &mut c2s_mat, 'N','N',1.0,0.0);
-                let tmp_spheric = _dgemm_nn_serial(&tmp_cart_x.to_matrixfullslice(),&c2s_mat.to_matrixfullslice());
+                // C[num_grids, s_len] = tmp_cart_x[num_grids, c_len] x c2s[c_len, s_len]
+                let mut tmp_spheric = uninit_matrix(num_grids, s_len);
+                _dgemm(&*tmp_cart_x, (0..num_grids, 0..c_len), 'N',
+                       &c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                       &mut tmp_spheric, (0..num_grids, 0..s_len), 1.0, 0.0);
                 paox_x.iter_columns_mut(ibas_start..ibas_start+s_len)
                 .zip(tmp_spheric.iter_columns_full()).for_each(|(to,from)| {
                     to.iter_mut().zip(from.iter()).for_each(|(to,from)| {*to = *from});
@@ -566,11 +585,11 @@ pub fn spheric_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basi
             //Stop here
             paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
                 //tmp_spheric.lapack_dgemm(tmp_cart_x, &mut c2s_mat, 'N','N',1.0,0.0);
-                let mut tmp_spheric = MatrixFull::new([s_len,num_grids],0.0);
-                tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                    &c2s_mat.to_matrixfullslice(),
-                    &tmp_cart_x.to_matrixfullslice(),
-                    'T','N',1.0,0.0);
+                // C[s_len, num_grids] = c2s[c_len, s_len]^T x tmp_cart_x[c_len, num_grids]
+                let mut tmp_spheric = uninit_matrix(s_len, num_grids);
+                _dgemm(&c2s_mat.to_matrixfullslice(), (0..c_len, 0..s_len), 'T',
+                       &*tmp_cart_x, (0..c_len, 0..num_grids), 'N',
+                       &mut tmp_spheric, (0..s_len, 0..num_grids), 1.0, 0.0);
                 paox_x.copy_from_matr(ibas_start..ibas_start+s_len,0..num_grids,  &tmp_spheric, 0..s_len,0..num_grids);
                 //let tmp_spheric = _dgemm_nn_serial(&tmp_cart_x.to_matrixfullslice(),&c2s_mat.to_matrixfullslice());
                 //paox_x.iter_columns_mut(ibas_start..ibas_start+s_len)
@@ -698,11 +717,13 @@ pub fn gto_1st_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_typ
             });
             if basis_type.eq(&"spheric".to_string()) {
                 tmp_cart.iter().zip(value.iter_mut()).for_each(|(tmp_cart, value)| {
-                    let mut tmp_spheric = uninit_matrix((2*iang + 1) as usize, 1);
-                    tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                        &tmp_cart.to_matrixfullslice(), 
-                        &c2s_matrix_const(iang as usize).to_matrixfullslice(), 
-                        'T', 'N', 1.0, 0.0);
+                    let s_len = (2*iang + 1) as usize;
+                    let c_len = ((iang+1)*(iang+2)/2) as usize;
+                    // C[1, s_len] = tmp_cart[c_len, 1]^T x c2s[c_len, s_len]
+                    let mut tmp_spheric = uninit_matrix(1, s_len);
+                    _dgemm(&*tmp_cart, (0..c_len, 0..1), 'T',
+                           &c2s_matrix_const(iang as usize).to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
+                           &mut tmp_spheric, (0..1, 0..s_len), 1.0, 0.0);
                     value.extend(tmp_spheric.data.iter());
                 });
             } else {

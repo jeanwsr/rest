@@ -1,5 +1,13 @@
 #![warn(unused_imports)]
-use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_tn, _dsvd};
+use tensors::matrix_blas_lapack::{_dgemm, _dsvd};
+
+#[inline]
+fn uninit_matrix(rows: usize, cols: usize) -> MatrixFull<f64> {
+    let n = rows * cols;
+    let mut buf = Vec::with_capacity(n);
+    unsafe { buf.set_len(n); }
+    unsafe { MatrixFull::from_vec_unchecked([rows, cols], buf) }
+}
 use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
 use crate::ctrl_io::U2RStyle;
 use crate::initial_guess::enxc::effective_nxc_matrix;
@@ -385,8 +393,18 @@ fn derive_oss_pair_from_occupation(scf_data: &mut SCF, occupation: &[Vec<f64>; 2
         let ovlp_full = scf_data.ovlp.to_matrixfull().unwrap();
         let c_alpha = scf_data.eigenvectors[0].to_matrixfullslice();
         let c_beta = scf_data.eigenvectors[1].to_matrixfullslice();
-        let tmp = _dgemm_tn(&c_beta, &ovlp_full.to_matrixfullslice());
-        let m_ovlp = _dgemm_nn(&tmp.to_matrixfullslice(), &c_alpha);
+        // BLAS-backed (was naive triple loops): tmp[ns,nao] = C_beta^T S;
+        // m_ovlp[ns,ns] = tmp x C_alpha
+        let nao = ovlp_full.size()[0];
+        let ns = c_beta.size()[1];
+        let mut tmp = uninit_matrix(ns, nao);
+        _dgemm(&c_beta, (0..nao, 0..ns), 'T',
+               &ovlp_full, (0..nao, 0..nao), 'N',
+               &mut tmp, (0..ns, 0..nao), 1.0, 0.0);
+        let mut m_ovlp = uninit_matrix(ns, ns);
+        _dgemm(&tmp, (0..ns, 0..nao), 'N',
+               &c_alpha, (0..nao, 0..ns), 'N',
+               &mut m_ovlp, (0..ns, 0..ns), 1.0, 0.0);
         // column-major: M.data[j + i*num_state] = M[j][i]
         let mut best_i = 0usize;
         let mut best_ovlp = -1.0f64;
@@ -609,8 +627,18 @@ fn import_mode(target_scftype: &SCFType, source: SCFType) -> ImportMode {
 /// `M = c1^T S c2`: the overlap matrix of two MO sets ([num_state, num_state]).
 /// `M = c1^T S c2`: the overlap matrix of two MO sets ([num_state, num_state]).
 fn mo_overlap_matrix(c1: &MatrixFull<f64>, s: &MatrixFull<f64>, c2: &MatrixFull<f64>) -> MatrixFull<f64> {
-    let tmp = _dgemm_tn(&c1.to_matrixfullslice(), &s.to_matrixfullslice());
-    _dgemm_nn(&tmp.to_matrixfullslice(), &c2.to_matrixfullslice())
+    // BLAS-backed (was naive triple loops): tmp[ns,nao] = c1^T S; M[ns,ns] = tmp x c2
+    let nao = s.size()[0];
+    let ns = c1.size()[1];
+    let mut tmp = uninit_matrix(ns, nao);
+    _dgemm(c1, (0..nao, 0..ns), 'T',
+           s, (0..nao, 0..nao), 'N',
+           &mut tmp, (0..ns, 0..nao), 1.0, 0.0);
+    let mut m = uninit_matrix(ns, ns);
+    _dgemm(&tmp, (0..ns, 0..nao), 'N',
+           c2, (0..nao, 0..ns), 'N',
+           &mut m, (0..ns, 0..ns), 1.0, 0.0);
+    m
 }
 
 /// Indices of the occupied orbitals of one spin channel (occupation > 0.5).
@@ -652,8 +680,14 @@ fn u2r_density_basis(
             if wi.abs() < 1.0e-12 { continue; }
             for k in 0..num_basis { weighted.data[k + i * num_basis] *= wi; }
         }
-        let c_t = c.transpose();
-        let contrib = _dgemm_nn(&weighted.to_matrixfullslice(), &c_t.to_matrixfullslice());
+        // BLAS-backed, and the explicit c.transpose() copy is folded into the
+        // 'T' operand: contrib[nao,nao] = weighted[nao,ns] x c[nao,ns]^T
+        let nao = c.size()[0];
+        let ns = c.size()[1];
+        let mut contrib = uninit_matrix(nao, nao);
+        _dgemm(&weighted, (0..nao, 0..ns), 'N',
+               c, (0..nao, 0..ns), 'T',
+               &mut contrib, (0..nao, 0..nao), 1.0, 0.0);
         for k in 0..density.data.len() { density.data[k] += contrib.data[k]; }
     }
 
