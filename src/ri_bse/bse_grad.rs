@@ -2290,6 +2290,17 @@ pub struct BseGradEngine<'a> {
     /// `naux^2` intermediates) is by far the dominant cost, so restricting the
     /// list keeps both its time and its peak at one root's worth.
     pub grad_roots: Option<Vec<usize>>,
+    /// Energy-degenerate BSE root manifolds (indices into [`Self::roots`]),
+    /// detected by [`Self::finalize_degenerate_manifolds`] right after a solve.
+    ///
+    /// Inside a manifold the individual eigenvectors are only defined up to a
+    /// rotation, so the Hellmann-Feynman contraction of each member is
+    /// basis-dependent.  The members are metric-orthonormalised at detection
+    /// time and [`Self::analytic_gradients`] replaces their gradients by the
+    /// manifold average — the derivative of the mean manifold energy, which is
+    /// the basis-invariant (and physically meaningful) quantity as long as the
+    /// degeneracy is not split by the displacement.
+    pub degenerate_groups: Vec<Vec<usize>>,
     /// Solver that produced `roots` (see [`Self::solver_used`]).
     solver_used: &'static str,
     /// Screening energies the static screening was built from — kept so that
@@ -2549,6 +2560,7 @@ impl<'a> BseGradEngine<'a> {
             qp_caches,
             roots: Vec::new(),
             grad_roots: None,
+            degenerate_groups: Vec::new(),
             solver_used: "dense",
             eps_screen,
         }
@@ -2632,6 +2644,7 @@ impl<'a> BseGradEngine<'a> {
                     .into_iter()
                     .map(|(omega, x, y)| BseRoot { omega, x, y })
                     .collect();
+                self.finalize_degenerate_manifolds();
                 return;
             }
             eprintln!(
@@ -2646,6 +2659,7 @@ impl<'a> BseGradEngine<'a> {
                 .into_iter()
                 .map(|(omega, x, y)| BseRoot { omega, x, y })
                 .collect();
+            self.finalize_degenerate_manifolds();
             return;
         }
         self.solver_used = "dense";
@@ -2653,6 +2667,149 @@ impl<'a> BseGradEngine<'a> {
             .into_iter()
             .map(|(omega, x, y)| BseRoot { omega, x, y })
             .collect();
+        self.finalize_degenerate_manifolds();
+    }
+
+    /// Detect energy-degenerate BSE root manifolds, metric-orthonormalise their
+    /// members and remember the groups for the gradient averaging.
+    ///
+    /// The tolerance is `REST_BSE_DEGEN_TOL` (Hartree, default `1e-6`).  This
+    /// is the BSE-root analogue of the symmetry-degenerate *orbital* shells
+    /// handled in the GW gradient: without it, two roots with the same Omega
+    /// receive different gradients because the solver's basis inside the
+    /// manifold is arbitrary.
+    fn finalize_degenerate_manifolds(&mut self) {
+        self.degenerate_groups.clear();
+        let tol = std::env::var("REST_BSE_DEGEN_TOL")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0e-6)
+            .max(0.0);
+        if tol == 0.0 || self.roots.len() < 2 {
+            return;
+        }
+        let n = self.roots.len();
+        let mut i = 0usize;
+        while i < n {
+            let e0 = self.roots[i].omega;
+            let mut j = i + 1;
+            while j < n && (self.roots[j].omega - e0).abs() <= tol {
+                j += 1;
+            }
+            let g = j - i;
+            if g > 1 {
+                self.orthonormalise_manifold(i, g);
+                let split = self.roots[j - 1].omega - self.roots[i].omega;
+                println!(
+                    "[bse_grad] degenerate manifold detected: roots {}..{}, split={:.3e} Ha, projected (metric-orthonormalised, gradient averaged)",
+                    i,
+                    j - 1,
+                    split
+                );
+                self.degenerate_groups.push((i..j).collect());
+            }
+            i = j;
+        }
+    }
+
+    /// Loewdin-orthonormalise `roots[start..start+g]` in the BSE metric
+    /// `S_ij = X_i.X_j - Y_i.Y_j` (the metric of the Casida problem).
+    fn orthonormalise_manifold(&mut self, start: usize, g: usize) {
+        let dim = self.roots[start].x.len();
+        let mut s = vec![0.0f64; g * g];
+        for a in 0..g {
+            for b in 0..g {
+                let ra = &self.roots[start + a];
+                let rb = &self.roots[start + b];
+                s[a + b * g] = ra.x.iter().zip(rb.x.iter()).map(|(p, q)| p * q).sum::<f64>()
+                    - ra.y.iter().zip(rb.y.iter()).map(|(p, q)| p * q).sum::<f64>();
+            }
+        }
+        // symmetrise (the metric is symmetric up to round-off)
+        for a in 0..g {
+            for b in (a + 1)..g {
+                let m = 0.5 * (s[a + b * g] + s[b + a * g]);
+                s[a + b * g] = m;
+                s[b + a * g] = m;
+            }
+        }
+        let (vecs, vals, _) = _dsyevd(&to_mat(&s, g, g), 'V');
+        let vecs = vecs.expect("bse_grad: manifold metric eigenvectors");
+        if vals.iter().any(|&v| v <= 1.0e-12) {
+            println!(
+                "[bse_grad] degenerate manifold {:?}: metric is singular, keeping the solver basis",
+                (start..start + g).collect::<Vec<_>>()
+            );
+            return;
+        }
+        // T = V diag(1/sqrt(v)) V^T   (symmetric inverse square root)
+        let mut t = vec![0.0f64; g * g];
+        for a in 0..g {
+            for b in 0..g {
+                let mut acc = 0.0f64;
+                for k in 0..g {
+                    acc += vecs.data[a + k * g] * vecs.data[b + k * g] / vals[k].sqrt();
+                }
+                t[a + b * g] = acc;
+            }
+        }
+        let xs: Vec<Vec<f64>> = (0..g).map(|a| self.roots[start + a].x.clone()).collect();
+        let ys: Vec<Vec<f64>> = (0..g).map(|a| self.roots[start + a].y.clone()).collect();
+        for a in 0..g {
+            for r in 0..dim {
+                let mut x = 0.0f64;
+                let mut y = 0.0f64;
+                for b in 0..g {
+                    x += t[a + b * g] * xs[b][r];
+                    y += t[a + b * g] * ys[b][r];
+                }
+                self.roots[start + a].x[r] = x;
+                self.roots[start + a].y[r] = y;
+            }
+        }
+    }
+
+    /// Replace the gradient of every member of a detected degenerate manifold
+    /// by the manifold average (see [`Self::degenerate_groups`]).
+    ///
+    /// `grads[p]` is the gradient of `sel[p]`; a manifold is averaged only when
+    /// **all** its members are differentiated, because the average over a
+    /// subset is not the derivative of a manifold-invariant quantity.
+    fn average_degenerate_gradients(&self, grads: &mut [Vec<f64>], sel: &[usize]) {
+        for group in &self.degenerate_groups {
+            let pos: Vec<usize> = group
+                .iter()
+                .filter_map(|k| sel.iter().position(|s| s == k))
+                .collect();
+            if pos.len() < 2 {
+                continue;
+            }
+            if pos.len() != group.len() {
+                println!(
+                    "[bse_grad] warning: degenerate manifold {:?} is only partially differentiated                      ({:?}); the individual gradients are basis dependent and are left as computed",
+                    group, pos
+                );
+                continue;
+            }
+            let ncomp = grads[pos[0]].len();
+            let mut mean = vec![0.0f64; ncomp];
+            for &p in &pos {
+                for c in 0..ncomp {
+                    mean[c] += grads[p][c];
+                }
+            }
+            let inv = 1.0 / pos.len() as f64;
+            for c in 0..ncomp {
+                mean[c] *= inv;
+            }
+            for &p in &pos {
+                grads[p].copy_from_slice(&mean);
+            }
+            println!(
+                "[bse_grad] degenerate manifold {:?}: gradients replaced by the manifold average",
+                group
+            );
+        }
     }
 
     /// Linear-response stability of the reference state (see [`BseStability`]).
@@ -3211,6 +3368,7 @@ impl<'a> BseGradEngine<'a> {
                 }
             );
         }
+        self.average_degenerate_gradients(&mut grads, &sel);
         (grads, omegas)
     }
 
@@ -3408,6 +3566,8 @@ impl<'a> BseGradEngine<'a> {
                 }
             }
         }
+        let sel: Vec<usize> = (0..nk).collect();
+        self.average_degenerate_gradients(&mut grads, &sel);
         (grads, self.roots.iter().map(|r| r.omega).collect())
     }
 }
