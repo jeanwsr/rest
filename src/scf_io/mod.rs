@@ -3850,6 +3850,16 @@ impl SCF {
 
     }
 
+    /// Whether a later stage of the job still contracts the decomposed ERI.
+    ///
+    /// The analytic gradients (`job_type = force`/`geom_opt`) and the analdrv tasks (Hessian,
+    /// multipole, together with their post-SCF response objects) read `rimatr` after the SCF,
+    /// so the RI3MO generation must not release it for those jobs. A single-point job does not.
+    fn rimatr_needed_after_scf(&self) -> bool {
+        matches!(&self.mol.ctrl.job_type, crate::ctrl_io::JobType::Force | crate::ctrl_io::JobType::GeomOpt)
+            || !self.mol.ctrl.analdrv_tasks.is_empty()
+    }
+
     pub fn generate_ri3mo_rayon(&mut self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>) {
         if let SCFType::ROHF = self.scftype { //in ROHF case, generate semi-canonical eigenvectors for post SCF calculations.
             self.semi_diagonalize_hamiltonian(); 
@@ -3890,8 +3900,11 @@ impl SCF {
             //    })
             //};
 
-            // deallocate the rimatr to save the memory
-            self.rimatr = None;
+            // deallocate the rimatr to save the memory, unless a later stage of this job
+            // still contracts it (see `rimatr_needed_after_scf`)
+            if !self.rimatr_needed_after_scf() {
+                self.rimatr = None;
+            }
             self.ri3mo = Some(ri3mo);
         } else {
             // use rstsr::prelude::*;
