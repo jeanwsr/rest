@@ -42,8 +42,7 @@ use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
 use crate::grad::rhf::{
-    generator_deriv_hcore, get_dme0, get_grad_dao_ovlp, occupation_is_aufbau, occupation_summary,
-    pack_triu_tilde, RIHFGradientFlagsBuilder,
+    generator_deriv_hcore, get_dme0, get_grad_dao_ovlp, pack_triu_tilde, RIHFGradientFlagsBuilder,
 };
 use crate::grad::traits::GradAPI;
 use crate::grad::uhf::RIUHFGradient;
@@ -96,21 +95,6 @@ impl<'a> UDHGradient<'a> {
         assert!(mol_obj.ctrl.spin_polarization, "UDHGradient supports only unrestricted (spin-polarization = true) references.");
         assert!(matches!(scf_data.scftype, SCFType::UHF), "UDHGradient supports only UHF references.");
         assert!(mol_obj.start_mo == 0, "UDHGradient does not support frozen core (start_mo).");
-        // A Delta-SCF / MOM occupation breaks the contiguous `0..nocc` /
-        // `nocc..nmo` split the PT2 pair spaces are built from; refuse it
-        // instead of returning a silently wrong correlation gradient.
-        for spin in 0..2 {
-            assert!(
-                occupation_is_aufbau(&scf_data.occupation[spin]),
-                "The DH (PT2-family) analytic gradient does not support a non-Aufbau occupation \
-                 (MOM / force_state_occupation) in spin channel {}: {}. The PT2 occupied/virtual \
-                 spaces are built from the contiguous 0..nocc / nocc..nmo split. Either optimize \
-                 the geometry with the SCF functional (a non-PT2 `xc`), or drop \
-                 force_state_occupation.",
-                spin,
-                occupation_summary(&scf_data.occupation[spin])
-            );
-        }
         assert!(self.mpi_operator.is_none(), "UDHGradient is not MPI-parallelized yet.");
         assert!(
             scf_data.mol.dfadef.omega().is_none(),
@@ -182,12 +166,27 @@ impl<'a> UDHGradient<'a> {
         };
 
         // ── per-spin orbital data ── //
-        let mo_coeff: [Tsr; 2] =
-            [(&scf_data.eigenvectors[0]).to_rstsr(&device), (&scf_data.eigenvectors[1]).to_rstsr(&device)];
-        let mo_occ: [Tsr; 2] =
-            [(&scf_data.occupation[0]).to_rstsr(&device), (&scf_data.occupation[1]).to_rstsr(&device)];
-        let mo_energy: [Tsr; 2] =
-            [(&scf_data.eigenvalues[0]).to_rstsr(&device), (&scf_data.eigenvalues[1]).to_rstsr(&device)];
+        // The CP-SCF / PT2 kernels split the MO index into `0..nocc` and `nocc..nmo`. A
+        // Delta-SCF / MOM occupation (a hole below the HOMO, an occupied orbital above it) can
+        // leave the leading `nocc` columns holding an empty orbital, so the orbitals are put in
+        // occupied-first order here and that order is used everywhere below. For an Aufbau
+        // occupation the permutation is the identity.
+        let perm: [Vec<usize>; 2] = [
+            crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]),
+            crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[1]),
+        ];
+        let mo_coeff: [Tsr; 2] = [
+            (&scf_data.eigenvectors[0]).to_rstsr(&device).index_select(-1, &perm[0]),
+            (&scf_data.eigenvectors[1]).to_rstsr(&device).index_select(-1, &perm[1]),
+        ];
+        let mo_occ: [Tsr; 2] = [
+            (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm[0]),
+            (&scf_data.occupation[1]).to_rstsr(&device).index_select(0, &perm[1]),
+        ];
+        let mo_energy: [Tsr; 2] = [
+            (&scf_data.eigenvalues[0]).to_rstsr(&device).index_select(0, &perm[0]),
+            (&scf_data.eigenvalues[1]).to_rstsr(&device).index_select(0, &perm[1]),
+        ];
         let nao = mo_coeff[0].shape()[0];
         let nmo = mo_coeff[0].shape()[1];
         assert_eq!(mo_coeff[1].shape()[1], nmo, "UDHGradient expects equal MO counts per spin.");

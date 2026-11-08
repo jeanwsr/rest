@@ -52,7 +52,7 @@ use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
-use crate::grad::rhf::{get_grad_dao_ovlp, occupation_is_aufbau, occupation_summary, RIRHFGradient, RIHFGradientFlagsBuilder};
+use crate::grad::rhf::{get_grad_dao_ovlp, RIRHFGradient, RIHFGradientFlagsBuilder};
 use crate::grad::rks::get_vxc_rayon_new;
 use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
@@ -98,18 +98,6 @@ impl<'a> RDHGradient<'a> {
         let device = DeviceBLAS::default();
         assert!(!mol_obj.ctrl.spin_polarization, "RDHGradient supports only restricted (spin-polarization = false) references.");
         assert!(mol_obj.start_mo == 0, "RDHGradient does not support frozen core (start_mo).");
-        // A Delta-SCF / MOM occupation (a hole below the HOMO, an occupied
-        // orbital above it) breaks the contiguous `0..nocc` / `nocc..nmo` split
-        // that every PT2 occupied/virtual pair space of this driver is built
-        // from, so the correlation gradient would be silently wrong. Refuse it.
-        assert!(
-            occupation_is_aufbau(&scf_data.occupation[0]),
-            "The DH (PT2-family) analytic gradient does not support a non-Aufbau occupation \
-             (MOM / force_state_occupation): {}. The PT2 occupied/virtual spaces are built from \
-             the contiguous 0..nocc / nocc..nmo split. Either optimize the geometry with the SCF \
-             functional (a non-PT2 `xc`), or drop force_state_occupation.",
-            occupation_summary(&scf_data.occupation[0])
-        );
         assert!(self.mpi_operator.is_none(), "RDHGradient is not MPI-parallelized yet.");
         assert!(
             scf_data.mol.dfadef.omega().is_none(),
@@ -135,9 +123,15 @@ impl<'a> RDHGradient<'a> {
         let natm = mol_obj.geom.elem.len();
         let naux = aux.nao();
 
-        let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
-        let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
-        let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
+        // The CP-SCF / PT2 kernels split the MO index into `0..nocc` and `nocc..nmo`. A
+        // Delta-SCF / MOM occupation (a hole below the HOMO, an occupied orbital above it) can
+        // leave the leading `nocc` columns holding an empty orbital, so the orbitals are put in
+        // occupied-first order here and that order is used everywhere below. For an Aufbau
+        // occupation the permutation is the identity.
+        let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
+        let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device).index_select(-1, &perm);
+        let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm);
+        let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device).index_select(0, &perm);
         let nmo = mo_coeff.shape()[1];
         let nao = mo_coeff.shape()[0];
         let nocc = mo_occ.view().greater(0).sum();
