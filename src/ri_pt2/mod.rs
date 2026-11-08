@@ -1684,16 +1684,23 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 
         Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
     } else {
-        // No MPI operator available: run the non-MPI restricted open-shell
-        // driver. (This used to fall back to close_shell_pt2_rayon, which
-        // only reads the alpha channel and silently produced the wrong
-        // correlation for any open-shell reference; the restricted driver
-        // handles the alpha/beta pair sectors -- including the OSS hole
-        // below the beta HOMO -- correctly on a single node.)
-        restricted_open_shell_pt2_rayon(scf_data)
+        // No MPI operator available. RHF is a genuine closed-shell reference, so the
+        // closed-shell driver applies: it masks every pair by the occupation and therefore
+        // handles a non-Aufbau (Delta-SCF / MOM) occupation as well. Only ROHF -- including the
+        // restricted open-shell singlet, which forces the ROHF path -- needs the restricted
+        // open-shell driver, whose alpha/beta pair sectors cover the hole below the beta HOMO.
+        match scf_data.scftype {
+            SCFType::ROHF => restricted_open_shell_pt2_rayon(scf_data),
+            _ => close_shell_pt2_rayon(scf_data),
+        }
     }
     #[cfg(not(feature = "mpi"))]
-    { restricted_open_shell_pt2_rayon(scf_data) }
+    {
+        match scf_data.scftype {
+            SCFType::ROHF => restricted_open_shell_pt2_rayon(scf_data),
+            _ => close_shell_pt2_rayon(scf_data),
+        }
+    }
 
 }
 
