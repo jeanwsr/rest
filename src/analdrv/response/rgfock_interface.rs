@@ -362,9 +362,11 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- basic preparation and checks --- //
 
-    let mo_coeff = scf_data.eigenvectors[0].to_rstsr(&device);
-    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
-    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
+    // The generalized-Fock/Z-vector kernels use `0..nocc` as the occupied block.
+    let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
+    let mo_coeff = scf_data.eigenvectors[0].to_rstsr(&device).index_select(-1, &perm);
+    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm);
+    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device).index_select(0, &perm);
 
     assert_eq!(
         scf_data.mol.start_mo, 0,

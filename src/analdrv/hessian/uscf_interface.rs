@@ -25,25 +25,42 @@ pub fn uscf_hess_interface<'a>(
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
+    // CP-SCF expects the occupied orbitals in the leading `0..nocc` block (per spin).
+    let perm = [
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]),
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[1]),
+    ];
     let mo_coeff = {
         let mo_coeff_0 = &scf_data.eigenvectors[0];
         let mo_coeff_1 = &scf_data.eigenvectors[1];
-        let mo_coeff_0 = rt::asarray((&mo_coeff_0.data, mo_coeff_0.size, &device)).into_contig(ColMajor);
-        let mo_coeff_1 = rt::asarray((&mo_coeff_1.data, mo_coeff_1.size, &device)).into_contig(ColMajor);
+        let mo_coeff_0 = rt::asarray((&mo_coeff_0.data, mo_coeff_0.size, &device))
+            .into_contig(ColMajor)
+            .index_select(-1, &perm[0]);
+        let mo_coeff_1 = rt::asarray((&mo_coeff_1.data, mo_coeff_1.size, &device))
+            .into_contig(ColMajor)
+            .index_select(-1, &perm[1]);
         [mo_coeff_0, mo_coeff_1]
     };
     let mo_occ = {
         let mo_occ_0 = &scf_data.occupation[0];
         let mo_occ_1 = &scf_data.occupation[1];
-        let mo_occ_0 = rt::asarray((mo_occ_0, [mo_occ_0.len()], &device)).into_contig(ColMajor);
-        let mo_occ_1 = rt::asarray((mo_occ_1, [mo_occ_1.len()], &device)).into_contig(ColMajor);
+        let mo_occ_0 = rt::asarray((mo_occ_0, [mo_occ_0.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[0]);
+        let mo_occ_1 = rt::asarray((mo_occ_1, [mo_occ_1.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[1]);
         [mo_occ_0, mo_occ_1]
     };
     let mo_energy = {
         let mo_energy_0 = &scf_data.eigenvalues[0];
         let mo_energy_1 = &scf_data.eigenvalues[1];
-        let mo_energy_0 = rt::asarray((mo_energy_0, [mo_energy_0.len()], &device)).into_contig(ColMajor);
-        let mo_energy_1 = rt::asarray((mo_energy_1, [mo_energy_1.len()], &device)).into_contig(ColMajor);
+        let mo_energy_0 = rt::asarray((mo_energy_0, [mo_energy_0.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[0]);
+        let mo_energy_1 = rt::asarray((mo_energy_1, [mo_energy_1.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[1]);
         [mo_energy_0, mo_energy_1]
     };
 
