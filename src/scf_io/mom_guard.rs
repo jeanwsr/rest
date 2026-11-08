@@ -98,6 +98,10 @@ impl SCF {
     /// what makes the comparison independent of the ordering the diagonalizer
     /// returned, and it is the reason this test survives the near-degenerate case
     /// that defeats an index/occupation-pattern test.
+    ///
+    /// The per-orbital weight is the largest occupation of the channel, so a restricted
+    /// channel (occupations 0 or 2) fills its orbitals with 2 and counts
+    /// `sum / max_occ` orbitals, while an unrestricted channel (0 or 1) fills with 1.
     fn aufbau_occupation_by_energy(&self) -> Option<[Vec<f64>; 2]> {
         let nmo = self.mol.num_state;
         if nmo == 0 {
@@ -105,7 +109,12 @@ impl SCF {
         }
         let mut occ = [vec![0.0; nmo], vec![0.0; nmo]];
         for spin in 0..2 {
-            let n_sigma = self.occupation[spin].iter().sum::<f64>().round() as usize;
+            let max_occ = self.occupation[spin].iter().cloned().fold(0.0_f64, f64::max);
+            let n_sigma = if max_occ > f64::EPSILON {
+                (self.occupation[spin].iter().sum::<f64>() / max_occ).round() as usize
+            } else {
+                0
+            };
             let ev = &self.eigenvalues[spin];
             if ev.len() < nmo {
                 // the spin channel has no orbitals of its own (restricted run, or
@@ -120,7 +129,7 @@ impl SCF {
                 ev[a].partial_cmp(&ev[b]).unwrap_or(std::cmp::Ordering::Equal)
             });
             for &i in idx.iter().take(n_sigma.min(nmo)) {
-                occ[spin][i] = 1.0;
+                occ[spin][i] = max_occ;
             }
         }
         Some(occ)
@@ -222,7 +231,8 @@ impl SCF {
         let step = self.mom_commit_count + 1;
 
         // --- L0: spin signature ------------------------------------------------
-        let [s2, _2s_plus_1] = evaluate_spin_angular_momentum(&self.density_matrix, &self.ovlp, 2, &self.mol.num_elec);
+        let [s2, _2s_plus_1] =
+            evaluate_spin_angular_momentum(&self.density_matrix, &self.ovlp, self.mol.spin_channel, &self.mol.num_elec);
         let s2_ref = *self.mom_s2_ref.get_or_insert(s2);
 
         // --- tracked orbital / overlap (L3) -----------------------------------
