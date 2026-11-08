@@ -28,17 +28,21 @@ pub fn rscf_hess_interface<'a>(
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
+    // CP-SCF expects the occupied orbitals in the leading `0..nocc` block.
+    let perm = super::occupied_first_permutation(&scf_data.occupation[0]);
     let mo_coeff = {
         let mo_coeff = &scf_data.eigenvectors[0];
-        rt::asarray((&mo_coeff.data, mo_coeff.size, &device)).into_contig(ColMajor)
+        rt::asarray((&mo_coeff.data, mo_coeff.size, &device))
+            .into_contig(ColMajor)
+            .index_select(-1, &perm)
     };
     let mo_occ = {
         let mo_occ = &scf_data.occupation[0];
-        rt::asarray((mo_occ, [mo_occ.len()], &device)).into_contig(ColMajor)
+        rt::asarray((mo_occ, [mo_occ.len()], &device)).into_contig(ColMajor).index_select(0, &perm)
     };
     let mo_energy = {
         let mo_energy = &scf_data.eigenvalues[0];
-        rt::asarray((mo_energy, [mo_energy.len()], &device)).into_contig(ColMajor)
+        rt::asarray((mo_energy, [mo_energy.len()], &device)).into_contig(ColMajor).index_select(0, &perm)
     };
 
     let mol_obj = &scf_data.mol;
