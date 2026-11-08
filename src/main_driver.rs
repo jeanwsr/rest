@@ -1241,7 +1241,64 @@ pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utili
     return (energy, gradient);
 }
 
-// UNVERIFIED NORMAL MODES CALCULATION
+/// l2 norm of the density-matrix gradient of an SCF state (the quantity the SCF reports as
+/// `grad_dm l2`). Both spin channels are inspected so that this also works for UHF/UDFT.
+fn density_gradient_norm(scf_data: &SCF) -> f64 {
+    let l2 = |m: &MatrixFull<f64>| -> f64 {
+        m.data.iter().map(|x| x * x).sum::<f64>().sqrt()
+    };
+    (0..2).map(|i| l2(&scf_data.grad_dm[i])).fold(0.0, f64::max)
+}
+
+/// SCF of one displaced geometry, followed by its analytic gradient.
+///
+/// A numerical Hessian differentiates the analytic gradient, so a displaced SCF has to converge
+/// the *density gradient*, not merely stop moving the density. `initial_guess = "inherit"` can
+/// stall DIIS in a state that satisfies `scf_conv_criteria = "dm,eev"` while the density gradient
+/// is still O(1e-1) Ha, and the Hessian column fed by such a state is pure noise (measured on
+/// H2O: two spurious modes at -1800 cm^-1 that the analytic Hessian does not have). The inherited
+/// start is kept because it normally needs a handful of iterations, but its result is verified
+/// against `gate`; if it is unusable the displacement is redone from a fresh guess, and if that
+/// fails too the calculation stops instead of returning a meaningless Hessian.
+fn displaced_gradient(
+    scf_data: &SCF,
+    atm_idx: usize,
+    displacement: [f64; 3],
+    gate: f64,
+    time_mark: &mut utilities::TimeRecords,
+    mpi_operator: &Option<MPIOperator>,
+) -> MatrixFull<f64> {
+    let mut last_grad = f64::INFINITY;
+    for (attempt, guess) in ["inherit", "pao"].iter().enumerate() {
+        let mut displaced = scf_data.clone();
+        displaced.mol.geom.geom_shift(atm_idx, displacement.to_vec());
+        displaced.mol.ctrl.print_level = 0;
+        displaced.mol.ctrl.initial_guess = String::from(*guess);
+        initialize_scf(&mut displaced, mpi_operator);
+        let _ = performance_essential_calculations(&mut displaced, time_mark, mpi_operator);
+        last_grad = density_gradient_norm(&displaced);
+        if displaced.scf_converged && last_grad <= gate {
+            let (_, gradient) = eval_force(&mut displaced, time_mark, mpi_operator);
+            return gradient;
+        }
+        if attempt == 0 && scf_data.mol.ctrl.print_level > 0 {
+            eprintln!(
+                "  WARNING: the displaced SCF (atom {}, displacement [{}, {}, {}] Bohr) reported \
+                 convergence with a density gradient of {:.2e} Ha (limit {:.2e} Ha); retrying from \
+                 a fresh guess.",
+                atm_idx, displacement[0], displacement[1], displacement[2], last_grad, gate
+            );
+        }
+    }
+    panic!(
+        "The displaced SCF for atom {} (displacement [{}, {}, {}] Bohr, used by the numerical \
+         Hessian) did not converge: its density gradient is still {:.2e} Ha, above the {:.2e} Ha \
+         that a Hessian at this geometry requires. Tighten [ctrl] scf_acc_rho / scf_acc_eev, or \
+         add \"g\" to scf_conv_criteria.",
+        atm_idx, displacement[0], displacement[1], displacement[2], last_grad, gate
+    );
+}
+
 fn eval_normal_modes(
     scf_data: &mut SCF,
     time_mark: &mut utilities::TimeRecords,
@@ -1251,8 +1308,30 @@ fn eval_normal_modes(
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
 
-    let num_atoms = scf_data.mol.geom.nfree;
-    let dim = num_atoms * 3;
+    // The Hessian is built over the *free* atoms only: an atom frozen by the geometry fix flag has
+    // no degrees of freedom, so displacing it would cost two SCF jobs per column for a row and a
+    // column that cannot enter the analysis. `geom.nfree` is the count of free atoms, while the
+    // displacement loop and the analytic gradient are indexed by the *real* atom index, so the two
+    // have to be kept apart: using `nfree` as the atom count silently reduces the Hessian to the
+    // leading atoms when the input freezes any of them.
+    let natom = scf_data.mol.geom.elem.len();
+    let free_atoms: Vec<usize> = (0..natom)
+        .filter(|&atm| !scf_data.mol.geom.fix.get(atm).copied().unwrap_or(false))
+        .collect();
+    if free_atoms.is_empty() {
+        panic!(
+            "Normal modes calculation requires at least one atom that is not frozen \
+             (geometry fix flag 0)."
+        );
+    }
+    let nfree = free_atoms.len();
+    let dim = nfree * 3;
+    // A displaced SCF only has to be as converged as the reference state it starts from: the
+    // Hessian differentiates the gradient, and a stalled SCF shows up as a gradient that is
+    // orders of magnitude worse than the reference one, not as a slightly worse one. The floor
+    // of 1e-5 Ha keeps a very tight reference from demanding the impossible at a displaced
+    // geometry; the factor of 100 catches the stall (measured: 1.1e-1 Ha against 8.6e-10 Ha).
+    let displaced_gate = (density_gradient_norm(scf_data) * 1.0e2).max(1.0e-5);
     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
     let displace = displace_ang / BOHR; // convert Angstrom to Bohr
 
@@ -1261,7 +1340,10 @@ fn eval_normal_modes(
         println!("=========================================================");
         println!("      Vibrational Normal Modes (Frequency) Calculation");
         println!("=========================================================");
-        println!("Number of atoms:               {}", num_atoms);
+        println!("Number of atoms:               {}", natom);
+        if nfree != natom {
+            println!("Frozen atoms (excluded):       {}", natom - nfree);
+        }
         println!("Hessian dimension:             {}", dim);
         println!("Finite-difference displacement: {:.6} Bohr ({:.6} Ang)", displace, displace_ang);
         println!("Number of displaced SCF jobs:  {}", dim * 2);
@@ -1298,38 +1380,27 @@ fn eval_normal_modes(
         io::stdout().flush().unwrap();
     }
 
-    for atm_idx in 0..num_atoms {
+    for (free_idx, &atm_idx) in free_atoms.iter().enumerate() {
         for xyz in 0..3 {
-            let col_idx = atm_idx * 3 + xyz;
+            let col_idx = free_idx * 3 + xyz;
 
             // +δ displacement
-            let mut vec_plus = vec![0.0; 3];
+            let mut vec_plus = [0.0; 3];
             vec_plus[xyz] = displace;
-            let mut scf_plus = scf_data.clone();
-            scf_plus.mol.geom.geom_shift(atm_idx, vec_plus);
-            scf_plus.mol.ctrl.print_level = 0;
-            scf_plus.mol.ctrl.initial_guess = String::from("inherit");
-            initialize_scf(&mut scf_plus, mpi_operator);
-            let _ = performance_essential_calculations(&mut scf_plus, time_mark, mpi_operator);
-            let (_, force_plus) = eval_force(&mut scf_plus, time_mark, mpi_operator);
+            let force_plus = displaced_gradient(scf_data, atm_idx, vec_plus, displaced_gate, time_mark, mpi_operator);
 
             // -δ displacement
-            let mut vec_minus = vec![0.0; 3];
+            let mut vec_minus = [0.0; 3];
             vec_minus[xyz] = -displace;
-            let mut scf_minus = scf_data.clone();
-            scf_minus.mol.geom.geom_shift(atm_idx, vec_minus);
-            scf_minus.mol.ctrl.print_level = 0;
-            scf_minus.mol.ctrl.initial_guess = String::from("inherit");
-            initialize_scf(&mut scf_minus, mpi_operator);
-            let _ = performance_essential_calculations(&mut scf_minus, time_mark, mpi_operator);
-            let (_, force_minus) = eval_force(&mut scf_minus, time_mark, mpi_operator);
+            let force_minus = displaced_gradient(scf_data, atm_idx, vec_minus, displaced_gate, time_mark, mpi_operator);
 
-            // Hessian column = (F(+) - F(-)) / (2δ)
-            // force_plus/minus are [3, num_atoms], we flatten to 3*num_atoms vector
-            for a in 0..num_atoms {
+            // Hessian column = (g(+) - g(-)) / (2δ).
+            // The analytic gradient is [3, natom] (component first) while the Hessian is indexed
+            // atom-major, so rows go through the same free-atom map as the columns.
+            for (row_free_idx, &row_atm) in free_atoms.iter().enumerate() {
                 for d in 0..3 {
-                    let row_idx = a * 3 + d;
-                    hessian[(row_idx, col_idx)] = (force_plus[(d, a)] - force_minus[(d, a)]) / (2.0 * displace);
+                    let row_idx = row_free_idx * 3 + d;
+                    hessian[(row_idx, col_idx)] = (force_plus[(d, row_atm)] - force_minus[(d, row_atm)]) / (2.0 * displace);
                 }
             }
 
@@ -1376,22 +1447,19 @@ fn eval_normal_modes(
     // Mass-weight Hessian: H̃_ij = H_ij / sqrt(m_i * m_j)
     let mut mw_hessian = MatrixFull::new([dim, dim], 0.0);
     for i in 0..dim {
-        let atom_i = i / 3;
-        let mass_i = mass_charge[atom_i].0; // mass in amu
+        let mass_i = mass_charge[free_atoms[i / 3]].0; // mass in amu
         for j in 0..=i {
-            let atom_j = j / 3;
-            let mass_j = mass_charge[atom_j].0;
+            let mass_j = mass_charge[free_atoms[j / 3]].0;
             let mw_val = hessian[(i, j)] / (mass_i * mass_j).sqrt();
             mw_hessian[(i, j)] = mw_val;
             mw_hessian[(j, i)] = mw_val;
         }
     }
 
-    // Diagonalize mass-weighted Hessian
-    let (eigenvectors, eigenvalues, info) = _dsyevd(&mw_hessian, 'V');
-    if info != 0 {
-        panic!("DSYEVD (diagonalization of mass-weighted Hessian) failed with info = {}", info);
-    }
+    // Diagonalize the mass-weighted Hessian. `_dsyevd` returns (eigenvectors, eigenvalues, n),
+    // where the third element is the matrix dimension, not a LAPACK `info`: the wrapper panics
+    // on a non-zero `info` itself, so a failed diagonalization never returns here.
+    let (eigenvectors, eigenvalues, _) = _dsyevd(&mw_hessian, 'V');
 
     let eigvec = eigenvectors.unwrap();
 
@@ -1447,12 +1515,19 @@ fn eval_normal_modes(
             println!("");
             println!("Mode {:4} (ω = {:12.4} cm⁻¹):", i + 1, freq);
             println!("{:>6} {:>14} {:>14} {:>14}", "Atom", "dX", "dY", "dZ");
-            for a in 0..num_atoms {
-                let dx = eigvec[(a * 3,     i)];
-                let dy = eigvec[(a * 3 + 1, i)];
-                let dz = eigvec[(a * 3 + 2, i)];
-                println!("{:>6} {:14.8} {:14.8} {:14.8}",
-                    scf_data.mol.geom.elem[a], dx, dy, dz);
+            // The eigenvector lives in the free-coordinate space; frozen atoms stay at zero.
+            for atom in 0..natom {
+                match free_atoms.iter().position(|&free_atm| free_atm == atom) {
+                    Some(block) => {
+                        let dx = eigvec[(block * 3,     i)];
+                        let dy = eigvec[(block * 3 + 1, i)];
+                        let dz = eigvec[(block * 3 + 2, i)];
+                        println!("{:>6} {:14.8} {:14.8} {:14.8}",
+                            scf_data.mol.geom.elem[atom], dx, dy, dz);
+                    },
+                    None => println!("{:>6} {:>14} {:>14} {:>14}   (frozen)",
+                        scf_data.mol.geom.elem[atom], "0.0", "0.0", "0.0"),
+                }
             }
         }
     }
