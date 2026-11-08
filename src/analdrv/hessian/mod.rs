@@ -39,17 +39,6 @@ use crate::scf_io::{SCFType, SCF};
 use crate::thermo::ThermoResult;
 use crate::utilities::rstsr_util::Tsr;
 
-/// Stable permutation of the MO index that puts occupied orbitals (occupation > 0)
-/// before virtual ones.
-///
-/// The Hessian CP-SCF blocks address the occupied space as `0..nocc`. For an Aufbau
-/// occupation this permutation is the identity.
-pub(crate) fn occupied_first_permutation(mo_occ: &[f64]) -> Vec<usize> {
-    let mut perm: Vec<usize> = (0..mo_occ.len()).collect();
-    perm.sort_by_key(|&i| mo_occ[i] <= f64::EPSILON);
-    perm
-}
-
 /// Output of the analytical Hessian task, with the derived vibrational/thermochemical analysis.
 #[derive(Debug, Clone, Default)]
 pub struct HessOutput {

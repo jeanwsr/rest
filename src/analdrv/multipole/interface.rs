@@ -107,8 +107,10 @@ fn multipole_interface_r<'a>(
     let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
 
     let device = DeviceBLAS::default();
-    let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
-    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
+    // Match the orbital basis of `rgfock_dh_interface`.
+    let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
+    let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device).index_select(-1, &perm);
+    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm);
     let mol_cint = get_cint_mol(&scf_data.mol);
 
     // DH density increments: PT2-family post-SCF methods only. The remaining requirements (no

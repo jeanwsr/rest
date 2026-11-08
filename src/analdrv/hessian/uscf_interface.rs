@@ -27,8 +27,8 @@ pub fn uscf_hess_interface<'a>(
     // --- basic preparation --- //
     // CP-SCF expects the occupied orbitals in the leading `0..nocc` block (per spin).
     let perm = [
-        super::occupied_first_permutation(&scf_data.occupation[0]),
-        super::occupied_first_permutation(&scf_data.occupation[1]),
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]),
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[1]),
     ];
     let mo_coeff = {
         let mo_coeff_0 = &scf_data.eigenvectors[0];

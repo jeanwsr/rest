@@ -29,7 +29,7 @@ pub fn rscf_hess_interface<'a>(
 
     // --- basic preparation --- //
     // CP-SCF expects the occupied orbitals in the leading `0..nocc` block.
-    let perm = super::occupied_first_permutation(&scf_data.occupation[0]);
+    let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
     let mo_coeff = {
         let mo_coeff = &scf_data.eigenvectors[0];
         rt::asarray((&mo_coeff.data, mo_coeff.size, &device))
