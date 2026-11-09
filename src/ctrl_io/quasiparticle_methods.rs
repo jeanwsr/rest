@@ -335,6 +335,47 @@ pub struct QuasiParticle {
     pub bse_roots_path:String,
     /// Number of roots solved by `bse_roots_only`.  Default `8`.
     pub bse_roots_n:usize,
+    // ---- SHARC nonadiabatic-dynamics interface ---------------------------
+    //
+    // `gw_or_bse = "bse_sharc"` runs one SHARC quantum-chemistry step: it
+    // solves the BSE, assembles the analytic gradients of every requested
+    // root, and -- when the corresponding switches below are set -- evaluates
+    // the inter-state wavefunction overlap matrix and the nonadiabatic
+    // coupling vectors between all states at this geometry.  Everything is
+    // written to `sharc_output` (JSON) for the `SHARC_REST.py` interface, and
+    // the data needed by the *next* step (MO coefficients + BSE amplitudes)
+    // to `sharc_state_output`.
+    /// Number of electronic states **including the ground state** handled by
+    /// the SHARC step (`sharc_nstates = 4` means S0 + three excited states).
+    /// `0` (default) falls back to `gradient_nroots + 1`.
+    pub sharc_nstates:usize,
+    /// Assemble the analytic nuclear gradients of every solved state.
+    pub sharc_do_grad:bool,
+    /// Assemble the nonadiabatic coupling vectors `d_IJ = <I|d/dR|J>`.
+    pub sharc_do_nac:bool,
+    /// Assemble the inter-state overlap matrix `S_IJ = <I(R0)|J(R1)>` against
+    /// `sharc_previous_state`.  Requires that file; without it the matrix is
+    /// simply omitted from the output.
+    pub sharc_do_overlap:bool,
+    /// Assemble state/transition dipole moments (`h`-companion `dm` request).
+    pub sharc_do_dipole:bool,
+    /// State file of the previous geometry (JSON, written by
+    /// `sharc_state_output` in the previous step).  Empty disables overlaps.
+    pub sharc_previous_state:String,
+    /// Where to write the restart/state file for the next step.
+    pub sharc_state_output:String,
+    /// Where to write the SHARC step result (JSON).  The Python interface
+    /// `SHARC_REST.py` parses exactly this file.
+    pub sharc_output:String,
+    /// Step index recorded in the state file (informative only).
+    pub sharc_step_index:i64,
+    /// How the NAC vectors are obtained.  `"overlap"` (default) differentiates
+    /// the analytic inter-state overlap expression with respect to the ket
+    /// geometry (frozen-amplitude approximation); `"off"` writes zeros.
+    pub sharc_nac_mode:String,
+    /// Displacement (bohr) of the central finite difference that differentiates
+    /// the cross-geometry AO overlap integrals for the NAC.  Default `1e-3`.
+    pub sharc_nac_fd_step:f64,
     /// Orbital energies that build the BSE screening inside the gradient:
     /// `"reference"` (mean-field, REST's default) or `"qp"`.  Default
     /// `"reference"`.
@@ -905,6 +946,17 @@ impl Default for QuasiParticle {
             bse_roots_only:false,
             bse_roots_path:String::from("bse_roots.json"),
             bse_roots_n:8,
+            sharc_nstates:0,
+            sharc_do_grad:true,
+            sharc_do_nac:true,
+            sharc_do_overlap:true,
+            sharc_do_dipole:false,
+            sharc_previous_state:String::new(),
+            sharc_state_output:String::from("sharc_state.json"),
+            sharc_output:String::from("sharc_step.json"),
+            sharc_step_index:-1,
+            sharc_nac_mode:String::from("overlap"),
+            sharc_nac_fd_step:1.0e-3,
             gradient_screening:String::from("reference"),
             gradient_force_fallback:String::new(),
             gradient_force_linearized:String::new(),
@@ -2314,6 +2366,53 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.gw_switch_fallback_threshold = match tmp_ctrl.get("gw_switch_fallback_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
                 _ => 1.0,
+            };
+            // ---- SHARC interface keywords --------------------------------
+            // All of them are optional; the defaults keep every other card
+            // untouched (nothing below is read outside `bse_sharc`).
+            tmp_input.sharc_nstates = match tmp_ctrl.get("sharc_nstates").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
+            };
+            tmp_input.sharc_do_grad = match tmp_ctrl.get("sharc_do_grad").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
+            tmp_input.sharc_do_nac = match tmp_ctrl.get("sharc_do_nac").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
+            tmp_input.sharc_do_overlap = match tmp_ctrl.get("sharc_do_overlap").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
+            tmp_input.sharc_do_dipole = match tmp_ctrl.get("sharc_do_dipole").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.sharc_previous_state = match tmp_ctrl.get("sharc_previous_state").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            tmp_input.sharc_state_output = match tmp_ctrl.get("sharc_state_output").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+                _ => String::from("sharc_state.json"),
+            };
+            tmp_input.sharc_output = match tmp_ctrl.get("sharc_output").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+                _ => String::from("sharc_step.json"),
+            };
+            tmp_input.sharc_step_index = match tmp_ctrl.get("sharc_step_index").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(-1),
+                _ => -1,
+            };
+            tmp_input.sharc_nac_mode = match tmp_ctrl.get("sharc_nac_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("overlap"),
+            };
+            tmp_input.sharc_nac_fd_step = match tmp_ctrl.get("sharc_nac_fd_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-3),
+                _ => 1.0e-3,
             };
             return Ok(Some(tmp_input));
         },

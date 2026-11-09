@@ -506,6 +506,30 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         }
         scf_data.prepare_bse_integrals(mpi_operator);
         bse_output = ri_bse::bse_main(scf_data);
+    }else if output_type.eq("bse_sharc"){
+        // ---- SHARC non-adiabatic dynamics step --------------------------
+        // One trajectory step: BSE energies plus (optionally) the analytic
+        // gradients of every state, the inter-state overlap matrix against the
+        // previous geometry, and the non-adiabatic coupling vectors.  All of it
+        // is written as JSON for the `SHARC_REST.py` interface; the state file
+        // written here is what the next step reads back for the overlaps.
+        if scf_data.mol.spin_channel==2 {
+            panic!(
+                "The SHARC interface (`gw_or_bse = \"bse_sharc\"`) supports only \
+                 spin-restricted (closed-shell) references."
+            );
+        }
+        // NOTE: no explicit GW pass here.  `GwGradEngine` solves the
+        // quasiparticle problem internally for *both* the excitation energies
+        // and their gradients; running `gw_main` first and pinning those QP
+        // energies (the `bse_gradient` behaviour) makes the energy ignore
+        // d(eps_QP)/dR while the gradient keeps it, which we measured as a
+        // 20-30 % overestimate of the excited-state gradient (and hence a
+        // systematic energy drift in the trajectory).  With no pinning the
+        // gradient reproduces the finite-difference energy derivative to
+        // 2e-4 relative.
+        bse_output.excitation_energies =
+            sharc_step(scf_data, &qp_ctrl).unwrap_or_else(|e| panic!("SHARC step failed: {e}"));
     }else if is_cvs_bse {
         // Core-valence separated BSE.  The GW stage is the ordinary one, except
         // that the extrapolated-window thresholds are widened so the core
@@ -735,84 +759,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 // quadratically — stay out of the BSE entirely.
                 // `bse_cutoff_energy = x`: `x` Ha below the HOMO (occupied
                 // side) and `x` Ha above the LUMO (virtual side).
-                let (e_homo, e_lumo, two_sided) = {
-                    let e = &scf_data.eigenvalues[0];
-                    let homo = scf_data.homo[0];
-                    let lumo = scf_data.lumo[0].min(e.len() - 1);
-                    let w = qp_ctrl.bse_cutoff_energy;
-                    (e[homo], e[lumo], w > 0.0 && w < 1.0e5)
-                };
-                // Pinned active space (`bse_active_occ_start` /
-                // `bse_active_vir_end`, written by the relaxation drivers): the
-                // *index* window is what the reference spectrum uses
-                // (`ri_gw::bse_active_bounds`), so the gradient has to use it too.
-                // An energy window lets single orbitals drift in and out with the
-                // nuclei -- on DA1/PBEh the transition space oscillated between 46
-                // and 47 virtuals from one geometry to the next, which makes
-                // `Omega(R)` discontinuous by ~1e-3 Ha and leaves the analytic
-                // gradient inconsistent with the energy: the L-BFGS line search
-                // then measures a *linear* uphill `dE(s)` at s = 0.012..0.047 A
-                // (dE = +2.8e-4..+3.6e-3 Ha) although the gradient predicts
-                // descent, and stops at |g| = 0.18.
-                //
-                // The pin becomes two cutoffs halfway between the last excluded
-                // and the first included orbital, i.e. far from any crossing, so
-                // that `new_with_window` reproduces the pinned indices exactly.
-                let pinned_window = qp_ctrl.bse_active_occ_start >= 0
-                    && qp_ctrl.bse_active_vir_end > 0;
-                let (cutoff, occ_cutoff) = if pinned_window {
-                    let e = &scf_data.eigenvalues[0];
-                    let lo = qp_ctrl.bse_active_occ_start as usize;
-                    let hi = qp_ctrl.bse_active_vir_end as usize;
-                    let occ_cut = if lo > 0 && lo < e.len() {
-                        0.5 * (e[lo - 1] + e[lo])
-                    } else {
-                        f64::NEG_INFINITY
-                    };
-                    let vir_cut = if hi < e.len() {
-                        0.5 * (e[hi - 1] + e[hi])
-                    } else {
-                        f64::INFINITY
-                    };
-                    if std::env::var("REST_BSE_PIN_DEBUG").is_ok() {
-                        eprintln!(
-                            "[bse pin] occ_start = {lo}, vir_end = {hi} -> occ_cutoff \
-                             {occ_cut:.6} Ha, vir_cutoff {vir_cut:.6} Ha"
-                        );
-                    }
-                    (vir_cut, occ_cut)
-                } else {
-                let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
-                    // Fixed *count*: the cutoff sits halfway between the n-th and
-                    // the (n+1)-th virtual at this geometry, so the transition
-                    // space keeps the same dimension at every point of a
-                    // relaxation path.  An energy window lets orbitals drift in
-                    // and out (observed `dim 816 -> 864 -> 1008` on
-                    // azobenzene/def2-TZVPP), which makes `E_GS + Omega`
-                    // discontinuous at those crossings.
-                    let e = &scf_data.eigenvalues[0];
-                    let last = scf_data.homo[0] + qp_ctrl.gradient_bse_nvir;
-                    if last + 1 < e.len() {
-                        0.5 * (e[last] + e[last + 1])
-                    } else {
-                        f64::INFINITY
-                    }
-                } else if two_sided {
-                    e_lumo + qp_ctrl.bse_cutoff_energy
-                } else if qp_ctrl.gradient_bse_window > 0.0 {
-                    let e = &scf_data.eigenvalues[0];
-                    let nocc = scf_data.homo[0] + 1;
-                    0.5 * (e[nocc - 1] + e[nocc]) + qp_ctrl.gradient_bse_window
-                } else {
-                    f64::INFINITY
-                };
-                let occ_cutoff = if two_sided {
-                    e_homo - qp_ctrl.bse_cutoff_energy
-                } else {
-                    f64::NEG_INFINITY
-                };
-                (cutoff, occ_cutoff)
-                };
+                let (cutoff, occ_cutoff) = bse_gradient_cutoffs(scf_data, &qp_ctrl);
                 let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_window(
                     scf_data, &gw, multi, screen, cutoff, occ_cutoff);
                 println!(
@@ -911,6 +858,412 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
     bse_output
+}
+
+
+
+// ---------------------------------------------------------------------------
+// SHARC interface
+// ---------------------------------------------------------------------------
+
+/// Run one SHARC quantum-chemistry step.
+///
+/// Solves `sharc_nstates - 1` BSE roots at the current geometry, assembles the
+/// analytic gradient of every state (ground state + roots), the inter-state
+/// overlap matrix against `sharc_previous_state`, and the non-adiabatic
+/// coupling vectors.  Writes `sharc_output` (the step result read by
+/// `SHARC_REST.py`) and `sharc_state_output` (the restart file for the next
+/// step), and returns the excitation energies.
+fn sharc_step(
+    scf_data: &mut SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+) -> anyhow::Result<Vec<f64>> {
+    use crate::ri_bse::bse_grad::{BseGradEngine, BseSolver, ScreeningEnergy};
+    use crate::ri_bse::sharc;
+
+    let nmo = scf_data.mol.num_state;
+    let nao = scf_data.mol.num_basis;
+    let natom = scf_data.mol.geom.elem.len();
+    let nstates_total = if qp_ctrl.sharc_nstates > 1 {
+        qp_ctrl.sharc_nstates
+    } else if qp_ctrl.gradient_nroots > 0 {
+        qp_ctrl.gradient_nroots + 1
+    } else {
+        qp_ctrl.gradient_state + 2
+    };
+    let nroots = nstates_total - 1;
+    let multi = if qp_ctrl.bse_spin.eq_ignore_ascii_case("triplet") {'t'} else {'s'};
+    let screen = if qp_ctrl.gradient_screening.eq_ignore_ascii_case("qp") {
+        ScreeningEnergy::Qp
+    } else {
+        ScreeningEnergy::Reference
+    };
+    let mut cfg = ri_gw::gw_grad::GwGradConfig::from_scf(scf_data);
+    // Consistency of d(Omega)/dR with Omega(R) requires the QP energies and
+    // their geometric response to come from the same solve; pinning them to an
+    // externally computed GW vector breaks that (measured 20-30 % error).
+    cfg.pin_qp_from_checkpoint = false;
+    cfg.z_min = qp_ctrl.gradient_z_min;
+    cfg.force_static_fallback = qp_ctrl
+        .gradient_force_fallback
+        .split(',')
+        .filter_map(|t| t.trim().parse::<usize>().ok())
+        .collect();
+    cfg.smooth_pole = qp_ctrl.gradient_smooth_pole;
+    cfg.exact_residue_z = qp_ctrl.gradient_exact_residue;
+    cfg.graphical_rescue = qp_ctrl.gradient_graphical_rescue;
+    cfg.force_linearized = qp_ctrl
+        .gradient_force_linearized
+        .split(',')
+        .filter_map(|t| t.trim().parse::<usize>().ok())
+        .collect();
+
+    let (cutoff, occ_cutoff) = bse_gradient_cutoffs(scf_data, qp_ctrl);
+    let vxc = precompute_vxc_and_release_grid_ao(scf_data);
+
+    // Solve the BSE and (optionally) differentiate every root.
+    let (omegas, grads, x, y, occ_start, nocc_active, vir_start, nvir_active) = {
+        let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
+        let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+        if pin_qp {
+            gw.pin_qp_energies(scf_data.gwqp.0.clone());
+        }
+        let mut bse = BseGradEngine::new_with_window(
+            scf_data, &gw, multi, screen, cutoff, occ_cutoff);
+        println!(
+            "SHARC step {}: BSE transition space {} occupied x {} of {} virtuals, spin channel '{multi}'",
+            qp_ctrl.sharc_step_index, bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
+        );
+        let dim = bse.screen.nocc * bse.screen.nvir;
+        let solver = if dim <= 128 { BseSolver::Dense } else { BseSolver::Davidson };
+        let mut dcfg = crate::solvers::davidson::DavidsonConfig::default();
+        dcfg.add_dim = dcfg.add_dim.max(nroots + 2);
+        dcfg.restart_dim = dcfg.restart_dim.max(nroots + 2);
+        dcfg.max_subspace = dcfg.max_subspace.max(12 * (nroots + 2)).max(200);
+        dcfg.max_iter = 400;
+        bse.solve(nroots, solver, &dcfg);
+        for (k, om) in bse.excitation_energies().iter().enumerate() {
+            println!(
+                "  SHARC state {}: {:.12} Ha = {:.6} eV",
+                k + 1, om, om * 27.211386245988
+            );
+        }
+        report_root_composition(scf_data, &bse);
+        let omegas = bse.excitation_energies();
+        let grads = if qp_ctrl.sharc_do_grad {
+            bse.analytic_gradients().0
+        } else {
+            Vec::new()
+        };
+        let x: Vec<Vec<f64>> = bse.roots.iter().map(|r| r.x.clone()).collect();
+        let y: Vec<Vec<f64>> = bse.roots.iter().map(|r| r.y.clone()).collect();
+        (
+            omegas, grads, x, y,
+            bse.screen.occ_start, bse.screen.nocc,
+            bse.screen.vir_start, bse.screen.nvir,
+        )
+    };
+    if qp_ctrl.sharc_do_grad {
+        assert_eq!(
+            grads.len(), nroots,
+            "SHARC: {} gradients assembled for {} roots", grads.len(), nroots
+        );
+    }
+
+    // ---- state record ---------------------------------------------------
+    let mut mo = vec![0.0; nao * nmo];
+    {
+        let c = &scf_data.eigenvectors[0];
+        for p in 0..nao {
+            for q in 0..nmo {
+                mo[p * nmo + q] = c[[p, q]];
+            }
+        }
+    }
+    // Deterministic MO / amplitude phases: without them the arbitrary LAPACK
+    // eigenvector signs make `det(S_oo)` and the root signs jump between steps.
+    sharc::fix_mo_phases(&mut mo, nao, nmo);
+    let mut x = x;
+    let mut y = y;
+    sharc::fix_amplitude_phases(&mut x, &mut y);
+    // Track the state phases along the trajectory: the arbitrary sign of a
+    // root is fixed once (above), but it can still flip when the leading
+    // configuration changes.  Aligning each root with the previous step keeps
+    // the diagonal of the overlap matrix positive and smooth.
+    let prev_state: Option<sharc::SharcState> =
+        if qp_ctrl.sharc_previous_state.is_empty() {
+            None
+        } else {
+            Some(sharc::SharcState::load(&qp_ctrl.sharc_previous_state)?)
+        };
+    let mut geometry_bohr = Vec::with_capacity(natom);
+    for a in 0..natom {
+        geometry_bohr.push([
+            scf_data.mol.geom.position[[0, a]],
+            scf_data.mol.geom.position[[1, a]],
+            scf_data.mol.geom.position[[2, a]],
+        ]);
+    }
+
+    // Align the MO phases with the previous step and re-express the amplitudes
+    // in the re-signed basis, so that every diagonal overlap `S_II` stays
+    // positive along the trajectory (a flipped virtual orbital would otherwise
+    // turn the overlap of the states that contain it into `-1`).
+    let mol_for_overlap = scf_data.mol.clone();
+    let mut s_mo_prev: Option<Vec<f64>> = None;
+    if let Some(p) = prev_state.as_ref() {
+        if p.nmo == nmo && p.nao == nao {
+            let s0 = sharc::cross_mo_overlap_at(
+                &mol_for_overlap, &p.mo, nmo, nao, &p.geometry_bohr, &mo, &geometry_bohr);
+            let signs = sharc::mo_overlap_signs(&s0, nmo);
+            sharc::apply_mo_signs(&mut mo, nao, nmo, &signs);
+            sharc::apply_amplitude_signs(
+                &mut x, &mut y, &signs, occ_start, nocc_active, vir_start, nvir_active);
+            s_mo_prev = Some(sharc::cross_mo_overlap_at(
+                &mol_for_overlap, &p.mo, nmo, nao, &p.geometry_bohr, &mo, &geometry_bohr));
+            // The MO re-signing above changes the *representation* of the
+            // amplitudes, so the global root phases have to be aligned only
+            // afterwards -- otherwise a state whose orbital was re-signed
+            // comes out with the opposite sign and the overlap matrix mixes
+            // `+` and `-` representations of the same state.
+            sharc::align_phases_to_previous(&mut x, &mut y, &p.x, &p.y);
+        }
+    }
+
+    let cur = sharc::SharcState {
+        step: qp_ctrl.sharc_step_index,
+        natom,
+        elements: scf_data.mol.geom.elem.clone(),
+        geometry_bohr: geometry_bohr.clone(),
+        nao,
+        nmo,
+        nocc: vir_start,
+        occ_start,
+        nocc_active,
+        vir_start,
+        nvir_active,
+        mo: mo.clone(),
+        omega: omegas.clone(),
+        x: x.clone(),
+        y: y.clone(),
+        scf_energy: scf_data.scf_energy,
+    };
+
+    // Everything present in the step result, in SHARC's ordering:
+    // state 0 is the ground state, state I >= 1 is BSE root I-1.
+    let ns = nstates_total;
+    let mut energies = vec![0.0; ns];
+    energies[0] = scf_data.scf_energy;
+    for k in 0..nroots {
+        energies[k + 1] = scf_data.scf_energy + omegas[k];
+    }
+
+    let mut gradients_out: Option<Vec<Vec<f64>>> = None;
+    if qp_ctrl.sharc_do_grad {
+        let gs = reference_gradient(scf_data);
+        let mut g = Vec::with_capacity(ns);
+        g.push(gs.clone());
+        for k in 0..nroots {
+            let mut v = Vec::with_capacity(3 * natom);
+            for c in 0..(3 * natom) {
+                v.push(gs[c] + grads[k][c]);
+            }
+            g.push(v);
+        }
+        report_analytic_gradient(scf_data, "SHARC_S0", &g[0]);
+        gradients_out = Some(g);
+    }
+
+    // ---- inter-state overlap matrix (previous geometry) -----------------
+    let mol = scf_data.mol.clone();
+    let mut overlap_out: Option<Vec<Vec<f64>>> = None;
+    if qp_ctrl.sharc_do_overlap && prev_state.is_some() {
+        let prev = prev_state.as_ref().unwrap();
+        sharc::check_compatible(prev, &cur)?;
+        let s_mo = s_mo_prev.clone().unwrap_or_else(|| {
+            sharc::cross_mo_overlap_at(
+                &mol, &prev.mo, nmo, nao, &prev.geometry_bohr, &cur.mo, &geometry_bohr)
+        });
+        let s = sharc::overlap_matrix(prev, &cur, &s_mo);
+        println!("SHARC inter-state overlap matrix (previous -> current geometry):");
+        for i in 0..s.len() {
+            let row: Vec<String> = (0..s.len()).map(|j| format!("{:+.6}", s[i][j])).collect();
+            println!("  {:2}: {}", i, row.join(" "));
+        }
+        overlap_out = Some(s);
+    }
+
+    // ---- non-adiabatic coupling vectors ---------------------------------
+    let mut nac_out: Option<Vec<Vec<Vec<f64>>>> = None;
+    if qp_ctrl.sharc_do_nac && !qp_ctrl.sharc_nac_mode.eq_ignore_ascii_case("off") {
+        let s_mo = sharc::cross_mo_overlap_at(
+            &mol, &cur.mo, nmo, nao, &geometry_bohr, &cur.mo, &geometry_bohr);
+        let ds_mo = sharc::cross_mo_overlap_deriv(
+            &mol, &cur.mo, nmo, nao, &geometry_bohr, &cur.mo, &geometry_bohr,
+            qp_ctrl.sharc_nac_fd_step);
+        let nac = sharc::nac_vectors(&cur, &s_mo, &ds_mo);
+        println!("SHARC non-adiabatic couplings (frozen-amplitude overlap derivative):");
+        for i in 0..nac.len() {
+            for j in 0..nac.len() {
+                if i == j {
+                    continue;
+                }
+                let norm = nac[i][j].iter().map(|v| v * v).sum::<f64>().sqrt();
+                println!("  d[{i},{j}] |d| = {norm:.6e} a.u.");
+            }
+        }
+        nac_out = Some(nac);
+    }
+
+    let dipoles_out = if qp_ctrl.sharc_do_dipole {
+        Some(sharc::dipole_moments(scf_data, &cur))
+    } else {
+        None
+    };
+
+    // ---- write the files -------------------------------------------------
+    let step_out = sharc::SharcStep {
+        natom,
+        elements: cur.elements.clone(),
+        geometry_bohr,
+        nstates: ns,
+        energies,
+        gradients: gradients_out,
+        nac: nac_out,
+        overlap: overlap_out,
+        dipoles: dipoles_out,
+        omega: omegas.clone(),
+        multiplicities: vec![1],
+        units: String::from("atomic"),
+        step: qp_ctrl.sharc_step_index,
+    };
+    if !qp_ctrl.sharc_output.is_empty() {
+        step_out
+            .save(&qp_ctrl.sharc_output)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", qp_ctrl.sharc_output))?;
+        println!("SHARC step result written to {}", qp_ctrl.sharc_output);
+    }
+    if !qp_ctrl.sharc_state_output.is_empty() {
+        cur.save(&qp_ctrl.sharc_state_output)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", qp_ctrl.sharc_state_output))?;
+        println!("SHARC restart state written to {}", qp_ctrl.sharc_state_output);
+    }
+
+    Ok(omegas)
+}
+
+/// Energy cut-offs that define the BSE transition space for the analytic
+/// gradient / SHARC paths.
+///
+/// `gradient_bse_window = 0` keeps the full virtual space, the historical
+/// behaviour; a positive value restricts the transition space to
+/// `e_F + window` (the same convention as the timing driver's `PAPER_WINDOW`).
+/// `bse_cutoff_energy = w` (finite, and not the 1e6 default) turns on the
+/// **two-sided** window `[e_H - w, e_H + w]` around the molecular Fermi level
+/// E_F = e_HOMO: the occupied manifold is then truncated from below as well,
+/// so deep core orbitals -- which cannot contribute to low-lying excitations
+/// but enter the O(nocc^2) screening blocks and the O(dim^2) matrices
+/// quadratically -- stay out of the BSE entirely.  `bse_cutoff_energy = x`:
+/// `x` Ha below the HOMO (occupied side) and `x` Ha above the LUMO (virtual
+/// side).
+///
+/// Pinned active space (`bse_active_occ_start` / `bse_active_vir_end`,
+/// written by the relaxation drivers): the *index* window is what the
+/// reference spectrum uses (`ri_gw::bse_active_bounds`), so the gradient has
+/// to use it too.  An energy window lets single orbitals drift in and out with
+/// the nuclei -- on DA1/PBEh the transition space oscillated between 46 and 47
+/// virtuals from one geometry to the next, which makes `Omega(R)`
+/// discontinuous by ~1e-3 Ha and leaves the analytic gradient inconsistent
+/// with the energy: the L-BFGS line search then measures a *linear* uphill
+/// `dE(s)` at s = 0.012..0.047 A (dE = +2.8e-4..+3.6e-3 Ha) although the
+/// gradient predicts descent, and stops at |g| = 0.18.
+///
+/// The pin becomes two cutoffs halfway between the last excluded and the first
+/// included orbital, i.e. far from any crossing, so that `new_with_window`
+/// reproduces the pinned indices exactly.
+fn bse_gradient_cutoffs(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+) -> (f64, f64) {
+    let (e_homo, e_lumo, two_sided) = {
+        let e = &scf_data.eigenvalues[0];
+        let homo = scf_data.homo[0];
+        let lumo = scf_data.lumo[0].min(e.len() - 1);
+        let w = qp_ctrl.bse_cutoff_energy;
+        (e[homo], e[lumo], w > 0.0 && w < 1.0e5)
+    };
+    // Pinned active space (`bse_active_occ_start` /
+    // `bse_active_vir_end`, written by the relaxation drivers): the
+    // *index* window is what the reference spectrum uses
+    // (`ri_gw::bse_active_bounds`), so the gradient has to use it too.
+    // An energy window lets single orbitals drift in and out with the
+    // nuclei -- on DA1/PBEh the transition space oscillated between 46
+    // and 47 virtuals from one geometry to the next, which makes
+    // `Omega(R)` discontinuous by ~1e-3 Ha and leaves the analytic
+    // gradient inconsistent with the energy: the L-BFGS line search
+    // then measures a *linear* uphill `dE(s)` at s = 0.012..0.047 A
+    // (dE = +2.8e-4..+3.6e-3 Ha) although the gradient predicts
+    // descent, and stops at |g| = 0.18.
+    //
+    // The pin becomes two cutoffs halfway between the last excluded
+    // and the first included orbital, i.e. far from any crossing, so
+    // that `new_with_window` reproduces the pinned indices exactly.
+    let pinned_window = qp_ctrl.bse_active_occ_start >= 0
+        && qp_ctrl.bse_active_vir_end > 0;
+    let (cutoff, occ_cutoff) = if pinned_window {
+        let e = &scf_data.eigenvalues[0];
+        let lo = qp_ctrl.bse_active_occ_start as usize;
+        let hi = qp_ctrl.bse_active_vir_end as usize;
+        let occ_cut = if lo > 0 && lo < e.len() {
+            0.5 * (e[lo - 1] + e[lo])
+        } else {
+            f64::NEG_INFINITY
+        };
+        let vir_cut = if hi < e.len() {
+            0.5 * (e[hi - 1] + e[hi])
+        } else {
+            f64::INFINITY
+        };
+        if std::env::var("REST_BSE_PIN_DEBUG").is_ok() {
+            eprintln!(
+                "[bse pin] occ_start = {lo}, vir_end = {hi} -> occ_cutoff \
+                 {occ_cut:.6} Ha, vir_cutoff {vir_cut:.6} Ha"
+            );
+        }
+        (vir_cut, occ_cut)
+    } else {
+    let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
+        // Fixed *count*: the cutoff sits halfway between the n-th and
+        // the (n+1)-th virtual at this geometry, so the transition
+        // space keeps the same dimension at every point of a
+        // relaxation path.  An energy window lets orbitals drift in
+        // and out (observed `dim 816 -> 864 -> 1008` on
+        // azobenzene/def2-TZVPP), which makes `E_GS + Omega`
+        // discontinuous at those crossings.
+        let e = &scf_data.eigenvalues[0];
+        let last = scf_data.homo[0] + qp_ctrl.gradient_bse_nvir;
+        if last + 1 < e.len() {
+            0.5 * (e[last] + e[last + 1])
+        } else {
+            f64::INFINITY
+        }
+    } else if two_sided {
+        e_lumo + qp_ctrl.bse_cutoff_energy
+    } else if qp_ctrl.gradient_bse_window > 0.0 {
+        let e = &scf_data.eigenvalues[0];
+        let nocc = scf_data.homo[0] + 1;
+        0.5 * (e[nocc - 1] + e[nocc]) + qp_ctrl.gradient_bse_window
+    } else {
+        f64::INFINITY
+    };
+    let occ_cutoff = if two_sided {
+        e_homo - qp_ctrl.bse_cutoff_energy
+    } else {
+        f64::NEG_INFINITY
+    };
+    (cutoff, occ_cutoff)
+    };
+    (cutoff, occ_cutoff)
 }
 
 /// Print the transition composition of every solved BSE root.

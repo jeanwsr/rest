@@ -31,6 +31,7 @@ pub mod dynamicbse;
 pub mod pysoc_export;
 pub mod bse_grad;
 pub mod cvs;
+pub mod sharc;
 
 
 #[cfg(target_os = "linux")]
