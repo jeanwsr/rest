@@ -129,6 +129,19 @@ pub struct SCF {
     /// makes `scgw::evgw` continue from the saved round with the restored DIIS
     /// history.
     pub gw_checkpoint_state: Option<crate::fileop::gw_checkpoint::GwCheckpointState>,
+    /// Root of the BSE spectrum selected by the previous excited-state
+    /// geometry-optimization step (0 = lowest root).  `None` before the first
+    /// step.
+    pub bse_tracked_state: Option<usize>,
+    /// BSE amplitudes `(X, Y)` of [`Self::bse_tracked_state`] at the previous
+    /// geometry, flattened in the active `nocc * nvir` ordering.  A geometry
+    /// optimizer uses their overlap with the roots at the new geometry to keep
+    /// following one electronic state when root indices swap.
+    pub bse_tracked_x: Vec<f64>,
+    pub bse_tracked_y: Vec<f64>,
+    /// Active-space shape of the stored amplitudes: `(nocc, nvir)`.
+    pub bse_tracked_nocc: usize,
+    pub bse_tracked_nvir: usize,
 }
 
 #[derive(Clone,Copy)]
@@ -192,6 +205,11 @@ impl SCF {
             solvent_scf: None,
             tddft_excitations: None,
             gw_checkpoint_state: None,
+            bse_tracked_state: None,
+            bse_tracked_x: Vec::new(),
+            bse_tracked_y: Vec::new(),
+            bse_tracked_nocc: 0,
+            bse_tracked_nvir: 0,
         };
 
         // at first check the scf type: RHF, ROHF or UHF

@@ -380,6 +380,19 @@ fn precompute_vxc_and_release_grid_ao(scf_data: &mut SCF) -> ri_gw::gw_grad::GwV
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
+    // A geometry optimization on an excited-state surface needs two things
+    // that a plain single-point `bse_gradient` card does not: a *fixed* BSE
+    // active space (otherwise Omega(R) is discontinuous when an orbital drifts
+    // through the energy window) and a way to keep following the same
+    // electronic state when the root ordering changes.  Both are switched on
+    // automatically by the dedicated job type, and can also be requested
+    // explicitly by a normal card.
+    let is_excited_state_opt = matches!(
+        scf_data.mol.ctrl.job_type,
+        crate::ctrl_io::JobType::ExcitedStateOpt
+    );
+    let follow_bse_state = qp_ctrl.gradient_follow_state || is_excited_state_opt;
+    let pin_bse_active_space = qp_ctrl.gradient_pin_active_space || is_excited_state_opt;
     // `"cvs bse"` is the documented spelling; accept the underscore/dash
     // variants as a convenience.  Matching is case-insensitive.
     let normalized_output_type = output_type.trim().to_lowercase();
@@ -725,7 +738,14 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let nroots = if qp_ctrl.bse_roots_only {
                 qp_ctrl.bse_roots_n
             } else if qp_ctrl.gradient_nroots == 0 {
-                qp_ctrl.gradient_state + 1
+                // Following a state needs at least one extra root so that a
+                // crossing with the next state can be detected.  A fixed-index
+                // card keeps the historical "only up to `gradient_state`".
+                if follow_bse_state {
+                    qp_ctrl.gradient_state + 2
+                } else {
+                    qp_ctrl.gradient_state + 1
+                }
             } else {
                 qp_ctrl.gradient_nroots
             };
@@ -735,7 +755,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 qp_ctrl.gradient_state
             );
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
-            let (grads, omegas) = {
+            let (grads, omegas, state, tracked_x, tracked_y,
+                 used_occ_start, used_vir_end, active_nocc, active_nvir) = {
                 let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
                 let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
                 // Hand the energy path's quasiparticle energies to the gradient
@@ -765,6 +786,13 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 println!(
                     "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
                     bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
+                );
+                println!(
+                    "BSE active orbital indices: occupied #{}..#{}, virtuals #{}..#{}",
+                    bse.screen.occ_start,
+                    bse.screen.occ_start + bse.screen.nocc.saturating_sub(1),
+                    bse.screen.vir_start,
+                    bse.screen.vir_start + bse.screen.nvir.saturating_sub(1)
                 );
                 // Archive the quasiparticle spectrum this gradient is built on,
                 // so that a later card (e.g. stage 2 of the two-stage
@@ -824,21 +852,92 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     );
                     return bse_output;
                 }
-                // `gradient_only_state`: solve `nroots` roots (the spectrum the
-                // card asked for) but assemble the gradient of `gradient_state`
-                // alone.  Each extra assembled root costs a full fold + adjoint
-                // solve; an optimiser reads one.
-                let only = qp_ctrl.gradient_only_state
-                    && qp_ctrl.gradient_state < bse.roots.len();
-                if only {
-                    bse.set_grad_roots(Some(vec![qp_ctrl.gradient_state]));
+                // Select the root this step differentiates.  With
+                // `gradient_follow_state` the previous step's amplitudes decide
+                // which current root is the *same electronic state*, so the
+                // optimization does not jump when two roots swap order.
+                let dim = bse.screen.nocc * bse.screen.nvir;
+                let mut selected_state = qp_ctrl.gradient_state;
+                let mut tracked_x = Vec::new();
+                let mut tracked_y = Vec::new();
+                let mut tracked_sign = 1.0f64;
+                let mut track_score = f64::NEG_INFINITY;
+                let have_previous = follow_bse_state
+                    && scf_data.bse_tracked_state.is_some()
+                    && scf_data.bse_tracked_nocc == bse.screen.nocc
+                    && scf_data.bse_tracked_nvir == bse.screen.nvir
+                    && scf_data.bse_tracked_x.len() == dim
+                    && !bse.roots.is_empty();
+                if have_previous {
+                    for (k, root) in bse.roots.iter().enumerate() {
+                        if root.x.len() < dim || root.y.len() < dim {
+                            continue;
+                        }
+                        let mut score = 0.0f64;
+                        for p in 0..dim {
+                            score += scf_data.bse_tracked_x[p] * root.x[p];
+                            score -= scf_data.bse_tracked_y[p] * root.y[p];
+                        }
+                        if score.abs() > track_score {
+                            track_score = score.abs();
+                            selected_state = k;
+                            tracked_sign = if score < 0.0 { -1.0 } else { 1.0 };
+                        }
+                    }
+                    if selected_state != qp_ctrl.gradient_state {
+                        println!(
+                            "BSE state tracking: root {} -> root {} (amplitude overlap |S| = {:.6})",
+                            qp_ctrl.gradient_state, selected_state, track_score
+                        );
+                    } else {
+                        println!(
+                            "BSE state tracking: kept root {} (amplitude overlap |S| = {:.6})",
+                            selected_state, track_score
+                        );
+                    }
+                    if track_score < 0.5 {
+                        println!(
+                            "WARNING: BSE state tracking overlap |S| = {:.3} < 0.5; \
+                             the root character changed substantially -- check the root composition.",
+                            track_score
+                        );
+                    }
+                } else if follow_bse_state {
+                    selected_state = qp_ctrl.gradient_state.min(bse.roots.len().saturating_sub(1));
                 }
-                bse.analytic_gradients()
+                assert!(
+                    selected_state < bse.roots.len(),
+                    "BSE state tracking selected root {} but only {} roots were solved",
+                    selected_state,
+                    bse.roots.len()
+                );
+                if follow_bse_state {
+                    let root = &bse.roots[selected_state];
+                    tracked_x = root.x.iter().map(|v| tracked_sign * v).collect();
+                    tracked_y = root.y.iter().map(|v| tracked_sign * v).collect();
+                }
+                // `gradient_only_state`: solve `nroots` roots (the spectrum the
+                // card asked for) but assemble the gradient of the selected root
+                // alone.  Each extra assembled root costs a full fold + adjoint
+                // solve; an optimiser reads one.  An excited-state optimization
+                // always takes this branch: state tracking needs the extra
+                // roots' amplitudes, never their gradients.
+                let only = (qp_ctrl.gradient_only_state || is_excited_state_opt)
+                    && selected_state < bse.roots.len();
+                if only {
+                    bse.set_grad_roots(Some(vec![selected_state]));
+                }
+                let (grads, omegas) = bse.analytic_gradients();
+                let used_occ_start = bse.screen.occ_start;
+                let used_vir_end = bse.screen.vir_start + bse.screen.nvir;
+                let active_nocc = bse.screen.nocc;
+                let active_nvir = bse.screen.nvir;
+                (grads, omegas, selected_state, tracked_x, tracked_y,
+                 used_occ_start, used_vir_end, active_nocc, active_nvir)
             };
-            let state = qp_ctrl.gradient_state;
-            // with `gradient_only_state` the returned vector holds that root alone;
-            // without it, every solved root was assembled and `grads[state]` is it.
-            let g_state = if qp_ctrl.gradient_only_state && grads.len() == 1 {
+            // with the one-root branch the returned vector holds that root alone;
+            // otherwise every solved root was assembled and `grads[state]` is it.
+            let g_state = if grads.len() == 1 && (qp_ctrl.gradient_only_state || is_excited_state_opt) {
                 grads[0].clone()
             } else {
                 grads[state].clone()
@@ -846,6 +945,43 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             println!(
                 "BSE analytic gradient requested for root {state} (omega = {:.12} Ha = {:.6} eV)",
                 omegas[state], omegas[state] * 27.211386245988
+            );
+            // Keep the active space fixed for the rest of an optimization, and
+            // remember the state so the next geometry can follow it.
+            if pin_bse_active_space
+                && (qp_ctrl.bse_active_occ_start < 0 || qp_ctrl.bse_active_vir_end <= 0)
+            {
+                if let Some(qp_mut) = scf_data.mol.ctrl.quasiparticle_methods.as_mut() {
+                    qp_mut.bse_active_occ_start = used_occ_start as i64;
+                    qp_mut.bse_active_vir_end = used_vir_end as i64;
+                    println!(
+                        "BSE active space pinned for the remaining optimization steps: \
+                         bse_active_occ_start = {}, bse_active_vir_end = {}",
+                        used_occ_start, used_vir_end
+                    );
+                }
+            }
+            if follow_bse_state {
+                scf_data.bse_tracked_state = Some(state);
+                scf_data.bse_tracked_x = tracked_x;
+                scf_data.bse_tracked_y = tracked_y;
+                scf_data.bse_tracked_nocc = active_nocc;
+                scf_data.bse_tracked_nvir = active_nvir;
+            }
+            // The geometry optimizer consumes exactly these two numbers; keep
+            // them under fixed keys so `eval_force` does not have to parse the
+            // human-readable root label.
+            scf_data.energies.insert(
+                "bse_excited_state_response_gradient".to_string(),
+                g_state.clone(),
+            );
+            scf_data.energies.insert(
+                "bse_excited_state_omega".to_string(),
+                vec![omegas[state]],
+            );
+            scf_data.energies.insert(
+                "bse_excited_state_index".to_string(),
+                vec![state as f64],
             );
             report_analytic_gradient(scf_data, &format!("BSE_ROOT{state}"), &g_state);
             report_state_and_total_gradient(

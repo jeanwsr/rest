@@ -121,6 +121,12 @@ pub enum JobType {
     Force,
     NumDipole,
     GeomOpt,
+    /// Geometry optimization on the potential-energy surface of one GW-BSE
+    /// excited state: the optimizer receives `E_SCF(R) + Omega_S(R)` and the
+    /// analytic total gradient `dE_SCF/dR + dOmega_S/dR`.  The electronic
+    /// structure is the ordinary `gw_or_bse = "bse_gradient"` card path; this
+    /// job type only changes what the geometry optimizer consumes.
+    ExcitedStateOpt,
     NormalModes,
 }
 
@@ -638,10 +644,20 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         JobType::SinglePoint => {println!("Calculation type: Single-point energy")},
         JobType::Force => {println!("Calculation type: Force calculation")},
         JobType::NumDipole => {println!("Calculation type: Numerical dipole calculation")},
-        JobType::GeomOpt => {
-            println!("Calculation type: Geometry optimization");
+        JobType::GeomOpt | JobType::ExcitedStateOpt => {
+            if matches!(ctrl.job_type, JobType::ExcitedStateOpt) {
+                println!("Calculation type: Excited-state geometry optimization (GW-BSE analytic gradient)");
+            } else {
+                println!("Calculation type: Geometry optimization");
+            }
             // opt_engine: available options: "lbfgs", "geometric-pyo3"; default: "geometric-pyo3"
             if let Some(opt_engine) = &mut ctrl.opt_engine {
+                // Accept both spellings used in the documentation/old cards.
+                if opt_engine.eq_ignore_ascii_case("geometric-pyo3") {
+                    *opt_engine = "geometric_pyo3".to_string();
+                } else if opt_engine.eq_ignore_ascii_case("lbfgs") {
+                    *opt_engine = "lbfgs".to_string();
+                }
                 if ctrl.print_level >= 1 {
                     println!("Optimization engine: {}", opt_engine);
                 }
@@ -649,6 +665,45 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
                 ctrl.opt_engine = Some("geometric_pyo3".to_string());
                 if ctrl.print_level >= 1 {
                     println!("Optimization engine: Default (geometric_pyo3)");
+                }
+            }
+            if matches!(ctrl.job_type, JobType::ExcitedStateOpt) {
+                match ctrl.quasiparticle_methods.as_mut() {
+                    Some(qp) => {
+                        let method = qp.gw_or_bse.trim().to_lowercase();
+                        if method.is_empty() {
+                            qp.gw_or_bse = "bse_gradient".to_string();
+                        } else if method != "bse_gradient" {
+                            panic!(
+                                "job_type = \"excited_state_opt\" requires \
+                                 [quasiparticle_methods] gw_or_bse = \"bse_gradient\" \
+                                 (got \"{}\").  The geometry optimizer consumes the \
+                                 BSE analytic gradient produced by that card path.",
+                                qp.gw_or_bse
+                            );
+                        }
+                        if qp.bse_roots_only {
+                            panic!(
+                                "job_type = \"excited_state_opt\" cannot use \
+                                 bse_roots_only = true: that stage deliberately returns \
+                                 without assembling a gradient."
+                            );
+                        }
+                        if qp.bse_active_occ_start >= 0
+                            && qp.bse_active_vir_end > 0
+                            && qp.bse_active_vir_end <= qp.bse_active_occ_start
+                        {
+                            panic!(
+                                "bse_active_vir_end = {} must be larger than \
+                                 bse_active_occ_start = {}",
+                                qp.bse_active_vir_end, qp.bse_active_occ_start
+                            );
+                        }
+                    }
+                    None => panic!(
+                        "job_type = \"excited_state_opt\" requires a \
+                         [quasiparticle_methods] section with gw_or_bse = \"bse_gradient\"."
+                    ),
                 }
             }
         },
@@ -659,21 +714,44 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
 
     // To make sure the geometric_pyo3 structure is initialized properly
     // The geometric_pyo3 block has higher priority than the corresponding settings in the ctrl block
-    if let JobType::GeomOpt = ctrl.job_type.clone() {
+    if matches!(ctrl.job_type, JobType::GeomOpt | JobType::ExcitedStateOpt) {
         if let Some(opt_engine) = ctrl.opt_engine.clone() {
             if opt_engine.eq("geometric_pyo3") {
                 println!("Geometric_pyo3 is used for geometry optimization");
-                if let Some(geometric_pyo3) = &ctrl.geometric_pyo3 {
+                if let Some(geometric_pyo3) = ctrl.geometric_pyo3.as_ref() {
+                    if matches!(ctrl.job_type, JobType::ExcitedStateOpt)
+                        && (geometric_pyo3.transition || geometric_pyo3.irc)
+                    {
+                        panic!(
+                            "job_type = \"excited_state_opt\" is a minimum search on an \
+                             excited-state surface; geomeTRIC transition/IRC options are \
+                             not applicable.  Set transition = false and irc = false."
+                        );
+                    }
+                    if geometric_pyo3.analytic_hessian {
+                        panic!(
+                            "job_type = \"excited_state_opt\": analytic_hessian currently \
+                             builds the ground-state Hessian, not the excited-state one. \
+                             Leave analytic_hessian = false and let geomeTRIC use its \
+                             internal Hessian model."
+                        );
+                    }
                     if geometric_pyo3.transition {
                         println!("Transition state optimization is enabled");
                     } else if geometric_pyo3.irc {
                         println!("IRC optimization is enabled");
+                    } else if matches!(ctrl.job_type, JobType::ExcitedStateOpt) {
+                        println!("Excited-state minimum optimization is enabled");
                     } else {
                         println!("Standard geometry optimization is enabled");
                     }
                 } else {
                     ctrl.geometric_pyo3 = Some(GeomeTRIC::default());
-                    println!("Standard geometry optimization is enabled");
+                    if matches!(ctrl.job_type, JobType::ExcitedStateOpt) {
+                        println!("Excited-state minimum optimization is enabled");
+                    } else {
+                        println!("Standard geometry optimization is enabled");
+                    }
                 }
             } else if opt_engine.eq("lbfgs") {
                 println!("L-BFGS is used for geometry optimization");
@@ -1071,7 +1149,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.job_type = match tmp_ctrl.get("job_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {
                     let tmp_xc_low = tmp_xc.to_lowercase();
-                    if tmp_xc_low.eq("opt") || tmp_xc_low.eq("geometry optimization") ||
+                    if tmp_xc_low.eq("excited_state_opt") || tmp_xc_low.eq("excited-state-opt") ||
+                       tmp_xc_low.eq("excited state opt") || tmp_xc_low.eq("bse_opt") ||
+                       tmp_xc_low.eq("bse_geom_opt") || tmp_xc_low.eq("bse_geometry_optimization") ||
+                       tmp_xc_low.eq("excited_state_geometry_optimization") ||
+                       tmp_xc_low.eq("es_opt") || tmp_xc_low.eq("excited_opt") {
+                        JobType::ExcitedStateOpt
+                    } else if tmp_xc_low.eq("opt") || tmp_xc_low.eq("geometry optimization") ||
                        tmp_xc_low.eq("geometry relaxation") || tmp_xc_low.eq("geom_opt") ||
                        tmp_xc_low.eq("geom_relax") || tmp_xc_low.eq("relax") {
                         JobType::GeomOpt

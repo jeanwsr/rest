@@ -49,6 +49,7 @@
     2. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
 	3. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	4. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
+	5. `excited_state_opt`: GW-BSE 激发态构型优化。使用 `gw_or_bse = "bse_gradient"` 的解析梯度，在势能面 `E_SCF(R) + Omega_S(R)` 上做 geomeTRIC 优化。等价设置有：`bse_opt`, `bse_geom_opt`, `es_opt` 等。详见下文“GW-BSE 激发态构型优化”。
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
     - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
@@ -1305,6 +1306,57 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
          electronic_energy = -114.5521
          conc = "1.0M"
     ```
+
+## GW-BSE 激发态构型优化（`job_type = "excited_state_opt"`）
+
+该任务把 GW-BSE 解析梯度直接接到 geomeTRIC：每一步几何都执行与单点
+`gw_or_bse = "bse_gradient"` 完全相同的 SCF → GW → BSE → 解析梯度流程，
+但返回给优化器的是
+
+```
+E(R)   = E_SCF(R) + Omega_S(R)
+dE/dR  = dE_SCF/dR + dOmega_S/dR
+```
+
+而不是基态能量/梯度。`[quasiparticle_methods]` 中的 GW/BSE 参数（`gw_variant`、
+`bse_tda`、`gradient_state`、`gradient_nroots`、活性空间等）与单点梯度卡完全相同。
+
+激发态专用行为（自动开启，也可由同名关键词显式控制）：
+
+- `gradient_pin_active_space`（默认对 `excited_state_opt` 为 true）：第一次 BSE
+  梯度实际使用的 `[occ_start, vir_end)` 会写回并固定下来，避免能量窗口随几何
+  漂移导致 `Omega(R)` 不连续。生产计算建议仍在卡里显式写出
+  `bse_active_occ_start` / `bse_active_vir_end`，这样作业重投时活性空间不变。
+- `gradient_follow_state`（默认对 `excited_state_opt` 为 true）：按上一步 BSE
+  振幅的重叠 `X_old^T X_new - Y_old^T Y_new` 跟踪同一个电子态，而不是死守根序号。
+  `gradient_nroots` 需覆盖可能交换的根；未显式设置时至少求解 `gradient_state + 2`
+  个根，但只组装被跟踪根的梯度。
+
+最小示例（AC-GW、TDA、固定 27×46 活性空间）：
+
+```toml
+[ctrl]
+    job_type =        "excited_state_opt"
+    opt_engine =      "geometric_pyo3"
+    xc =              "pbeh"
+    ...
+[quasiparticle_methods]
+    gw_or_bse =            "bse_gradient"
+    gw_variant =           "ac"
+    bse_tda =              true
+    gradient_state =       0
+    gradient_nroots =      3
+    bse_active_occ_start = 0
+    bse_active_vir_end =   73
+    gradient_exact_residue = true
+    ...
+[geometric_pyo3]
+    maxiter = 25
+    convergence_grms = 1.0e-3
+```
+
+注意：`excited_state_opt` 只支持解析梯度（`numerical_force = false`），并且
+`analytic_hessian` 仍会构造基态 Hessian，因此该任务下不允许开启。
 
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300

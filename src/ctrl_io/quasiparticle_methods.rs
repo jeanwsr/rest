@@ -292,6 +292,34 @@ pub struct QuasiParticle {
     /// transition space must contain more roots (every solved root enlarges the
     /// kernel covectors and the folds).  Default `0`.
     pub gradient_nroots:usize,
+    /// Follow one electronic *state* from geometry to geometry by the overlap
+    /// of its BSE amplitudes, instead of always differentiating the fixed
+    /// `gradient_state` index.
+    ///
+    /// The BSE root index is only an eigenvalue ordering; at a crossing or an
+    /// avoided crossing two roots exchange character and a fixed index would
+    /// silently jump to a different state.  When this is enabled, every step
+    /// solves `gradient_nroots` roots, compares each root's `(X, Y)` with the
+    /// amplitudes stored from the previous step (overlap `X_old^T X_new -
+    /// Y_old^T Y_new`) and differentiates the best match.  Set
+    /// `gradient_nroots` large enough to include the state of interest.
+    ///
+    /// Automatically enabled for `job_type = "excited_state_opt"`.
+    /// Default `false`.
+    pub gradient_follow_state:bool,
+    /// Keep the BSE active space fixed at the indices used by the first
+    /// geometry-optimization step.
+    ///
+    /// An energy-window active space changes with the nuclear geometry, which
+    /// makes `E_GS + Omega` discontinuous when an orbital crosses the window
+    /// edge and leaves the analytic gradient inconsistent with the energy.
+    /// With this enabled, the first BSE gradient of the run writes the actual
+    /// `[occ_start, vir_end)` it used back into `bse_active_occ_start` /
+    /// `bse_active_vir_end`, and every later step reuses those indices.
+    ///
+    /// Automatically enabled for `job_type = "excited_state_opt"`.
+    /// Default `false`.
+    pub gradient_pin_active_space:bool,
     /// Energy window above the Fermi level (Hartree) for the BSE transition
     /// space of the **analytic gradient**.  `0.0` keeps the full virtual space
     /// (`f64::INFINITY`), which is what the card path used to do unconditionally
@@ -940,6 +968,8 @@ impl Default for QuasiParticle {
             gradient_orbital:-1,
             gradient_state:0,
             gradient_nroots:0,
+            gradient_follow_state:false,
+            gradient_pin_active_space:false,
             gradient_bse_window:0.0,
             gradient_bse_nvir:0,
             gradient_amplitude_path:String::new(),
@@ -1172,6 +1202,8 @@ impl QuasiParticle {
         table.insert("gradient_orbital".to_string(), toml::Value::Integer(self.gradient_orbital as i64));
         table.insert("gradient_state".to_string(), toml::Value::Integer(self.gradient_state as i64));
         table.insert("gradient_nroots".to_string(), toml::Value::Integer(self.gradient_nroots as i64));
+        table.insert("gradient_follow_state".to_string(), toml::Value::Boolean(self.gradient_follow_state));
+        table.insert("gradient_pin_active_space".to_string(), toml::Value::Boolean(self.gradient_pin_active_space));
         table.insert("gradient_bse_window".to_string(), toml::Value::Float(self.gradient_bse_window));
         table.insert("gradient_bse_nvir".to_string(), toml::Value::Integer(self.gradient_bse_nvir as i64));
         table.insert("gradient_amplitude_path".to_string(), toml::Value::String(self.gradient_amplitude_path.clone()));
@@ -1809,6 +1841,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
                 serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
                 _ => 0,
+            };
+            tmp_input.gradient_follow_state = match tmp_ctrl.get("gradient_follow_state").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.gradient_pin_active_space = match tmp_ctrl.get("gradient_pin_active_space").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
             };
             tmp_input.gradient_bse_window = match tmp_ctrl.get("gradient_bse_window").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
