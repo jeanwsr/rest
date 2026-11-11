@@ -41,7 +41,7 @@ use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_
 // use self::gen_grids::radial_grid_lmg_bse;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 use regex::Regex;
-use crate::basis_io::{gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, 
+use crate::basis_io::{gto_1st_value_batch_serial, gto_1st_value_serial, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch,
     spheric_gto_value_matrixfull};
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
@@ -6336,29 +6336,6 @@ impl Grids {
 
 
 
-pub fn numerical_density_v01(grid: &Grids, mol: &Molecule, dm: &mut [MatrixFull<f64>;2]) -> [f64;2] {
-    let mut total_density = [0.0f64;2];
-    //let mut count:usize = 0;
-    grid.coordinates.iter().zip(grid.weights.iter()).for_each(|(r,w)| {
-        let mut density_r_sum = [0.0;2];
-        let mut density_r:Vec<f64> = vec![];
-        mol.basis4elem.iter().zip(mol.geom.rg_position.iter_columns_full()).for_each(|(elem,geom)| {
-            let mut tmp_geom = [0.0;3];
-            tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            density_r.extend(gto_value(r, &tmp_geom, elem, &mol.ctrl.basis_type));
-        });
-        let mut density_rr = MatrixFull::from_vec([mol.num_basis,1],density_r).unwrap();
-        dm.iter_mut().zip(density_r_sum.iter_mut()).for_each(|(dm_s, density_r_sum)| {
-            let mut tmp_mat = MatrixFull::new([mol.num_basis,1],0.0);
-            tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
-            *density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
-        });
-        total_density.iter_mut().zip(density_r_sum.iter()).for_each(|(to,from)| *to += from*w);
-    });
-    
-    total_density
-}
-
 pub fn numerical_density(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, mpi_operator: &Option<MPIOperator>) -> [f64;2] {
     #[cfg(feature = "mpi")]
     if let Some(mpi_op) = mpi_operator {
@@ -6655,27 +6632,33 @@ fn test_non0tab_compress_roundtrip() {
 
 #[test]
 fn test_auto_non0tab_blksize() {
-    // Small system: large blksize
-    let blk = Grids::auto_non0tab_blksize(100);
-    assert!(blk >= 128, "small nao should get large blksize, got {blk}");
-    assert!(blk <= 256, "blksize should be clamped, got {blk}");
+    // Current contract (see auto_non0tab_blksize): blksize = 512 KB /
+    // (nao * 16), clamped to [256, 512]. The lower bound 256 and upper bound
+    // 512 replaced the historical [32, 256] after the sparse-grid memory
+    // optimization (blksize=32 measured 15.5 s/iter vs 13.1 s at 256 on
+    // Rh-complex/1956 bfs/28 cores); these assertions were left behind on
+    // the old clamp and updated 2026-11-12 to the documented behavior.
+    // Formula check: 512*1024/(nao*16).
+    let small = Grids::auto_non0tab_blksize(100);
+    assert_eq!(small, 327, "512KB target for nao=100 -> 327");
 
-    // Medium system
-    let blk = Grids::auto_non0tab_blksize(730);
-    assert!(blk >= 32 && blk <= 128, "medium nao blksize range, got {blk}");
+    // Medium and large systems all clamp to the lower bound 256
+    for nao in [730_usize, 4600, 20000] {
+        let blk = Grids::auto_non0tab_blksize(nao);
+        assert_eq!(blk, 256, "nao={nao} should clamp to the 256 lower bound");
+    }
 
-    // Large system: small blksize
-    let blk = Grids::auto_non0tab_blksize(4600);
-    assert!(blk >= 32, "large nao should get small blksize, got {blk}");
-    assert!(blk <= 64, "large nao blksize should be small, got {blk}");
+    // Monotone non-increasing in nao
+    let mut prev = Grids::auto_non0tab_blksize(10);
+    for nao in [50_usize, 100, 300, 1000, 5000] {
+        let blk = Grids::auto_non0tab_blksize(nao);
+        assert!(blk <= prev, "blksize must be non-increasing: nao={nao}");
+        prev = blk;
+    }
 
-    // Very large: clamped to minimum
-    let blk = Grids::auto_non0tab_blksize(20000);
-    assert_eq!(blk, 32, "very large nao should hit minimum");
-
-    // Tiny system: clamped to maximum
+    // Tiny system: clamped to maximum 512
     let blk = Grids::auto_non0tab_blksize(10);
-    assert_eq!(blk, 256, "tiny nao should hit maximum");
+    assert_eq!(blk, 512, "tiny nao should hit the 512 maximum");
 }
 
 // ── contract_response_compressed correctness with multi-batch grid offsets ──
@@ -6811,8 +6794,24 @@ fn test_non0tab_contract_response_offset() {
             r, &vrho_local, &vsigma, &vtau,
             &weights_local, &mut result, spin,
             false, false,
-            &rhop, nao, 0.0,
+            &rhop, nao,
         );
+        // `contract_response_compressed` scatters only the upper triangle
+        // (off-diagonals accumulate C_ij + C_ji) and is completed by the
+        // caller's symmetrize V ← 0.5(V + V^T) — see the production debug
+        // compare in `xc_exc_vxc_slots` and the scatter comment inside. The
+        // assertions below target the completed operator, so symmetrize here
+        // exactly like the production caller (test drift fix 2026-11-12:
+        // this test predated the upper-triangle-only scatter).
+        for m in result.iter_mut() {
+            for mu in 0..nao {
+                for nu in mu..nao {
+                    let sym = 0.5 * (m[[mu, nu]] + m[[nu, mu]]);
+                    m[[mu, nu]] = sym;
+                    m[[nu, mu]] = sym;
+                }
+            }
+        }
         result
     };
 

@@ -14,10 +14,10 @@ use crate::constants::{C2S_L0, C2S_L1, C2S_L2, C2S_L3, C2S_L4, CarBasInfo, c2s_m
 use crate::utilities;
 use super::Basis4Elem;
 use super::{
-    cartesian_gto_1st_batch_v04, cartesian_gto_1st_cint, cartesian_gto_1st_cint_batch,
+    cartesian_gto_1st_batch_v04, cartesian_gto_1st_cint_batch,
     cartesian_gto_1st_cint_batch_serial, cartesian_gto_1st_cint_batch_serial_v03,
     cartesian_gto_2nd_batch_v04, cartesian_gto_3rd_batch_v04, cartesian_gto_batch_v04,
-    cartesian_gto_cint, cartesian_gto_cint_batch, cartesian_gto_cint_batch_rayon,
+    cartesian_gto_cint_batch, cartesian_gto_cint_batch_rayon,
     cartesian_gto_cint_batch_v04, cint_cartesian_gto_1st_cint_batch_serial_v03,
     cint_cartesian_gto_cint_batch_v04,
 };
@@ -274,29 +274,17 @@ pub fn cartesian_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4
     for ibas in &bas.electron_shells {
         let iang = ibas.angular_momentum[0] as usize;
         let c_len = (iang+1)*(iang+2)/2;
-        if iang ==0 || iang==1 {
-            for coeff in ibas.coefficients.iter() {
-                let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
-                coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                        tmp_cart += cint_cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
-                });
+        // libcint cartesian convention for every l (the l<2 / l>=2 split the
+        // historical if/else duplicated is already inside the evaluator)
+        for coeff in ibas.coefficients.iter() {
+            let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+                    tmp_cart += cint_cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
+            });
 
-                outmat_c.copy_from_matr(ibas_start..ibas_start+c_len, 0..num_grids, 
-                    &tmp_cart, 0..c_len, 0..num_grids);
-                ibas_start += c_len;
-            }
-        } else {
-            for coeff in ibas.coefficients.iter() {
-                let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
-                coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                        tmp_cart += cint_cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
-                });
-
-                outmat_c.copy_from_matr(ibas_start..ibas_start+c_len, 0..num_grids, 
-                    &tmp_cart, 0..c_len, 0..num_grids);
-                ibas_start += c_len;
-            }
-
+            outmat_c.copy_from_matr(ibas_start..ibas_start+c_len, 0..num_grids, 
+                &tmp_cart, 0..c_len, 0..num_grids);
+            ibas_start += c_len;
         }
     }
 
@@ -304,38 +292,13 @@ pub fn cartesian_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4
 }
 
 pub fn gto_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> Vec<f64> {
-    let mut value:Vec<f64> = vec![];
-    for ibas in &bas.electron_shells {
-        let iang = ibas.angular_momentum[0];
-        for coeff in ibas.coefficients.iter() {
-            let mut tmp_cart = MatrixFull::new([((iang+1)*(iang+2)/2) as usize,1],0.0);
-            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                //let scoeff = *icoeff * _gaussian_int(iang*2 + 2, *iexp*2.0).sqrt();
-                let mut tmp_cart_0 = cartesian_gto_cint(*iexp, iang as usize, gto_center, r);
-                //tmp_cart.data.iter_mut().zip(tmp_cart_0.data.iter()).for_each(|(to,from)| {
-                //    *to += *from*icoeff
-                //});
-                tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
-            });
-            if basis_type.eq(&"spheric".to_string()) {
-                let s_len = (2*iang + 1) as usize;
-                let c_len = ((iang+1)*(iang+2)/2) as usize;
-                // C[1, s_len] = tmp_cart[c_len, 1]^T x c2s[c_len, s_len]
-                // (s_len contiguous values; the old code used the layout
-                //  equivalence of [s_len,1] and [1,s_len] buffers)
-                let mut tmp_spheric = uninit_matrix(1, s_len);
-                _dgemm(&tmp_cart, (0..c_len, 0..1), 'T',
-                       &c2s_matrix_const(iang as usize).to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
-                       &mut tmp_spheric, (0..1, 0..s_len), 1.0, 0.0);
-                //tmp_spheric.lapack_dgemm(&mut tmp_cart, &mut c2s_matrix(iang as usize), 'T', 'N', 1.0, 0.0);
-                value.extend(tmp_spheric.data);
-            } else {
-                value.extend(tmp_cart.data);
-            }
-        }
-        
-    }
-    value
+    // Single-point convenience wrapper around the batch tabulation. Both
+    // branches (spheric / cartesian) must use the SAME normalization chain as
+    // `gto_value_serial` so that the values are consistent with the libcint
+    // integrals (the historical hand-rolled version applied the spheric-chain
+    // normalization on the cartesian branch, which is wrong for l >= 2; see
+    // AO_AOP_NORM_AUDIT.md §5-D).
+    gto_value_serial(&[r.clone()], gto_center, bas, basis_type).data
 }
 pub fn spheric_gto_1st_value_batch(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis4Elem) -> Vec<MatrixFull<f64>> {
     let num_grids:usize = r.len();
@@ -515,36 +478,20 @@ pub fn cartesian_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Ba
     for ibas in &bas.electron_shells {
         let iang = ibas.angular_momentum[0] as usize;
         let c_len = (iang+1)*(iang+2)/2;
-        if iang == 0 || iang == 1 { 
-            for coeff in ibas.coefficients.iter() {
-                let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
-                coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                    let mut tmp_cart_0 = cint_cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
-                    tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
-                        to.self_scaled_add(from, *icoeff);
-                    });
+        // libcint cartesian convention for every l (the l<2 / l>=2 split the
+        // historical if/else duplicated is already inside the evaluator)
+        for coeff in ibas.coefficients.iter() {
+            let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+                let mut tmp_cart_0 = cint_cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
+                tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
+                    to.self_scaled_add(from, *icoeff);
                 });
-                paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
-                    paox_x.copy_from_matr(ibas_start..ibas_start+c_len,0..num_grids,  tmp_cart_x, 0..c_len,0..num_grids);
-
-                });
-                ibas_start += c_len;
-            }
-        } else {
-            for coeff in ibas.coefficients.iter() {
-                let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
-                coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                    let mut tmp_cart_0 = cint_cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
-                    tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
-                        to.self_scaled_add(from, *icoeff);
-                    });
-                });
-                paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
-                    paox_x.copy_from_matr(ibas_start..ibas_start+c_len,0..num_grids,  tmp_cart_x, 0..c_len,0..num_grids);
-
-                });
-                ibas_start += c_len;
-            }
+            });
+            paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
+                paox_x.copy_from_matr(ibas_start..ibas_start+c_len,0..num_grids,  tmp_cart_x, 0..c_len,0..num_grids);
+            });
+            ibas_start += c_len;
         }
     }
     paox
@@ -696,98 +643,33 @@ pub fn spheric_gto_deriv_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Ba
     pao 
 }
 
-pub fn gto_1st_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> Vec<Vec<f64>> {
-    let mut value:Vec<Vec<f64>> = vec![vec![];3];
-    //let mut value:[Vec<f64>;3] = [Vec::new();3];
-    for ibas in &bas.electron_shells {
-        let iang = ibas.angular_momentum[0];
-        for coeff in ibas.coefficients.iter() {
-            let mut tmp_cart = [
-                MatrixFull::new([((iang+1)*(iang+2)/2) as usize,1],0.0),
-                MatrixFull::new([((iang+1)*(iang+2)/2) as usize,1],0.0),
-                MatrixFull::new([((iang+1)*(iang+2)/2) as usize,1],0.0)
-            ];
-            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                //let scoeff = *icoeff * _gaussian_int(iang*2 + 2, *iexp*2.0).sqrt();
-                let mut tmp_cart_0 = cartesian_gto_1st_cint(*iexp, iang as usize, gto_center, r);
-                //println!("debug: {:?}, {:?}, {:?}", &tmp_cart_0[0].data,&tmp_cart_0[1].data,&tmp_cart_0[2].data);
-                tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(tmp_cart,tmp_cart_0)| {
-                    tmp_cart.self_scaled_add(tmp_cart_0, *icoeff)
-                });
-            });
-            if basis_type.eq(&"spheric".to_string()) {
-                tmp_cart.iter().zip(value.iter_mut()).for_each(|(tmp_cart, value)| {
-                    let s_len = (2*iang + 1) as usize;
-                    let c_len = ((iang+1)*(iang+2)/2) as usize;
-                    // C[1, s_len] = tmp_cart[c_len, 1]^T x c2s[c_len, s_len]
-                    let mut tmp_spheric = uninit_matrix(1, s_len);
-                    _dgemm(&*tmp_cart, (0..c_len, 0..1), 'T',
-                           &c2s_matrix_const(iang as usize).to_matrixfullslice(), (0..c_len, 0..s_len), 'N',
-                           &mut tmp_spheric, (0..1, 0..s_len), 1.0, 0.0);
-                    value.extend(tmp_spheric.data.iter());
-                });
-            } else {
-                tmp_cart.iter().zip(value.iter_mut()).for_each(|(tmp_cart, value)| {
-                    value.extend(tmp_cart.data.iter())
-                });
-            }
-        }
-        
-    }
-    value
-}
-pub fn gto_value_debug(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String,count: usize) -> Vec<f64> {
-    let mut value:Vec<f64> = vec![];
-    for ibas in &bas.electron_shells {
-        let iang = ibas.angular_momentum[0];
-        for coeff in ibas.coefficients.iter() {
-            let mut tmp_cart = MatrixFull::new([((iang+1)*(iang+2)/2) as usize,1],0.0);
-            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                //let scoeff = *icoeff * _gaussian_int(iang*2 + 2, *iexp*2.0).sqrt();
-                let mut tmp_cart_0 = cartesian_gto_cint(*iexp, iang as usize, gto_center, r);
-                //tmp_cart.data.iter_mut().zip(tmp_cart_0.data.iter()).for_each(|(to,from)| {
-                //    *to += *from*icoeff
-                //});
-                tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
-                //if count<10 {println!("iang: {:2} coeff: {:8.4}, exp: {:8.4}, tmp_cart: {:?}", iang, scoeff, iexp, &tmp_cart)};
-            });
-            if basis_type.eq(&"spheric".to_string()) {
-                let mut tmp_spheric = MatrixFull::new([(2*iang + 1) as usize, 1],0.0);
-                //tmp_spheric.lapack_dgemm(&mut tmp_cart, &mut c2s_matrix(iang as usize), 'T', 'N', 1.0, 0.0);
-                tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                    &tmp_cart.to_matrixfullslice(), 
-                    &c2s_matrix_const(iang as usize).to_matrixfullslice(),
-                    'T', 'N', 1.0, 0.0);
-                value.extend(tmp_spheric.data);
-            } else {
-                value.extend(tmp_cart.data);
-            }
-        }
-        
-    }
-    value
-}
-
-/// Normalization factor for GTO radial part g=r^l e^{-\alpha r^2}
-/// 
-/// \frac{1}{\sqrt{\int g^r r^2 dr}} = \sqrt{\frac{2^{2l+3} (l+1)! (2a)^{1+1.5}}{(2l+2)!\sqrt{\pi}}}
-/// Ref: H. B. Schlegel and M. J. Frisch, Int. J. Quant. Chem., 54(1995, 83-87)
-/// 
-/// This part is absorbed in the BasCell.coefficients for libcint.
-/// However, in REST, we prepare the tabulated GTOs which are normalized.
-/// In consequence, this factor should be removed again for the use in REST. 
-/// 
-/// ===============================================================================================
-/// NOTE::: It works for spheric basis, s and p type-cartesian basis.
-/// NOTE::: for cartesian basis with l>=2, the normalization factor is not correct.
-/// NOTE::: Therefore, for the calculation with basis_type = catesian, you need to use cint_cart_norm_factor()
-/// ===============================================================================================
+/// sqrt(I_L(alpha)) with I_L = int_0^inf r^{2L+2} exp(-2 alpha r^2) dr, i.e.
+/// the exact inverse of libcint's `CINTgto_norm(L, alpha)`.
+///
+/// Spheric chain: `basis_normalization` multiplies the contraction
+/// coefficients by `CINTgto_norm`, while the tabulated primitives
+/// (`cartesian_gto_*_v04`, raw `Norm0*Fang*monomial`) carry no radial
+/// normalization. Multiplying the primitives by this factor makes the
+/// product element-wise equal to libcint's spheric basis function, because
+/// `sqrt(I_L)*Norm0 = sqrt((2L+1)!!)/(2 sqrt(pi))` cancels against the c2s
+/// (Schlegel–Frisch) rows: `sqrt(I_L)*norm0*f*c2s = fac_sp*T_libcint`
+/// (derivation: AO_AOP_NORM_AUDIT.md §4).
 pub fn cint_norm_factor(iang: i32, alpha: f64) -> f64 {
     return _gaussian_int(iang*2+2, alpha*2.0).sqrt()
 }
 
+/// Cartesian-chain counterpart of [`cint_norm_factor`].
+///
+/// libcint's cartesian convention applies `CINTcommon_fac_sp(l)` to s and p
+/// shells only (`fac_sp(0) = 1/(2 sqrt(pi))`, `fac_sp(1) = sqrt(3/(4 pi))`,
+/// `fac_sp(l) = 1` for l >= 2). With `norm0*sqrt(I_L) = fac_sp(l)` for l < 2,
+/// multiplying the l < 2 tabulated primitives by this factor completes
+/// libcint's angular factor; for l >= 2 the factor is exactly 1 — the
+/// tabulated rows stay the RAW polynomial x^lx y^ly z^lz exp(-a r^2),
+/// matching the per-shell shared normalization of libcint's cartesian
+/// integrals (the per-component normalization libcint skips for l >= 2
+/// cannot be shared across one contraction; AO_AOP_NORM_AUDIT.md §2–§4).
 pub fn cint_cart_norm_factor(iang: i32, alpha: f64) -> f64 {
-    //return _gaussian_int(iang*2+2, alpha*2.0).sqrt()
     if iang == 0 || iang == 1 {
         return _gaussian_int(iang*2+2, alpha*2.0).sqrt()
     } else {
