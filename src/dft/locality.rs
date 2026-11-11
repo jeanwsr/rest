@@ -12,8 +12,9 @@
 //!
 //! Keeping them in one place pins the two paths to identical screening
 //! semantics. The radius envelope below is a rigorous upper bound of the
-//! spherical GTO magnitude, so a geometric skip never drops a row that the
-//! value screen would have kept (the SCF tabulation therefore stays
+//! tabulated GTO magnitude in both basis conventions (spheric and cartesian;
+//! derivation in AO_AOP_NORM_AUDIT.md), so a geometric skip never drops a row
+//! that the value screen would have kept (the SCF tabulation therefore stays
 //! bit-identical when the pre-screen is added).
 
 use rest_tensors::MatrixFull;
@@ -23,21 +24,37 @@ use crate::molecule_io::Molecule;
 /// Conservative per-atom influence radii (bohr) for AO screening: beyond
 /// `radius(a)` no basis function on atom `a` can exceed `cutoff` in magnitude.
 ///
-/// The envelope of one shell is `A_l * C_contr * r^l * exp(-alpha_min r^2)`:
+/// The envelope of one shell is `c_dir * C_contr * r^l * exp(-alpha_min r^2)`:
 ///
-/// - `C_contr = sum_p |c_p| * Norm0(alpha_p, l)` bounds the primitive sum,
-///   with `Norm0 = (2a/pi)^(3/4) * (4a)^(l/2)` the primitive normalization of
-///   `cartesian_gto_batch_v04` (whose angular `Fang <= 1` and monomials obey
-///   `|x^lx y^ly z^lz| <= r^l`).
-/// - `A_l = sqrt((l+1)(l+2)/2)` bounds the 1-norm of every row of the
-///   (orthogonal) c2s transform, i.e. the worst amplification of the
-///   cartesian-to-spherical combination.
+/// - `C_contr = sum_p |d_p|`, where `d_p` are the shell coefficients as stored
+///   after `basis_normalization` (they already carry libcint's `gto_norm` and
+///   the contraction renormalization, and multiply the tabulated polynomial
+///   directly). No extra `Norm0(alpha_p, l)` factor may be applied: for
+///   diffuse exponents `Norm0 < 1` and the bound would no longer dominate the
+///   tabulated values (that was the pre-fix bug, strongest for cartesian
+///   shells with l >= 2 whose tabulated rows are raw polynomials).
+/// - `c_dir` bounds the direction amplitude of one tabulated row and depends
+///   on the tabulation convention (derivation: AO_AOP_NORM_AUDIT.md §4):
+///   * spheric — the tabulated value is `d_p * r^l * C_lm(r_hat) * exp(..)`
+///     (the `sqrt(I_L) * norm0 * f * c2s` chain collapses elementwise to the
+///     normalized real solid harmonic), so
+///     `c_dir = sup |C_lm| <= sqrt((2l+1)/(4 pi))`;
+///   * cartesian — the tabulated value is
+///     `d_p * [fac_sp(l) if l<2 else 1] * x^lx y^ly z^lz * exp(..)`, and
+///     `|x^lx y^ly z^lz| <= r^l`, so `c_dir = fac_sp(l)` for l < 2 and 1 for
+///     l >= 2 (`fac_sp` matches libcint's `CINTcommon_fac_sp`:
+///     `fac_sp(0) = 1/(2 sqrt(pi))`, `fac_sp(1) = sqrt(3/(4 pi))`).
+///
+/// Both factors are validated by the unit tests below (direction sup and
+/// shell envelope properties) and the bound holds for every exponent, tight
+/// or diffuse.
 ///
 /// A 0.5 bohr margin is added on top. Derivatives amplify the value by a
 /// modest polynomial factor at these distances; consumers that screen
 /// derivative-driven contractions should pass a cutoff tightened accordingly
 /// (the gradient pipeline uses `ao_cutoff * 1e-3`).
 pub fn atom_influence_radii(mol: &Molecule, cutoff: f64) -> Vec<f64> {
+    let cart_basis = mol.ctrl.basis_type == "cartesian";
     mol.basis4elem
         .iter()
         .map(|elem| {
@@ -48,19 +65,24 @@ pub fn atom_influence_radii(mol: &Molecule, cutoff: f64) -> Vec<f64> {
                 if !alpha_min.is_finite() || alpha_min <= 0.0 {
                     continue;
                 }
-                let n_cart = (l + 1) * (l + 2) / 2;
-                let a_l = (n_cart as f64).sqrt();
+                // libcint CINTcommon_fac_sp: applied to s and p shells only
+                let fac_sp = match l {
+                    0 => 0.5 / std::f64::consts::PI.sqrt(),
+                    1 => (3.0 / (4.0 * std::f64::consts::PI)).sqrt(),
+                    _ => 1.0,
+                };
+                let c_dir = if cart_basis {
+                    fac_sp
+                } else {
+                    ((2.0 * l as f64 + 1.0) / (4.0 * std::f64::consts::PI)).sqrt()
+                };
                 for coeffs in &shell.coefficients {
                     let c_contr: f64 = coeffs
                         .iter()
                         .zip(shell.exponents.iter())
-                        .map(|(c, a)| {
-                            c.abs()
-                                * (2.0 * a / std::f64::consts::PI).powf(0.75)
-                                * (4.0 * a).powf(l as f64 / 2.0)
-                        })
+                        .map(|(c, _a)| c.abs())
                         .sum();
-                    r_max = f64::max(r_max, envelope_radius(a_l * c_contr, l, alpha_min, cutoff));
+                    r_max = f64::max(r_max, envelope_radius(c_dir * c_contr, l, alpha_min, cutoff));
                 }
             }
             r_max + 0.5
@@ -131,4 +153,164 @@ pub fn screen_rows_by_value(vals: &MatrixFull<f64>, num_grids: usize, cutoff: f6
     (0..nbas)
         .filter(|&r| (0..num_grids).any(|g| vals[[r, g]].abs() > cutoff))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::basis_io::{gto_value_serial, BasCell, Basis4Elem};
+    use rest_libcint::CintType;
+
+    /// `c_dir` used by `atom_influence_radii`, replicated here so the tests
+    /// pin the same constants.
+    fn c_dir_for(l: usize, cart_basis: bool) -> f64 {
+        let fac_sp = match l {
+            0 => 0.5 / std::f64::consts::PI.sqrt(),
+            1 => (3.0 / (4.0 * std::f64::consts::PI)).sqrt(),
+            _ => 1.0,
+        };
+        if cart_basis {
+            fac_sp
+        } else {
+            ((2.0 * l as f64 + 1.0) / (4.0 * std::f64::consts::PI)).sqrt()
+        }
+    }
+
+    /// Deterministic quasi-uniform directions (Fibonacci sphere).
+    fn fibonacci_directions(n: usize) -> Vec<[f64; 3]> {
+        let ga = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        (0..n)
+            .map(|i| {
+                let y = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+                let r = (1.0 - y * y).max(0.0).sqrt();
+                let theta = ga * i as f64;
+                [r * theta.cos(), y, r * theta.sin()]
+            })
+            .collect()
+    }
+
+    fn build_shell(l: i32, cint_type: &CintType) -> Basis4Elem {
+        // deliberately span tight to very diffuse exponents: the envelope
+        // must hold for every alpha, including the regime where the old
+        // norm0-based bound failed (norm0 < 1)
+        let mut cell = BasCell {
+            function_type: None,
+            region: None,
+            angular_momentum: vec![l],
+            exponents: vec![50.0, 5.0, 0.5, 0.05],
+            coefficients: vec![
+                vec![0.15, 0.45, 0.40, 0.20],
+                vec![0.05, 0.30, 0.50, 0.35],
+            ],
+            native_coefficients: vec![],
+        };
+        cell.basis_normalization(cint_type);
+        Basis4Elem {
+            electron_shells: vec![cell],
+            references: None,
+            ecp_potentials: None,
+            ecp_electrons: None,
+            global_index: (0, 0),
+        }
+    }
+
+    /// Property: for every tabulated row (both conventions), the value at any
+    /// point is bounded by `c_dir * (sum_p |d_p|) * r^l * exp(-alpha_min r^2)`,
+    /// which is exactly the envelope `atom_influence_radii` solves for.
+    #[test]
+    fn envelope_bounds_tabulated_values_both_conventions() {
+        let center = [0.0_f64; 3];
+        let radii = [0.3, 1.0, 2.0, 4.0, 7.0, 10.0];
+        let directions = fibonacci_directions(64);
+        for l in 0..=4_i32 {
+            for (cart, type_name, cint_type) in [
+                (false, "spheric", CintType::Spheric),
+                (true, "cartesian", CintType::Cartesian),
+            ] {
+                let bas = build_shell(l, &cint_type);
+                let alpha_min = bas.electron_shells[0]
+                    .exponents
+                    .iter()
+                    .cloned()
+                    .fold(f64::INFINITY, f64::min);
+                let lf = l as f64;
+                let c_dir = c_dir_for(l as usize, cart);
+                let mut points: Vec<[f64; 3]> = Vec::new();
+                for &r in radii.iter() {
+                    for d in directions.iter() {
+                        points.push([r * d[0], r * d[1], r * d[2]]);
+                    }
+                }
+                let basis_type = type_name.to_string();
+                let tab = gto_value_serial(&points, &center, &bas, &basis_type);
+                // envelope per contraction; rows of contraction x use coeffs[x]
+                let contrs: Vec<f64> = bas.electron_shells[0]
+                    .coefficients
+                    .iter()
+                    .map(|co| co.iter().map(|c| c.abs()).sum())
+                    .collect();
+                let row_per_contr = tab.size[0] / contrs.len();
+                for g in 0..points.len() {
+                    let r = radii[g / directions.len()];
+                    let env_r = |c: f64| c_dir * c * r.powf(lf) * (-alpha_min * r * r).exp();
+                    for i in 0..tab.size[0] {
+                        let env = env_r(contrs[i / row_per_contr]);
+                        assert!(
+                            tab[[i, g]].abs() <= env * (1.0 + 1.0e-12),
+                            "{} l={} row={} g={}: |{}| > env {}",
+                            type_name, l, i, g, tab[[i, g]], env
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The spheric direction amplitude is the normalized real solid harmonic:
+    /// its sup must not exceed sqrt((2l+1)/(4 pi)) (and nearly attains it at
+    /// the pole of the m=0 row, so the bound is not vacuous). A single
+    /// primitive is used so the radial/contraction factor factors out exactly.
+    #[test]
+    fn spheric_direction_sup_matches_normalized_solid_harmonic() {
+        let center = [0.0_f64; 3];
+        for l in 0..=4_i32 {
+            let mut cell = BasCell {
+                function_type: None,
+                region: None,
+                angular_momentum: vec![l],
+                exponents: vec![0.7],
+                coefficients: vec![vec![1.0]],
+                native_coefficients: vec![],
+            };
+            cell.basis_normalization(&CintType::Spheric);
+            let bas = Basis4Elem {
+                electron_shells: vec![cell],
+                references: None,
+                ecp_potentials: None,
+                ecp_electrons: None,
+                global_index: (0, 0),
+            };
+            let alpha = 0.7_f64;
+            let d: f64 = bas.electron_shells[0].coefficients[0][0].abs();
+            let r = 2.0_f64;
+            let radial = d * r.powf(l as f64) * (-alpha * r * r).exp();
+            let directions = fibonacci_directions(256);
+            let points: Vec<[f64; 3]> = directions
+                .iter()
+                .map(|dd| [r * dd[0], r * dd[1], r * dd[2]])
+                .collect();
+            let basis_type = "spheric".to_string();
+            let tab = gto_value_serial(&points, &center, &bas, &basis_type);
+            let mut sup = 0.0_f64;
+            for g in 0..points.len() {
+                for i in 0..tab.size[0] {
+                    sup = sup.max(tab[[i, g]].abs() / radial);
+                }
+            }
+            let bound = ((2.0 * l as f64 + 1.0) / (4.0 * std::f64::consts::PI)).sqrt();
+            assert!(sup <= bound * (1.0 + 1.0e-9), "l={}: sup {} > bound {}", l, sup, bound);
+            // the m=0 pole nearly attains the bound
+            assert!(sup > 0.9 * bound, "l={}: bound too loose: sup {} vs {}", l, sup, bound);
+        }
+    }
 }

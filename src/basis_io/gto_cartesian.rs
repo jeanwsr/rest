@@ -36,44 +36,6 @@ fn delta_r(r1: &[f64;3], r2: &[f64;3]) -> ([f64;3],f64) {
 ///
 ///   Norm = (2a/Pi)^(3/4)*(4a)^{l/2}/((2*lx-1)!!(2*ly-1)!!(2*lz-1)!!)^{1/2}
 ///
-pub fn cartesian_gto_std(a: f64, l: usize, c:&[f64;3],r:&[f64;3]) -> MatrixFull<f64> {
-    // produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
-    //
-    //       gau(a,l,c) = Norm*x^{lx}*y^{ly}*z^{lz}*exp[-a*r^2],
-    //
-    // The GTO is normalized with the normalization factor "Norm" as
-    //
-    //   Norm = (2a/Pi)^(3/4)*(4a)^{l/2}/((2*lx-1)!!(2*ly-1)!!(2*lz-1)!!)^{1/2}
-    //
-
-    // results in the same order that are used in libcint
-    let mut tmp_v: Vec<f64> = vec![];
-    let mut rr:[f64;3] = r.clone();
-    rr.iter_mut().zip(c.iter()).for_each(|(r,c)| *r -= c);
-    let mut rdot = rr.iter().fold(0.0f64,|acc,rr| acc + rr*rr);
-    let exp_part = libm::exp(-a*rdot);
-    let norm0 = (2.0*a/PI).powf(0.75)*(4.0*a).powf((l as f64)/2.0);
-    for lx in (0..=l).rev() {
-        let xp = rr[0].powf(lx as f64);
-        //debug here
-        let normx = double_factorial((2*lx) as i32-1) as f64;
-        let rl = l - lx;
-        for ly in (0..=rl).rev() {
-            let lz = rl - ly;
-            let normy = double_factorial((2*ly) as i32-1) as f64;
-            let normz = double_factorial((2*lz) as i32-1) as f64;
-
-            //tmp_v.push(
-            //        xp*rr[1].powf(ly as f64)*rr[2].powf(lz as f64)
-            //        *exp_part);
-            tmp_v.push(norm0/(normx*normy*normz).sqrt()
-                    *xp*rr[1].powf(ly as f64)*rr[2].powf(lz as f64)
-                    *exp_part);
-            //println!("debug norm 2: {}", norm0/(normx*normy*normz).sqrt());
-        }
-    }
-    unsafe{MatrixFull::from_vec_unchecked([(l+1)*(l+2)/2,1], tmp_v)}
-}
 
 pub fn cartesian_gto_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
     // produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
@@ -348,17 +310,20 @@ pub fn cartesian_gto_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Mat
 }
 
 pub fn cint_cartesian_gto_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
-    // produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
-    // it will be used for the cartesian GTO defined by libcint
+    // Tabulated primitive values in the *libcint cartesian* convention, so
+    // that they match the integrals libcint computes with the same
+    // contraction coefficients (derivation: AO_AOP_NORM_AUDIT.md §4):
     //
-    //       gau(a,l,c) = Norm*(x-cx)^{lx}*(y-cy)^{ly}*(z-cz)^{lz}*exp[-a*|r-c|^2],
-    //                  = Norm0*Fang*exp[-a*|r-c|^2],
+    //   l <  2 :  fac_sp(l) * x^lx y^ly z^lz exp(-a|r-c|^2),
+    //             with fac_sp(0) = 1/(2 sqrt(pi)), fac_sp(1) = sqrt(3/(4 pi))
+    //             (libcint CINTcommon_fac_sp; norm0*sqrt(I_L) = fac_sp(l));
+    //   l >= 2 :  the RAW polynomial x^lx y^ly z^lz exp(-a|r-c|^2)
+    //             (libcint applies no angular factor; the radial gto_norm
+    //             lives in the contraction coefficients).
     //
-    // The GTO is normalized with the normalization factor "Norm" as
-    //
-    //   Norm = (2a/Pi)^(3/4)*(4a)^{l/2}/((2*lx-1)!!(2*ly-1)!!(2*lz-1)!!)^{1/2}
-    //   Norm0 = (2a/Pi)^(3/4)*(4a)^{l/2}
-    //   Fang = 1.0/((2*lx-1)!!(2*ly-1)!!(2*lz-1)!!)^{1/2} which has been evaluated and stored in constants/cartesian_gto.rs
+    // The caller multiplies by the coefficients and by `cint_cart_norm_factor`
+    // (which completes fac_sp for l < 2 and is 1 for l >= 2), so the final
+    // tabulated row equals the libcint cartesian basis function exactly.
 
     // results in the same order that are used in libcint
     let num_grids = r.len();
@@ -372,10 +337,9 @@ pub fn cint_cartesian_gto_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -
         (2.0*a/PI).powf(0.75)*opowf((4.0*a),(l as f64)/2.0)
     };
 
-    // In libcint, the GTOs with l>=2 are not normalized. 
-    // In concequence, the tabulated Cartesian GTOs prepared by REST are 
-    //     0) normalized for l<2
-    //     1) only normalized for the GTOs of x^{l}exp[-a*|r-c|^2)].
+    // cint_cartesian_gto_const(l) supplies the (lx, ly, lz) rows in libcint
+    // order; its 4th column is an unused placeholder (kept at 1.0) because
+    // this path tabulates raw polynomials for l >= 2.
     let binding = cint_cartesian_gto_const(l);
     let basinfo = &binding.to_matrixfullslice();;
 
@@ -687,8 +651,8 @@ pub fn cartesian_gto_1st_batch_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) ->
 pub fn cint_cartesian_gto_1st_batch_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
     let num_grids = r.len();
     let num_bas = (l+1)*(l+2)/2;
-    // For l>=2 (cartesian), the tabulated GTO gradient must match the raw polynomial
-    // (no Norm0/Fang), consistent with cint_cartesian_gto_batch_v04.
+    // For l>=2 (cartesian), the tabulated gradient must be that of the raw
+    // polynomial (no Norm0/Fang), consistent with cint_cartesian_gto_batch_v04.
     let norm0 = if l >= 2 {
         1.0
     } else {
@@ -1111,70 +1075,13 @@ pub fn cartesian_gto_3rd_batch_v04(a: f64, l: usize, c: &[f64;3], r:&[[f64;3]]) 
     vec![ao, aox, aoy, aoz, aoxx, aoxy, aoxz, aoyy, aoyz, aozz, aoxxx, aoxxy, aoxxz, aoxyy, aoxyz, aoxzz, aoyyy, aoyyz, aoyzz, aozzz]
 }
 
-pub fn cartesian_gto_1st_std(a: f64, l: usize, c:&[f64;3],r:&[f64;3]) -> [MatrixFull<f64>;3] {
-    let mut gto_dx: Vec<f64> = vec![];
-    let mut gto_dy: Vec<f64> = vec![];
-    let mut gto_dz: Vec<f64> = vec![];
-    let mut rr:[f64;3] = r.clone();
-    rr.iter_mut().zip(c.iter()).for_each(|(r,c)| *r -= c);
-    let mut rdot = rr.iter().fold(0.0f64,|acc,rr| acc + rr*rr);
-    let exp_part = libm::exp(-a*rdot);
-    let norm0 = (2.0*a/PI).powf(0.75)*(4.0*a).powf((l as f64)/2.0);
-    for lx in (0..=l as i32).rev() {
-        let lx_f64 = lx as f64;
-        let xp = rr[0].powf(lx_f64);
-        let mut xp_1s = -2.0*a*rr[0].powf(lx_f64+1.0);
-        xp_1s += if (lx != 0) {lx_f64*rr[0].powf(lx_f64-1.0)} else {0.0};
-        //debug here
-        let normx = double_factorial(2*lx-1) as f64;
-        let rl = l as i32 - lx;
-        for ly in (0..=rl as i32).rev() {
-            let lz = rl - ly;
-            let ly_f64 = ly as f64;
-            let lz_f64 = lz as f64;
-            let normy = double_factorial(2*ly-1) as f64;
-            let normz = double_factorial(2*lz-1) as f64;
-            let norm = norm0/(normx*normy*normz).sqrt();
 
-            let yp = rr[1].powf(ly_f64);
-            let mut yp_1s = -2.0*a*rr[1].powf(ly_f64+1.0);
-            yp_1s += if (ly != 0) {ly_f64*rr[1].powf(ly_f64-1.0)} else {0.0};
-            let zp = rr[2].powf(lz_f64);
-            let mut zp_1s = -2.0*a*rr[2].powf(lz_f64+1.0);
-            zp_1s += if (lz != 0)  {lz_f64*rr[2].powf(lz_f64-1.0)} else {0.0};
-
-            //tmp_v.push(
-            //        xp*rr[1].powf(ly as f64)*rr[2].powf(lz as f64)
-            //        *exp_part);
-            gto_dx.push(norm*xp_1s*yp*zp*exp_part);
-            gto_dy.push(norm*xp*yp_1s*zp*exp_part);
-            gto_dz.push(norm*xp*yp*zp_1s*exp_part);
-            //println!("debug norm 2: {}", norm0/(normx*normy*normz).sqrt());
-            //println!("debug: {},{},{}", xp_1s, yp_1s, zp_1s);
-            //println!("yp_1s comp: ly_f64: {}, rr[1]: {}, a: {}", ly_f64, rr[1], a);
-            //println!("yp_1s comp: ly_f64: {}, rr[1]: {}, a: {}", ly_f64, rr[1].powf(ly_f64-1.0), a);
-        }
-    }
-    //println!("debug: gto_d(x,y,z): ({:?}, {:?}, {:?})", &gto_dx, &gto_dy, &gto_dz);
-    [unsafe{MatrixFull::from_vec_unchecked([(l+1)*(l+2)/2,1], gto_dx)},
-     unsafe{MatrixFull::from_vec_unchecked([(l+1)*(l+2)/2,1], gto_dy)},
-     unsafe{MatrixFull::from_vec_unchecked([(l+1)*(l+2)/2,1], gto_dz)}]
-
-}
-
-pub fn cartesian_gto_cint(a: f64, l: usize, c:&[f64;3],r:&[f64;3]) -> MatrixFull<f64> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
-    let mut std_gto = cartesian_gto_std(a, l, c, r);
-    std_gto.self_multiple(cint_norm_factor(l as i32, a));
-    std_gto
-}
 
 pub fn cartesian_gto_cint_batch_rayon(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
+    // Spheric-chain evaluator: (norm0 · Fang · monomial) × sqrt(I_L). After
+    // the c2s combination and with the gto_norm-carrying coefficients it
+    // reproduces the libcint spheric basis function exactly
+    // (sqrt(I_L)·norm0·f·c2s = fac_sp·T_libcint; AO_AOP_NORM_AUDIT.md §4).
     //let mut time_records = utilities::TimeRecords::new();
 
     //time_records.new_item("1-1-1", "cartesian_gto_batch_par");
@@ -1192,9 +1099,10 @@ pub fn cartesian_gto_cint_batch_rayon(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]])
     std_gto
 }
 pub fn cartesian_gto_cint_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
+    // Spheric-chain evaluator: (norm0 · Fang · monomial) × sqrt(I_L). After
+    // the c2s combination and with the gto_norm-carrying coefficients it
+    // reproduces the libcint spheric basis function exactly
+    // (sqrt(I_L)·norm0·f·c2s = fac_sp·T_libcint; AO_AOP_NORM_AUDIT.md §4).
     let mut std_gto = cartesian_gto_batch_v03(a, l, c, r);
 
     std_gto.self_multiple(cint_norm_factor(l as i32, a));
@@ -1203,9 +1111,10 @@ pub fn cartesian_gto_cint_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Ma
 }
 
 pub fn cartesian_gto_cint_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           It prepares the tabulated cartesian gto which will be used for SPHERICAL gto defined in libcint
+    // Spheric-chain evaluator: cartesian_gto_batch_v04 × sqrt(I_L). Feeds the
+    // c2s (Schlegel–Frisch) combination for the SPHERICAL basis; with the
+    // gto_norm-carrying coefficients it reproduces the libcint spheric basis
+    // function exactly (AO_AOP_NORM_AUDIT.md §4).
     let mut std_gto = cartesian_gto_batch_v04(a, l, c, r);
 
     std_gto.self_multiple(cint_norm_factor(l as i32, a));
@@ -1214,12 +1123,12 @@ pub fn cartesian_gto_cint_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -
 }
 
 pub fn cint_cartesian_gto_cint_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> MatrixFull<f64> {
-    // WARNNING: In libcint, only s and p type gtos are normalized.
-    //           For gtos with l>=2, the normalization is not defined for different combination of lx, ly, and lz.
-    //           In consequence, the density matrix and orbital coeffiencts represented by the cartesian GTOs with libcint are not normalized.
-    //           In order to meet this requirement, the density tabulation by REST should be non-normalized as well.
-    //           It is the reason we have two subrutines to prepare the cartesian_gto_batch_v04.
-    //           This subroutine prepares the tabulated cartesian gto which will be used directly later with the CARTESIAN gto defined in libcint
+    // Wrapper of `cint_cartesian_gto_batch_v04` × `cint_cart_norm_factor`:
+    // tabulated cartesian GTO consistent with the libcint cartesian
+    // integrals (fac_sp·monomial for l<2, raw monomial for l>=2 — the
+    // per-component normalization libcint skips for l>=2 is impossible to
+    // share across one contraction, so REST keeps libcint's convention
+    // throughout; see AO_AOP_NORM_AUDIT.md §2–§4).
     let mut std_gto = cint_cartesian_gto_batch_v04(a, l, c, r);
 
     std_gto.self_multiple(cint_cart_norm_factor(l as i32, a));
@@ -1227,22 +1136,12 @@ pub fn cint_cartesian_gto_cint_batch_v04(a: f64, l: usize, c:&[f64;3],r:&[[f64;3
     std_gto
 }
 
-pub fn cartesian_gto_1st_cint(a: f64, l: usize, c:&[f64;3],r:&[f64;3]) -> [MatrixFull<f64>;3] {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
-    let mut std_gto_1st = cartesian_gto_1st_std(a, l, c, r);
-    //println!("debug: {:?}, {:?}, {:?}", &std_gto_1st[0].data,&std_gto_1st[1].data,&std_gto_1st[2].data);
-    std_gto_1st.iter_mut().for_each(|std_gto| {
-        std_gto.self_multiple(cint_norm_factor(l as i32, a))
-    });
-    std_gto_1st
-}
 
 pub fn cartesian_gto_1st_cint_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
+    // Spheric-chain evaluator: (norm0 · Fang · monomial) × sqrt(I_L). After
+    // the c2s combination and with the gto_norm-carrying coefficients it
+    // reproduces the libcint spheric basis function exactly
+    // (sqrt(I_L)·norm0·f·c2s = fac_sp·T_libcint; AO_AOP_NORM_AUDIT.md §4).
     let mut std_gto_1st = cartesian_gto_1st_batch_par_v02(a, l, c, r);
     //println!("debug: {:?}, {:?}, {:?}", &std_gto_1st[0].data,&std_gto_1st[1].data,&std_gto_1st[2].data);
     let fac = cint_norm_factor(l as i32, a);
@@ -1254,9 +1153,10 @@ pub fn cartesian_gto_1st_cint_batch(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -
 }
 
 pub fn cartesian_gto_1st_cint_batch_serial(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
+    // Spheric-chain evaluator: (norm0 · Fang · monomial) × sqrt(I_L). After
+    // the c2s combination and with the gto_norm-carrying coefficients it
+    // reproduces the libcint spheric basis function exactly
+    // (sqrt(I_L)·norm0·f·c2s = fac_sp·T_libcint; AO_AOP_NORM_AUDIT.md §4).
     let mut std_gto_1st = cartesian_gto_1st_batch_v02(a, l, c, r);
     //println!("debug: {:?}, {:?}, {:?}", &std_gto_1st[0].data,&std_gto_1st[1].data,&std_gto_1st[2].data);
     let fac = cint_norm_factor(l as i32, a);
@@ -1269,9 +1169,10 @@ pub fn cartesian_gto_1st_cint_batch_serial(a: f64, l: usize, c:&[f64;3],r:&[[f64
 
 ///MARK by IGOR
 pub fn cartesian_gto_1st_cint_batch_serial_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
-    // WARNNING: In libcint, the normalization of radial part should be defined in coefficients.
-    //           In other words, the native GTO integrals from libcint are not normlized with respect to "\int dr^3 r^2 g(r)"
-    //           In consequence, 
+    // Spheric-chain evaluator: (norm0 · Fang · monomial) × sqrt(I_L). After
+    // the c2s combination and with the gto_norm-carrying coefficients it
+    // reproduces the libcint spheric basis function exactly
+    // (sqrt(I_L)·norm0·f·c2s = fac_sp·T_libcint; AO_AOP_NORM_AUDIT.md §4).
     let mut std_gto_1st = cartesian_gto_1st_batch_v03(a, l, c, r);
     //println!("debug: {:?}, {:?}, {:?}", &std_gto_1st[0].data,&std_gto_1st[1].data,&std_gto_1st[2].data);
     let fac = cint_norm_factor(l as i32, a);
@@ -1283,12 +1184,12 @@ pub fn cartesian_gto_1st_cint_batch_serial_v03(a: f64, l: usize, c:&[f64;3],r:&[
 }
 
 pub fn cint_cartesian_gto_1st_cint_batch_serial_v03(a: f64, l: usize, c:&[f64;3],r:&[[f64;3]]) -> Vec<MatrixFull<f64>> {
-    // WARNNING: In libcint, only s and p type gtos are normalized.
-    //           For gtos with l>=2, the normalization is not defined for different combination of lx, ly, and lz.
-    //           In consequence, the density matrix and orbital coeffiencts represented by the cartesian GTOs with libcint are not normalized.
-    //           In order to meet this requirement, the density tabulation by REST should be non-normalized as well.
-    //           It is the reason we have two subrutines to prepare the cartesian_gto_batch_v04.
-    //           This subroutine prepares the tabulated cartesian gto which will be used directly later with the CARTESIAN gto defined in libcint
+    // Wrapper of `cint_cartesian_gto_batch_v04` × `cint_cart_norm_factor`:
+    // tabulated cartesian GTO consistent with the libcint cartesian
+    // integrals (fac_sp·monomial for l<2, raw monomial for l>=2 — the
+    // per-component normalization libcint skips for l>=2 is impossible to
+    // share across one contraction, so REST keeps libcint's convention
+    // throughout; see AO_AOP_NORM_AUDIT.md §2–§4).
     let mut std_gto_1st = cint_cartesian_gto_1st_batch_v03(a, l, c, r);
     let fac = cint_cart_norm_factor(l as i32, a);
     //std_gto_1st.data.iter_mut().for_each(|value| {*value *=fac});

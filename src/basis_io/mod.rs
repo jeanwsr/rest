@@ -345,9 +345,30 @@ impl BasCellRaw {
 }
 
 impl BasCell {
+    /// Rescale the contraction coefficients into libcint's convention
+    /// (derivation and numerical validation: AO_AOP_NORM_AUDIT.md §3–§4):
+    ///
+    /// 1. multiply each primitive coefficient by libcint's radial
+    ///    normalization `CINTgto_norm(L, alpha) = 1/sqrt(int_0^inf
+    ///    r^{2L+2} e^{-2 alpha r^2} dr)` (absorbed into coefficients; the
+    ///    integrals/evaluators themselves tabulate raw polynomials);
+    /// 2. divide contraction x by sqrt(S'_radial) — the diagonal of the
+    ///    libcint *Spheric* overlap of the rescaled contraction (all
+    ///    m-components are equal by rotational invariance). This is the
+    ///    PySCF/Gaussian anchor for both conventions (decision 2026-11-10,
+    ///    closes AO_AOP_NORM_AUDIT.md §5C/§7):
+    ///    * Spheric: every m-component of the contracted shell is
+    ///      unit-normalized — identical to the previous behavior;
+    ///    * Cartesian: the contraction is scaled to unit radial integral, so
+    ///      REST's cartesian overlap equals PySCF's (per-single-primitive
+    ///      diagonal pattern 4*pi*prod(2l_i-1)!!/(2L+1)!!) and D / MO
+    ///      coefficients / Mulliken are directly comparable across programs.
+    ///      (The previous anchor normalized the x^L component instead, which
+    ///      left a per-shell sqrt((2L+1)/4pi) scale relative to PySCF.
+    ///      The anchor is a per-contraction scalar: the tabulated chains and
+    ///      the libcint integrals stay exactly consistent under either
+    ///      choice, and energies are invariant.)
    pub fn basis_normalization(&mut self, cint_type: &CintType) {
-       /// To use libcint properly, we should rescale the coefficients of the contractive GTOs,
-       /// A detailed interpreation is necessary, which, however, is missing at present.
        let mut atm: Vec<Vec<i32>> = vec![vec![1, 20, 1, 23, 0, 0]];
        let mut env: Vec<f64> = vec![0.0_f64; 24]; 
        let bas_start: i32 = 24;
@@ -371,24 +392,12 @@ impl BasCell {
         //println!(" before basis-normalization: self.coefficients {:?}",self.coefficients);
         let mut tmp_exponents = self.exponents.to_owned();
         if self.angular_momentum.len()>1 && self.angular_momentum.len()==self.coefficients.len() {
-            // for Pople basis sets (for example, 6-31G)
-            for i_bas in (0..self.angular_momentum.len()) {
-                let mut tmp_ang = self.angular_momentum[i_bas];
-                let mut tmp_coefficients: Vec<Vec<f64>> = vec![];
-                for coe_vec in self.coefficients.iter() {
-                    let mut tmp_coefficients_column: Vec<f64> = vec![];
-                    coe_vec.iter().enumerate().for_each(|(ix,x)| {
-                        let tmp_value = CINTR2CDATA::gto_norm(tmp_ang as std::os::raw::c_int,
-                                                          self.exponents[ix]);
-                        //println!("gto_norm for {}: {}",tmp_exponents[ix],tmp_value);
-                        env.push(*x*tmp_value);
-                        tmp_coefficients_column.push(*x*tmp_value);
-                        //env.push(*x);
-                        //tmp_coefficients_column.push(*x);
-                    });
-                    tmp_coefficients.push(tmp_coefficients_column);
-                };
-            }
+            // Pople-style multi-l cells (one angular momentum per coefficient
+            // column) must have been split into single-l cells by
+            // `BasCellRaw::parse` before reaching here. The historical branch
+            // computed rescaled coefficients but never stored them, silently
+            // skipping the normalization; fail loudly instead.
+            panic!("Pople-style multi-l BasCell must be split by BasCellRaw::parse before basis_normalization: {:?}", &self);
         } else if self.angular_momentum.len()>1 && self.angular_momentum.len()!=self.coefficients.len(){
             // improper setting for the Pople basis sets
             panic!("Error: the Pople basis set is specified with a wrong format: {:?}", &self);
@@ -419,15 +428,11 @@ impl BasCell {
             let mut cint_data = CINTR2CDATA::new();
             let natm = atm.len() as i32;
             let nbas = bas.len() as i32;
-            let (ang,n_len) = match cint_type {
-                CintType::Cartesian => {let ang = tmp_ang as usize; (ang,(ang+1)*(ang+2)/2)},
-                CintType::Spheric => {let ang = tmp_ang as usize; (ang, ang*2+1)},
-                _ => panic!("The angular momentum is missing for the basis set : {:?}", &self)
-            };
-            //let n_len = (tmp_ang*2+1) as usize;
+            let n_len = (tmp_ang*2+1) as usize;
             cint_data.initial_r2c(&atm, natm, &bas, nbas, &env);
-            //cint_data.set_cint_type(CintType::Spheric);
-            cint_data.set_cint_type(*cint_type);
+            // radial anchor: the renorm overlap is always evaluated with the
+            // Spheric type, for both basis conventions (see the doc above)
+            cint_data.set_cint_type(CintType::Spheric);
             cint_data.cint1e_ovlp_optimizer_rust();
             let num_bas = self.coefficients.len();
             let num_pri = self.exponents.len();
