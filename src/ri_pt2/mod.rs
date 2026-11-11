@@ -19,6 +19,7 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+#[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, check_memory_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
