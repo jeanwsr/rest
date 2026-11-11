@@ -19,6 +19,7 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+#[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, check_memory_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
@@ -438,8 +439,14 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         #[cfg(not(feature = "mpi"))]
         let use_ASlide = false;
 
-        #[cfg(feature = "mpi")]
+        // NOTE: only the 2.5D/ASlide branch *bodies* are cfg-gated to MPI builds;
+        // the if/else chain itself must stay ungated. Gating the whole chain
+        // (as an earlier revision did) compiles away the 1D fallback in non-MPI
+        // builds, leaving pt2_c = 0 for every ri_symm post-SCF job (DH/SBGE2/
+        // SCSRPA families silently reported zero correlation energy).
         if use_25d {
+            #[cfg(feature = "mpi")]
+            {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
@@ -460,8 +467,15 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                     _ => [0.0,0.0,0.0]
                 }
             };
+            }
+            #[cfg(not(feature = "mpi"))]
+            {
+                unreachable!("2.5D dispatch requires the mpi feature")
+            }
         }
         else if (!use_25d) && use_ASlide {
+            #[cfg(feature = "mpi")]
+            {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_aslide(scf_data,mpi_operator).unwrap(),
@@ -482,8 +496,15 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                     _ => [0.0,0.0,0.0]
                 }
             };
+            }
+            #[cfg(not(feature = "mpi"))]
+            {
+                unreachable!("ASlide dispatch requires the mpi feature")
+            }
         }
         else {
+            // 1D fallback: runs with mpi_operator = Some (MPI build) and
+            // mpi_operator = None (single-node / non-MPI builds) alike.
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
