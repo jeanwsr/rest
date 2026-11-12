@@ -3405,6 +3405,24 @@ impl Grids {
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
         let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
+        // Per-atom grid levels: atoms listed in grid_level_map use their own
+        // level (same scale as grid_generation_level), others the global level.
+        let mut atom_levels: Vec<usize> = vec![grid_gen_level; mol.basis4elem.len()];
+        if !mol.ctrl.grid_level_map.is_empty() {
+            for (tmp_i, tmp_lv) in mol.ctrl.grid_level_map.iter() {
+                if *tmp_i > atom_levels.len() {
+                    panic!("grid_level_map: atom index {} is out of range (only {} centers)", tmp_i, atom_levels.len());
+                }
+                atom_levels[tmp_i - 1] = *tmp_lv;
+            }
+            if mol.ctrl.print_level > 0 {
+                println!("Per-atom grid level overrides (grid_level_map):");
+                for (tmp_i, tmp_lv) in mol.ctrl.grid_level_map.iter() {
+                    println!("  atom {:4} -> level {}", tmp_i, tmp_lv);
+                }
+            }
+        }
+
         // obtain system-dependent parameters
         //let mass_charge = get_mass_charge(&mol.geom.elem);
         //let mut proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
@@ -3442,7 +3460,7 @@ impl Grids {
                 hardness,
                 pruning.clone(),
                 rad_grid_method.clone(),
-                grid_gen_level,
+                atom_levels[center_index],
                 radii_adjust,
                 mol.ctrl.use_isdf,
             );
@@ -3456,6 +3474,9 @@ impl Grids {
         });
 
         utilities::timing(&dt0, Some("Generating the grids"));
+        if mol.ctrl.print_level > 0 {
+            println!("DFT integration grid: {} points for {} centers (level {})", num_points, atom_levels.len(), grid_gen_level);
+        }
         let num_threads = rayon::current_num_threads();
         utilities::apply_round_robin_permutation(&mut coordinates, &mut weights, &mut atm_idx, &mut quadrature_weights);
         let parallel_balancing = balancing(coordinates.len(), num_threads);

@@ -45,6 +45,42 @@ pub struct MdParameters {
     #[serde(default)]
     pub out_prefix: String,
 
+    #[serde(default)]
+    pub pdb_template: String,
+
+    /// PDB 轨迹输出间隔（步）。0 表示跟随 traj_interval。
+    #[serde(default)]
+    pub pdb_interval: usize,
+
+    /// PDB 轨迹跳过溶剂（水）原子。
+    #[serde(default)]
+    pub pdb_skip_solvent: bool,
+
+    /// XTC 压缩轨迹输出间隔（步）。0 表示跟随 traj_interval。
+    #[serde(default)]
+    pub xtc_interval: usize,
+
+    /// QM/MM link 对谐波约束（restrained-link，恢复切割键机械连接）。
+    #[serde(default)]
+    pub link_restraints: bool,
+
+    /// NPT Monte-Carlo 体积移动的尝试间隔（步）。
+    #[serde(default = "default_baro_interval")]
+    pub baro_interval: usize,
+
+    /// NPT Monte-Carlo 体积移动的初始尺度（自适应调节）。
+    #[serde(default = "default_baro_scale")]
+    pub baro_scale: f64,
+
+    #[serde(default = "default_pressure")]
+    pub pressure: f64,
+
+    #[serde(default = "default_tau_p")]
+    pub tau_p: f64,
+
+    #[serde(default = "default_compressibility")]
+    pub compressibility: f64,
+
     #[serde(default = "default_restart_output")]
     pub restart_output: String,
 
@@ -56,10 +92,11 @@ pub struct MdParameters {
 
     #[serde(default)]
     pub umbrella: Option<UmbrellaParams>,
+
 }
 
-pub const OUTPUT_SWITCHES: [&str; 6] =
-    ["md_log", "traj", "dipole", "energy_force", "umbrella_csv", "restart"];
+pub const OUTPUT_SWITCHES: [&str; 8] =
+    ["md_log", "traj", "dipole", "energy_force", "umbrella_csv", "restart", "pdb", "xtc"];
 
 fn default_outputs_for(qmmm: bool) -> Vec<String> {
     let mut out = vec![String::from("md_log"), String::from("traj")];
@@ -182,6 +219,12 @@ fn default_box_margin() -> f64 { 11.0 }
 fn default_box_spacing() -> f64 { 3.1 }
 fn default_init_velocities() -> String { String::from("maxwell") }
 fn default_restart_output() -> String { String::from("md_restart") }
+fn default_baro_interval() -> usize { 25 }
+fn default_baro_scale() -> f64 { 0.02 }
+fn default_pressure() -> f64 { 1.01325 }
+fn default_tau_p() -> f64 { 2.0 }
+fn default_compressibility() -> f64 { 4.5e-5 }
+
 fn default_water_model() -> String { String::from("tip3p") }
 fn default_mm_cutoff() -> f64 { 10.0 }
 fn default_pbc() -> bool { true }
@@ -246,6 +289,16 @@ impl Default for MdParameters {
             traj_interval: one(),
             equil_steps: 0,
             out_prefix: String::new(),
+            pdb_template: String::new(),
+            pdb_interval: 0,
+            pdb_skip_solvent: false,
+            xtc_interval: 0,
+            link_restraints: false,
+            baro_interval: default_baro_interval(),
+            baro_scale: default_baro_scale(),
+            pressure: default_pressure(),
+            tau_p: default_tau_p(),
+            compressibility: default_compressibility(),
             restart_output: default_restart_output(),
             outputs: default_outputs(),
             qmmm: None,
@@ -338,6 +391,13 @@ impl MdParameters {
                 ));
             }
         }
+        if self.ensemble.eq("npt") {
+            out.push_str(&format!(
+                "\nNPT barostat: isotropic, P = {} bar (1 bar = target), tau_p = {} ps, \
+                 compressibility = {} bar^-1",
+                self.pressure, self.tau_p, self.compressibility
+            ));
+        }
         out.push_str(&format!("\nMD outputs: {}", self.outputs.join(", ")));
         out
     }
@@ -378,6 +438,8 @@ const MD_KEYS: &[&str] = &[
     "umbrella_kappa", "umbrella_potential", "umbrella_cv",
     "umbrella_sum_kappa", "umbrella_sum_center",
     "restart_input",
+    "pdb_template", "pdb_interval", "pdb_skip_solvent", "xtc_interval", "link_restraints", "baro_interval", "baro_scale",
+    "pressure", "tau_p", "compressibility",
 ];
 
 pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<MdParameters>> {
@@ -429,6 +491,16 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
     if let Some(v) = get_num("opt_fmax") { p.opt_fmax = v; }
     if let Some(v) = get_u64("opt_steps") { p.opt_steps = v as usize; }
     if let Some(v) = get_str("out_prefix") { p.out_prefix = v; }
+    if let Some(v) = get_str("pdb_template") { p.pdb_template = v; }
+    if let Some(v) = get_u64("pdb_interval") { p.pdb_interval = v as usize; }
+    if let Some(v) = get_bool("pdb_skip_solvent") { p.pdb_skip_solvent = v; }
+    if let Some(v) = get_bool("link_restraints") { p.link_restraints = v; }
+    if let Some(v) = get_u64("xtc_interval") { p.xtc_interval = v as usize; }
+    if let Some(v) = get_u64("baro_interval") { p.baro_interval = v as usize; }
+    if let Some(v) = get_num("baro_scale") { p.baro_scale = v; }
+    if let Some(v) = get_num("pressure") { p.pressure = v; }
+    if let Some(v) = get_num("tau_p") { p.tau_p = v; }
+    if let Some(v) = get_num("compressibility") { p.compressibility = v; }
     if let Some(v) = get_str("restart_output") { p.restart_output = v; }
     let mut outputs_explicit: Option<Vec<String>> = None;
     if merged.get("outputs").is_some() {
@@ -470,9 +542,11 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
         qmmm.build_system = build_system;
         if let Some(v) = get_str("qmmm_water_model") {
             let lv = v.to_lowercase();
-            if lv != "tip3p" {
+            if !["tip3p", "opc3"].contains(&lv.as_str()) {
                 return Err(anyhow::anyhow!(
-                    "qmmm_water_model: only \"tip3p\" is currently supported, got \"{}\"", v));
+                    "qmmm_water_model: supported models are \"tip3p\" and \"opc3\", got \"{}\"",
+                    v
+                ));
             }
             qmmm.water_model = lv;
         }
@@ -609,12 +683,28 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
 
     if !p.ensemble.eq("nvt")
         && !p.ensemble.eq("nve")
+        && !p.ensemble.eq("npt")
         && !p.ensemble.eq("opt")
         && !p.ensemble.eq("sp")
         && !p.ensemble.eq("singlepoint")
     {
         return Err(anyhow::anyhow!(
-            "md ensemble must be \"nvt\", \"nve\", \"opt\" or \"sp\", got \"{}\"", p.ensemble));
+            "md ensemble must be \"nvt\", \"nve\", \"npt\", \"opt\" or \"sp\", got \"{}\"",
+            p.ensemble));
+    }
+    if p.ensemble.eq("npt") {
+        if !(p.pressure.is_finite()) {
+            return Err(anyhow::anyhow!("md pressure must be finite, got {}", p.pressure));
+        }
+        if p.tau_p <= 0.0 {
+            return Err(anyhow::anyhow!("md tau_p must be positive, got {}", p.tau_p));
+        }
+        if p.compressibility <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "md compressibility must be positive (1/bar), got {}",
+                p.compressibility
+            ));
+        }
     }
     if p.opt_fmax <= 0.0 {
         return Err(anyhow::anyhow!("md opt_fmax must be positive, got {}", p.opt_fmax));

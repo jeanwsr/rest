@@ -202,6 +202,16 @@ pub struct InputKeywords {
     pub basis_path: String,
     #[pyo3(get, set)]
     pub basis_type: String,
+    /// Per-atom basis-set overrides: (1-based atom index, basis-set name).
+    /// Atoms not listed fall back to `basis_path`. Indices run over `[geom]`
+    /// atoms first, then ghost-basis atoms.
+    pub basis_map: Vec<(usize, String)>,
+    /// Per-atom auxiliary basis-set overrides (grammar identical to `basis_map`).
+    /// Atoms not listed fall back to `auxbas_path`.
+    pub auxbas_map: Vec<(usize, String)>,
+    /// Per-atom DFT grid level overrides (0-9, same scale as `grid_generation_level`).
+    /// Atoms not listed fall back to `grid_generation_level`.
+    pub grid_level_map: Vec<(usize, usize)>,
     #[pyo3(get, set)]
     pub auxbas_path: String,
     #[pyo3(get, set)]
@@ -519,6 +529,90 @@ pub struct InputKeywords {
     pub analdrv_tasks: Vec<AnalDrvTask>,
 }
 
+/// Parse the shared "i" / "i-j" (1-based, inclusive) atom-range key grammar.
+fn parse_atm_range_key(tmp_key: &str, tmp_keyword: &str) -> (usize, usize) {
+    let tmp_spec: Vec<&str> = tmp_key.split('-').map(|s| s.trim()).collect();
+    let (tmp_start, tmp_end) = match tmp_spec.as_slice() {
+        [tmp_a] => {
+            let tmp_i: usize = tmp_a.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            (tmp_i, tmp_i)
+        },
+        [tmp_a, tmp_b] => {
+            let tmp_i: usize = tmp_a.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            let tmp_j: usize = tmp_b.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            (tmp_i, tmp_j)
+        },
+        _ => panic!("{}: invalid atom spec '{}', use 'i' or 'i-j' (1-based, inclusive)", tmp_keyword, tmp_key),
+    };
+    if tmp_start == 0 || tmp_end < tmp_start {
+        panic!("{}: invalid atom range '{}', indices are 1-based with start <= end", tmp_keyword, tmp_key);
+    }
+    (tmp_start, tmp_end)
+}
+
+/// Sort by atom index and reject overlapping keys/ranges.
+fn dedup_atm_map<T>(mut out: Vec<(usize, T)>, tmp_keyword: &str) -> Vec<(usize, T)> {
+    out.sort_by_key(|(tmp_i, _)| *tmp_i);
+    if out.windows(2).any(|w| w[0].0 == w[1].0) {
+        panic!("{}: duplicated atom index (overlapping keys/ranges)", tmp_keyword);
+    }
+    out
+}
+
+/// Parse the shared grammar of `basis_map` / `auxbas_map`: a table mapping
+/// 1-based atom indices (or inclusive "i-j" ranges) to basis-set names.
+pub fn parse_atm_basis_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, String)> {
+    match tmp_val {
+        serde_json::Value::Object(tmp_map) => {
+            let mut out: Vec<(usize, String)> = Vec::new();
+            for (tmp_key, tmp_v) in tmp_map.iter() {
+                let tmp_name = match tmp_v {
+                    serde_json::Value::String(tmp_s) => tmp_s.clone(),
+                    other => panic!("{}: the value for atom spec '{}' must be a string basis-set name, got {}", tmp_keyword, tmp_key, other),
+                };
+                let (tmp_start, tmp_end) = parse_atm_range_key(tmp_key, tmp_keyword);
+                for tmp_i in tmp_start..=tmp_end {
+                    out.push((tmp_i, tmp_name.clone()));
+                }
+            }
+            dedup_atm_map(out, tmp_keyword)
+        },
+        serde_json::Value::Null => Vec::new(),
+        other => panic!("{} must be a table mapping atom indices to basis-set names, got {}", tmp_keyword, other),
+    }
+}
+
+/// Parse `grid_level_map`: a table mapping 1-based atom indices (or inclusive
+/// "i-j" ranges) to DFT grid generation levels (0-9, same scale as
+/// `grid_generation_level`).
+pub fn parse_atm_grid_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, usize)> {
+    match tmp_val {
+        serde_json::Value::Object(tmp_map) => {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            for (tmp_key, tmp_v) in tmp_map.iter() {
+                let tmp_lv = match tmp_v {
+                    serde_json::Value::Number(tmp_n) => {
+                        let tmp_u = tmp_n.as_u64().unwrap_or_else(|| panic!("{}: grid level must be a non-negative integer, got {}", tmp_keyword, tmp_v));
+                        tmp_u as usize
+                    },
+                    serde_json::Value::String(tmp_s) => tmp_s.trim().parse().unwrap_or_else(|_| panic!("{}: invalid grid level '{}'", tmp_keyword, tmp_s)),
+                    other => panic!("{}: grid level must be an integer, got {}", tmp_keyword, other),
+                };
+                if tmp_lv > 9 {
+                    panic!("{}: grid level {} out of range (0-9)", tmp_keyword, tmp_lv);
+                }
+                let (tmp_start, tmp_end) = parse_atm_range_key(tmp_key, tmp_keyword);
+                for tmp_i in tmp_start..=tmp_end {
+                    out.push((tmp_i, tmp_lv));
+                }
+            }
+            dedup_atm_map(out, tmp_keyword)
+        },
+        serde_json::Value::Null => Vec::new(),
+        other => panic!("{} must be a table mapping atom indices to grid levels, got {}", tmp_keyword, other),
+    }
+}
+
 impl Default for InputKeywords {
     fn default() -> Self {
         InputKeywords::init_ctrl()
@@ -539,6 +633,9 @@ impl InputKeywords {
             // Keywords for (aux)-basis sets
             basis_path: String::from("def2-SVP"),
             basis_type: String::from("spheric"),
+            basis_map: Vec::new(),
+            auxbas_map: Vec::new(),
+            grid_level_map: Vec::new(),
             auxbas_path: String::from("def2-SV(P)-JKFIT"),
             auxbas_type: String::from("spheric"),
             use_auxbas: true,
@@ -1029,6 +1126,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level> 0 {println!("The {}-GTO basis set is taken from {}", tmp_input.basis_type,tmp_input.basis_path)};
 
+            // Per-atom basis overrides: basis_map = { "1" = "def2-tzvp", "5-8" = "cc-pvtz" }
+            // Keys are 1-based atom indices or inclusive ranges; values are basis-set
+            // names resolved like `basis_path` (pool lookup / BSE auto-download).
+            tmp_input.basis_map = parse_atm_basis_map(tmp_ctrl.get("basis_map").unwrap_or(&serde_json::Value::Null), "basis_map");
+            if !tmp_input.basis_map.is_empty() && tmp_input.basis_path == "chkfile" {
+                panic!("basis_map is not supported together with basis_path = \"chkfile\"");
+            }
+
             tmp_input.pruning = match tmp_ctrl.get("pruning").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
                 other => {String::from("nwchem")} //default prune method: sg1
@@ -1152,6 +1257,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             //if tmp_input.use_auxbas && tmp_input.print_level>0 {
             //    println!("The {}-GTO auxiliary basis set is taken from {}", tmp_input.auxbas_type,tmp_input.auxbas_path)
             //};
+
+            // Per-atom auxiliary basis overrides (grammar identical to basis_map)
+            tmp_input.auxbas_map = parse_atm_basis_map(tmp_ctrl.get("auxbas_map").unwrap_or(&serde_json::Value::Null), "auxbas_map");
             // ===============================================
             //  Keywords for Gradient calculation
             // ==============================================
@@ -1460,6 +1568,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
                 other => {3_usize},
             };
+
+            // Per-atom grid level overrides: grid_level_map = { "56-555" = 0 }
+            tmp_input.grid_level_map = parse_atm_grid_map(tmp_ctrl.get("grid_level_map").unwrap_or(&serde_json::Value::Null), "grid_level_map");
 
             tmp_input.even_tempered_basis = match tmp_ctrl.get("even_tempered_basis").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},

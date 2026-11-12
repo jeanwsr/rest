@@ -13,7 +13,11 @@ use std::collections::HashMap;
 /// thresholds, independently of the molecular settings, so that the atomic guess does not move
 /// when the molecular SCF is retuned. Used by [`initial_guess_from_sad`] for the density and by
 /// [`crate::initial_guess::pao`] for the occupied orbitals.
-pub(crate) fn prepare_atomic_scf(mol: &Molecule, ielem: &String) -> SCF {
+pub(crate) fn prepare_atomic_scf(
+    mol: &Molecule,
+    ielem: &String,
+    basis_override: Option<&String>,
+) -> SCF {
     if mol.ctrl.print_level > 0 {
         println!("\n=======================");
         println!("Generating SAD for atom: {}", ielem);
@@ -23,6 +27,11 @@ pub(crate) fn prepare_atomic_scf(mol: &Molecule, ielem: &String) -> SCF {
     let mut atom_ctrl = InputKeywords::init_ctrl();
     atom_ctrl.xc = String::from("hf");
     atom_ctrl.basis_path = mol.ctrl.basis_path.clone();
+    // Same element may use a different basis on specific atoms (ctrl.basis_map);
+    // the atomic guess must be generated in that same basis.
+    if let Some(b) = basis_override {
+        atom_ctrl.basis_map = vec![(1usize, b.clone())];
+    }
     atom_ctrl.basis_type = mol.ctrl.basis_type.clone();
     atom_ctrl.auxbas_path = mol.ctrl.auxbas_path.clone();
     atom_ctrl.auxbas_type = mol.ctrl.auxbas_type.clone();
@@ -71,10 +80,21 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
     //let mut dms_beta: Vec<MatrixFull<f64>> = vec![];
     let mut atom_dms: HashMap<String, Vec<MatrixFull<f64>>> = HashMap::new();
 
-    mol.geom.elem.iter().for_each(|ielem| {
-        if let None = &mut atom_dms.get(&ielem.clone()) {
+    // Same element may carry different basis sets (ctrl.basis_map), so atomic
+    // SAD densities are cached and block-diagonalized per (element, basis) pair.
+    let basis_name_of = |atm_index: usize| -> String {
+        match mol.ctrl.basis_map.binary_search_by_key(&(atm_index + 1), |(tmp_i, _)| *tmp_i) {
+            Ok(tmp_pos) => mol.ctrl.basis_map[tmp_pos].1.clone(),
+            Err(_) => mol.ctrl.basis_path.clone(),
+        }
+    };
 
-            let mut atom_scf = prepare_atomic_scf(mol, ielem);
+    mol.geom.elem.iter().enumerate().for_each(|(atm_index, ielem)| {
+        let sad_key = format!("{}|{}", ielem, basis_name_of(atm_index));
+        if let None = &mut atom_dms.get(&sad_key) {
+
+            let mut atom_scf =
+                prepare_atomic_scf(mol, ielem, Some(&basis_name_of(atm_index)));
 
             //println!("debug: elem prepared in this loop: {}, size: {:?}", ielem, atom_scf.density_matrix[0].size());
 
@@ -96,7 +116,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
                 dms.push(atom_scf.density_matrix[1].clone());
             }
 
-            atom_dms.insert(ielem.clone(),dms);
+            atom_dms.insert(sad_key, dms);
             
             if mol.ctrl.print_level > 0 {
                 println!("SAD generation for {} complete.", &ielem);
@@ -107,7 +127,10 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
     // reset the omp_num_threads to be the correct one
     //utilities::omp_set_num_threads_wrapper(mol.ctrl.num_threads.unwrap());
 
-    let (dms_alpha, dms_beta) = block_diag_specific(&atom_dms, &mol.geom.elem);
+    let atom_keys: Vec<String> = (0..mol.geom.elem.len())
+        .map(|tmp_i| format!("{}|{}", mol.geom.elem[tmp_i], basis_name_of(tmp_i)))
+        .collect();
+    let (dms_alpha, dms_beta) = block_diag_specific(&atom_dms, &atom_keys);
 
     if mol.geom.ghost_bs_elem.len() == 0 {
         if mol.spin_channel == 1 {
@@ -141,13 +164,13 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
     }   
 }
 
-pub fn block_diag_specific(atom_dms: &HashMap<String,Vec<MatrixFull<f64>>>,elem: &Vec<String>) -> (MatrixFull<f64>, MatrixFull<f64>) {
+pub fn block_diag_specific(atom_dms: &HashMap<String,Vec<MatrixFull<f64>>>, atom_keys: &Vec<String>) -> (MatrixFull<f64>, MatrixFull<f64>) {
     let mut atom_size = 0;
-    elem.iter().for_each(|ielem| {
-        if let Some(dm) = &atom_dms.get(ielem) {
+    atom_keys.iter().for_each(|ikey| {
+        if let Some(dm) = &atom_dms.get(ikey) {
             atom_size += &dm[0].size[0];
         } else {
-            panic!("Error: Unknown elemement ({}), for which the density matrix is not yet prepared", ielem);
+            panic!("Error: Unknown atom key ({}), for which the density matrix is not yet prepared", ikey);
         }
     });
     let mut dms_alpha = MatrixFull::new([atom_size;2], 0.0);
@@ -155,8 +178,8 @@ pub fn block_diag_specific(atom_dms: &HashMap<String,Vec<MatrixFull<f64>>>,elem:
     //let dms_alpha = dms.get_mut(0).unwrap();
     //let dms_beta = dms.get_mut(1).unwrap();
     let mut ao_index = 0;
-    elem.iter().for_each(|ielem| {
-        if let Some(dm_atom_vec) = &atom_dms.get(ielem) {
+    atom_keys.iter().for_each(|ikey| {
+        if let Some(dm_atom_vec) = &atom_dms.get(ikey) {
             let dm_atom_alpha = dm_atom_vec.get(0).unwrap();
             let dm_atom_beta  = dm_atom_vec.get(1).unwrap();
             let loc_length = dm_atom_alpha.size[0];

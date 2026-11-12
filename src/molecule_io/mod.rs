@@ -587,6 +587,50 @@ impl Molecule {
         let mut auxbas_info: Vec<BasInfo> = vec![];
         let mut aux_cint_fdqc: Vec<Vec<usize>> = vec![];
 
+        if !ctrl.auxbas_map.is_empty() {
+            if ctrl.eri_type.to_lowercase().contains("analytic") {
+                println!("WARNING: auxbas_map is set but eri_type = analytic does not use auxiliary basis; auxbas_map is ignored");
+            }
+            let mut all_elem: Vec<String> = geom.elem.clone();
+            all_elem.extend(geom.ghost_bs_elem.iter().cloned());
+            let mut by_name: std::collections::BTreeMap<&String, Vec<String>> = std::collections::BTreeMap::new();
+            for (tmp_i, tmp_name) in ctrl.auxbas_map.iter() {
+                by_name.entry(tmp_name).or_default().push(all_elem[tmp_i - 1].clone());
+            }
+            let rest_basis_dir = crate::ctrl_io::path_util::get_rest_basis_dir();
+            for (tmp_name, tmp_elems) in by_name {
+                let tmp_dir = crate::ctrl_io::path_util::get_valid_basis_path(tmp_name, &rest_basis_dir, "auxiliary basis");
+                let tmp_local = local_element_checker(&tmp_dir);
+                let tmp_missing: Vec<String> = tmp_elems.iter().filter(|tmp_e| !tmp_local.contains(tmp_e)).cloned().collect();
+                if !tmp_missing.is_empty() {
+                    let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
+                    let cap = re.captures(&tmp_dir).unwrap();
+                    let auxbas_name = cap.name("basis").unwrap().as_str().to_string();
+                    if check_basis_name(&auxbas_name) {
+                        bse_downloader::bse_auxbas_getter_v2(&auxbas_name, &geom, &tmp_dir, &tmp_missing, ctrl.print_level);
+                    } else if ctrl.print_level > 0 {
+                        println!("auxbas_map: missing local auxiliary basis files for {:?} in {} and auto-download is unavailable", &tmp_missing, &tmp_dir);
+                    }
+                }
+            }
+            if ctrl.print_level > 0 {
+                println!("Per-atom auxiliary basis overrides (auxbas_map):");
+                for (tmp_i, tmp_name) in ctrl.auxbas_map.iter() {
+                    println!("  atom {:4} -> {}", tmp_i, tmp_name);
+                }
+            }
+        };
+        let rest_basis_dir_aux = crate::ctrl_io::path_util::get_rest_basis_dir();
+        let aux_dir_for_atm = |atm_index_1based: usize| -> String {
+            match ctrl.auxbas_map.binary_search_by_key(&atm_index_1based, |(tmp_i, _)| *tmp_i) {
+                Ok(tmp_pos) => {
+                    let tmp_name = &ctrl.auxbas_map[tmp_pos].1;
+                    crate::ctrl_io::path_util::get_valid_basis_path(tmp_name, &rest_basis_dir_aux, "auxiliary basis")
+                },
+                Err(_) => ctrl.auxbas_path.clone(),
+            }
+        };
+
         let ctrl_elem = ctrl_element_checker(geom);
         let local_elem = local_element_checker(&ctrl.auxbas_path);
         //if ctrl.print_level>0 {
@@ -633,7 +677,7 @@ impl Molecule {
         //import the basis set of atoms and ghost atoms one by one
         let elem_tot = geom.elem.clone().into_iter().chain(geom.ghost_bs_elem.clone().into_iter()).collect::<Vec<_>>();
         for (atm_index, atm_elem) in elem_tot.iter().enumerate() {
-            let tmp_path = format!("{}/{}.json",&ctrl.auxbas_path, &atm_elem);
+            let tmp_path = format!("{}/{}.json",&aux_dir_for_atm(atm_index + 1), &atm_elem);
             let mut tmp_basis = match &etb {
                 None => Basis4Elem::parse_json_from_file(tmp_path,&cint_type).unwrap(),
                 Some(x) => { match x.elements.get(atm_elem) {
@@ -890,6 +934,38 @@ impl Molecule {
                 match matched {
                     Some(_) => panic!("{} may not be a valid basis set name, similar name is {}", basis_name, matched.unwrap()),
                     None => panic!("{} may not be a valid basis set name, please check.", basis_name),
+                }
+            }
+        };
+
+        if !ctrl.basis_map.is_empty() {
+            let mut all_elem: Vec<String> = geom.elem.clone();
+            all_elem.extend(geom.ghost_bs_elem.iter().cloned());
+            let mut by_name: std::collections::BTreeMap<&String, Vec<String>> = std::collections::BTreeMap::new();
+            for (tmp_i, tmp_name) in ctrl.basis_map.iter() {
+                let tmp_elem = crate::geom_io::formated_element_name(&all_elem[tmp_i - 1]);
+                by_name.entry(tmp_name).or_default().push(tmp_elem);
+            }
+            let rest_basis_dir = crate::ctrl_io::path_util::get_rest_basis_dir();
+            for (tmp_name, tmp_elems) in by_name {
+                let tmp_dir = crate::ctrl_io::path_util::get_valid_basis_path(tmp_name, &rest_basis_dir, "basis");
+                let tmp_local = local_element_checker(&tmp_dir);
+                let tmp_missing: Vec<String> = tmp_elems.iter().filter(|tmp_e| !tmp_local.contains(tmp_e)).cloned().collect();
+                if !tmp_missing.is_empty() {
+                    let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
+                    let cap = re.captures(&tmp_dir).unwrap();
+                    let basis_name = cap.name("basis").unwrap().as_str().to_string();
+                    if check_basis_name(&basis_name) {
+                        bse_downloader::bse_basis_getter_v2(&basis_name, &geom, &tmp_dir, &tmp_missing);
+                    } else if ctrl.print_level > 0 {
+                        println!("basis_map: missing local basis files for {:?} in {} and auto-download is unavailable", &tmp_missing, &tmp_dir);
+                    }
+                }
+            }
+            if ctrl.print_level > 0 {
+                println!("Per-atom basis overrides (basis_map):");
+                for (tmp_i, tmp_name) in ctrl.basis_map.iter() {
+                    println!("  atom {:4} -> {}", tmp_i, tmp_name);
                 }
             }
         };
