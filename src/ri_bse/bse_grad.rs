@@ -3043,6 +3043,13 @@ impl<'a> BseGradEngine<'a> {
             .max()
             .unwrap_or(nmo)
             .max(1)
+            // The packed pair covector must also cover the complete active
+            // window even when every amplitude weight happens to vanish at a
+            // particular (near-degenerate, single-configuration) geometry.
+            // Without this floor `add_into_packed` can address pairs outside
+            // the banded buffer.
+            .max(occ_start + nocc_act)
+            .max(vir_start + nvir)
             .min(nmo);
         let mut scr = self.gw.qp_pullback_scratch_banded(nk, nrow_pair);
         let mut col0 = 0usize;

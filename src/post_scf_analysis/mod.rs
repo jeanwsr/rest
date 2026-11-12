@@ -780,7 +780,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 qp_ctrl.gradient_state
             );
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
-            let (grads, omegas, state, tracked_x, tracked_y, tracked_t,
+            let (grads, state, omega_selected, tracked_x, tracked_y, tracked_t,
                  grad_group, geom_now, ao_mode_this_step,
                  used_occ_start, used_vir_end, active_nocc, active_nvir) = {
                 let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
@@ -1085,20 +1085,30 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 // alone.  A degenerate manifold is the exception: its gradient is
                 // only meaningful as the manifold average, so every member is
                 // assembled and the engine averages them.
+                // The energy of the state we actually differentiate.  Read it
+                // from the full solved spectrum (`bse.excitation_energies()`),
+                // never from the `omegas` that `analytic_gradients` returns:
+                // that vector only contains the *assembled* roots, so it has
+                // length 1 when `gradient_state > 0` and was the source of the
+                // `omegas[state]` out-of-bounds panic.
+                let omega_selected = bse.excitation_energies()[selected_state];
                 let only = grad_group.is_none()
                     && (qp_ctrl.gradient_only_state || is_excited_state_opt)
                     && selected_state < bse.roots.len();
                 if let Some(group) = &grad_group {
                     bse.set_grad_roots(Some(group.clone()));
                 } else if only {
+                    // Assemble the gradient of the requested state only; the
+                    // lower roots solved for the spectrum/state tracking must
+                    // not enter the expensive per-root pullback.
                     bse.set_grad_roots(Some(vec![selected_state]));
                 }
-                let (grads, omegas) = bse.analytic_gradients();
+                let (grads, _selected_omegas) = bse.analytic_gradients();
                 let used_occ_start = bse.screen.occ_start;
                 let used_vir_end = bse.screen.vir_start + bse.screen.nvir;
                 let active_nocc = bse.screen.nocc;
                 let active_nvir = bse.screen.nvir;
-                (grads, omegas, selected_state, tracked_x, tracked_y, tracked_t,
+                (grads, selected_state, omega_selected, tracked_x, tracked_y, tracked_t,
                  grad_group, geom_now, ao_mode_this_step,
                  used_occ_start, used_vir_end, active_nocc, active_nvir)
             };
@@ -1134,7 +1144,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             };
             println!(
                 "BSE analytic gradient requested for root {state} (omega = {:.12} Ha = {:.6} eV)",
-                omegas[state], omegas[state] * 27.211386245988
+                omega_selected, omega_selected * 27.211386245988
             );
             // Keep the active space fixed for the rest of an optimization, and
             // remember the state so the next geometry can follow it.
@@ -1178,7 +1188,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             );
             scf_data.energies.insert(
                 "bse_excited_state_omega".to_string(),
-                vec![omegas[state]],
+                vec![omega_selected],
             );
             scf_data.energies.insert(
                 "bse_excited_state_index".to_string(),
