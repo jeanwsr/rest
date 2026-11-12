@@ -190,11 +190,6 @@ fn is_finite_complex(value: Complex64) -> bool {
 /// Get Pade sampling indices matching PySCF's `_get_ac_idx`.
 /// Selects `npts` indices from [1..nw+1] (skipping ω=0) with decreasing step sizes.
 pub fn get_ac_idx(nw: usize, npts: usize, step_ratio: f64) -> Vec<usize> {
-    assert!(
-        npts <= nw,
-        "get_ac_idx: ac_num_samples ({npts}) must not exceed the number of \
-         frequency points ({nw})"
-    );
     let mut steps: Vec<f64> = (0..npts)
         .map(|i| 1.0 + (step_ratio - 1.0) * i as f64 / (npts.max(2) - 1) as f64)
         .collect();
@@ -211,28 +206,29 @@ pub fn get_ac_idx(nw: usize, npts: usize, step_ratio: f64) -> Vec<usize> {
         cumsum.push(acc);
     }
     let offset = 1.0_f64 - cumsum[0];
-    let mut idx: Vec<usize> = cumsum.iter().map(|c| (c + offset).round() as usize).collect();
-
-    // The rounded cumulative grid can repeat a node when `npts` is a
-    // substantial fraction of `nw` (observed for `ac_num_samples >= 24`).
-    // A Padé fit needs strictly distinct frequencies, so enforce strict
-    // monotonicity; if shifting would run past the last grid point, fall back
-    // to an evenly spaced (still strictly increasing) set.
-    for i in 1..npts {
-        if idx[i] <= idx[i - 1] {
-            idx[i] = idx[i - 1] + 1;
+    // Strictly increasing indices: rounding onto a grid of only `nw` points
+    // produces duplicate sample frequencies whenever `npts` is a sizeable
+    // fraction of `nw`, and the Pade builder rejects duplicates.  If the grid
+    // runs out before `npts` distinct nodes are available, use the nodes that
+    // do exist (the requested `ac_num_samples` is an upper bound).
+    let mut out: Vec<usize> = Vec::with_capacity(npts);
+    for &c in &cumsum {
+        let mut v = (c + offset).round() as usize;
+        if let Some(&last) = out.last() {
+            if v <= last {
+                v = last + 1;
+            }
         }
-    }
-    if idx[npts - 1] > nw {
-        for i in 0..npts {
-            idx[i] = 1 + ((nw - 1) * i) / (npts - 1);
+        if v > nw {
+            break;
         }
+        out.push(v);
     }
-    debug_assert!(idx.windows(2).all(|w| w[0] < w[1]), "AC indices must be strictly increasing");
-    debug_assert!(idx[0] >= 1 && idx[npts - 1] <= nw, "AC indices out of range");
-    idx
+    if out.is_empty() {
+        out.push(1);
+    }
+    out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,11 +239,22 @@ mod tests {
 
     #[test]
     fn ac_indices_are_strictly_increasing() {
-        for &(nw, npts) in &[(51usize, 24usize), (51, 30), (201, 24), (201, 40), (1000, 100)] {
+        for &(nw, npts) in &[
+            (51usize, 24usize),
+            (51, 30),
+            (201, 24),
+            (201, 40),
+            (1000, 100),
+            (20, 24),
+        ] {
             let idx = get_ac_idx(nw, npts, 2.0 / 3.0);
-            assert_eq!(idx.len(), npts);
-            assert!(idx[0] >= 1 && idx[npts - 1] <= nw, "range: {idx:?} for nw={nw}");
+            assert!(idx.len() <= nw, "too many: {idx:?} for nw={nw}");
+            assert!(!idx.is_empty());
+            assert!(idx[0] >= 1 && *idx.last().unwrap() <= nw, "range: {idx:?} for nw={nw}");
             assert!(idx.windows(2).all(|w| w[0] < w[1]), "duplicate: {idx:?} for nw={nw}");
+            if npts <= nw {
+                assert_eq!(idx.len(), npts);
+            }
         }
     }
 
