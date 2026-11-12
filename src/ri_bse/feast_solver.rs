@@ -498,7 +498,10 @@ fn rayleigh_ritz_refine(
 
 /// Solve generalized eigenvalue problem H·C = S·C·E via Cholesky of S.
 /// Only called for non-TDA where basis vectors are not orthonormal.
-/// Returns (eigenvalues, Some(eigenvectors)) on success, or (empty, None) on failure.
+///
+/// `_dsyevd` panics on a non-zero LAPACK `info` itself (its third return value is the matrix
+/// dimension, not `info`), so a diagonalization failure aborts the run instead of returning
+/// `None`; the `Option` in the return type only ever carries `Some` and is kept for the callers.
 fn solve_generalized_eigenproblem(
     h: &MatrixFull<f64>,
     s: &mut MatrixFull<f64>,
@@ -510,12 +513,9 @@ fn solve_generalized_eigenproblem(
     }));
 
     if cholesky_ok.is_err() {
-        // S not SPD — fall back to dsyevd on H
-        let (psi_opt, evals, info) = _dsyevd(h, 'V');
-        if info != 0 {
-            eprintln!("Warning: Rayleigh-Ritz dsyevd fallback failed with info={}", info);
-            return (Vec::new(), None);
-        }
+        // S is not positive definite, so the metric transform is unavailable: diagonalize H
+        // directly, which is what the caller can still use.
+        let (psi_opt, evals, _) = _dsyevd(h, 'V');
         return (evals, Some(psi_opt.unwrap()));
     }
 
@@ -529,11 +529,8 @@ fn solve_generalized_eigenproblem(
     let l_inv = match _dinverse(&l_mat) {
         Some(m) => m,
         None => {
-            let (psi_opt, evals, info) = _dsyevd(h, 'V');
-            if info != 0 {
-                eprintln!("Warning: Rayleigh-Ritz dsyevd fallback failed with info={}", info);
-                return (Vec::new(), None);
-            }
+            // Singular L: same fallback as above.
+            let (psi_opt, evals, _) = _dsyevd(h, 'V');
             return (evals, Some(psi_opt.unwrap()));
         }
     };
@@ -543,17 +540,7 @@ fn solve_generalized_eigenproblem(
     let tmp = _dgemm_scaled(&l_inv, 'N', h, 'N', 1.0);
     let h_trans = _dgemm_scaled(&tmp, 'N', &l_inv_t, 'N', 1.0);
 
-    let (psi_trans_opt, evals, info) = _dsyevd(&h_trans, 'V');
-    if info != 0 {
-        eprintln!("Warning: Rayleigh-Ritz dsyevd on transformed H failed with info={}", info);
-        // Last resort: try dsyevd on original H
-        let (psi_opt, evals2, info2) = _dsyevd(h, 'V');
-        if info2 != 0 {
-            eprintln!("Warning: Rayleigh-Ritz dsyevd last-resort failed with info={}", info2);
-            return (Vec::new(), None);
-        }
-        return (evals2, Some(psi_opt.unwrap()));
-    }
+    let (psi_trans_opt, evals, _) = _dsyevd(&h_trans, 'V');
     let psi_trans = psi_trans_opt.unwrap();
 
     // Transform back: C = L⁻ᵀ · Ψ_trans

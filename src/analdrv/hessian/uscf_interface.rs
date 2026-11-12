@@ -2,7 +2,7 @@ use crate::analdrv::prelude::*;
 use super::print_hessian_and_timing;
 use crate::analdrv::hessian::rscf_interface::{scf_proton_charges, scf_skeleton_nimatmul};
 use crate::analdrv::response::rresp_interface::scf_jk_factors;
-use crate::analdrv::response::uresp_interface::{scf_xc_func_list_uks, URespSCF};
+use crate::analdrv::response::uresp_interface::URespSCF;
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dftd::hess::HessDFTD;
@@ -25,25 +25,42 @@ pub fn uscf_hess_interface<'a>(
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
+    // CP-SCF expects the occupied orbitals in the leading `0..nocc` block (per spin).
+    let perm = [
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]),
+        crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[1]),
+    ];
     let mo_coeff = {
         let mo_coeff_0 = &scf_data.eigenvectors[0];
         let mo_coeff_1 = &scf_data.eigenvectors[1];
-        let mo_coeff_0 = rt::asarray((&mo_coeff_0.data, mo_coeff_0.size, &device)).into_contig(ColMajor);
-        let mo_coeff_1 = rt::asarray((&mo_coeff_1.data, mo_coeff_1.size, &device)).into_contig(ColMajor);
+        let mo_coeff_0 = rt::asarray((&mo_coeff_0.data, mo_coeff_0.size, &device))
+            .into_contig(ColMajor)
+            .index_select(-1, &perm[0]);
+        let mo_coeff_1 = rt::asarray((&mo_coeff_1.data, mo_coeff_1.size, &device))
+            .into_contig(ColMajor)
+            .index_select(-1, &perm[1]);
         [mo_coeff_0, mo_coeff_1]
     };
     let mo_occ = {
         let mo_occ_0 = &scf_data.occupation[0];
         let mo_occ_1 = &scf_data.occupation[1];
-        let mo_occ_0 = rt::asarray((mo_occ_0, [mo_occ_0.len()], &device)).into_contig(ColMajor);
-        let mo_occ_1 = rt::asarray((mo_occ_1, [mo_occ_1.len()], &device)).into_contig(ColMajor);
+        let mo_occ_0 = rt::asarray((mo_occ_0, [mo_occ_0.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[0]);
+        let mo_occ_1 = rt::asarray((mo_occ_1, [mo_occ_1.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[1]);
         [mo_occ_0, mo_occ_1]
     };
     let mo_energy = {
         let mo_energy_0 = &scf_data.eigenvalues[0];
         let mo_energy_1 = &scf_data.eigenvalues[1];
-        let mo_energy_0 = rt::asarray((mo_energy_0, [mo_energy_0.len()], &device)).into_contig(ColMajor);
-        let mo_energy_1 = rt::asarray((mo_energy_1, [mo_energy_1.len()], &device)).into_contig(ColMajor);
+        let mo_energy_0 = rt::asarray((mo_energy_0, [mo_energy_0.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[0]);
+        let mo_energy_1 = rt::asarray((mo_energy_1, [mo_energy_1.len()], &device))
+            .into_contig(ColMajor)
+            .index_select(0, &perm[1]);
         [mo_energy_0, mo_energy_1]
     };
 
@@ -126,7 +143,7 @@ pub fn uscf_hess_interface<'a>(
         let verbose = scf_data.mol.ctrl.print_level > 2;
         let grid_shift = cfg.grid_shift_deriv;
         let proton_charges = scf_proton_charges(scf_data);
-        UHessKSNIMatmul::new(&mol, scf_xc_func_list_uks(scf_data), ni, grid_shift, proton_charges, verbose)
+        UHessKSNIMatmul::new(&mol, scf_data.mol.dfadef.scf_func_list(2), ni, grid_shift, proton_charges, verbose)
     });
     if let Some(ref mut hess_nimatmul_obj) = hess_nimatmul_obj {
         hess_el_list.push(hess_nimatmul_obj);

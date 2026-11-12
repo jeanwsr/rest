@@ -107,15 +107,17 @@ fn multipole_interface_r<'a>(
     let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
 
     let device = DeviceBLAS::default();
-    let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
-    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
+    // Match the orbital basis of `rgfock_dh_interface`.
+    let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
+    let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device).index_select(-1, &perm);
+    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm);
     let mol_cint = get_cint_mol(&scf_data.mol);
 
     // DH density increments: PT2-family post-SCF methods only. The remaining requirements (no
     // frozen core, no range separation, rimatr availability) are guarded inside
     // `rgfock_dh_interface`.
-    let mut rgfock = if scf_data.mol.xc_data.is_fifth_dfa() {
-        match &scf_data.mol.xc_data.dfa_family_pos {
+    let mut rgfock = if scf_data.mol.dfadef.is_fifth_dfa() {
+        match &scf_data.mol.dfadef.family_pos() {
             Some(crate::dft::DFAFamily::PT2) => {},
             other => panic!(
                 "Multipole evaluation for post-SCF methods currently supports PT2-family (xDH/BDH/MP2) methods only, got {other:?}."
@@ -158,7 +160,7 @@ fn multipole_interface_r<'a>(
     // Gaussian fchk file. Post-SCF (PT2-family: MP2 and double-hybrid) methods dump the total
     // density; SCF-level methods silently ignore the keyword (their total density is the SCF
     // density alone, already in the fchk output).
-    if mp_cfg.rdm1_dump && scf_data.mol.xc_data.is_fifth_dfa() {
+    if mp_cfg.rdm1_dump && scf_data.mol.dfadef.is_fifth_dfa() {
         let fchk_file = format!("{}.fchk", scf_data.mol.geom.name);
         if !std::path::Path::new(&fchk_file).exists() {
             // the density is appended to an existing fchk file; this keyword must not create one
@@ -221,7 +223,7 @@ fn multipole_interface_u<'a>(
     config: &AnalDrvConfig,
     resp_objs: Option<&mut RespSCF<'a>>,
 ) -> MultipoleOutput {
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         panic!(
             "Multipole evaluation is not implemented for unrestricted post-SCF (double-hybrid, \
              fifth-DFA) methods yet; only SCF-level UHF/UKS is supported."

@@ -1,7 +1,7 @@
 use crate::molecule_io::Molecule;
 use crate::geom_io;
 use crate::basis_io;
-use crate::basis_io::basic_math::factorial;
+use crate::utilities::basic_math::factorial;
 use crate::scf_io::SCF;
 use rest_tensors::{MatrixFull};
 use rand::Rng;

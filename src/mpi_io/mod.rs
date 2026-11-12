@@ -157,7 +157,15 @@ impl MPIData {
         let rank = world.rank() as usize;
         #[cfg(feature = "scalapack")]
         let cgrid = CblacsGrid::new(size, "R");
-
+        // Always expose the operator, INCLUDING at one rank.
+        //
+        // The previous `if size >= 2` branch returned (None, None) at one
+        // rank, which dropped `universe` and therefore called MPI_Finalize
+        // (`impl Drop for Universe` in rsmpi). PEXSI needs a live
+        // communicator even for `mpirun -np 1`, so a one-rank run must keep
+        // the Universe alive and hand out a valid MPIOperator. Leaking the
+        // handle instead (std::mem::forget) left MPI in a half-initialised
+        // state that segfaults.
         if size >= 2 {
             (
                 Some(MPIOperator {
@@ -211,6 +219,8 @@ impl MPIData {
             aop_compressed: None,
             atm_idx: local_atm_idx,
             quadrature_weights: local_quadrature_weights,
+            ao_atm: Vec::new(),
+            atm_coords: Vec::new(),
         }
         
     }

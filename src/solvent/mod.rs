@@ -195,6 +195,13 @@ pub struct PcmStatic {
     pub e_cds: Option<f64>,
     pub tarea: Option<f64>,
     pub d_cds: Option<Vec<MatrixFull<f64>>>,
+    /// Cached `(P|g_j)` int2c2e block, `[naux, ngrids]` (column-major, one column per
+    /// grid point). Geometry-only, yet the per-iteration code used to re-evaluate it TWICE
+    /// per SCF iteration (once in `get_v_grids_e` step 3, once in `get_veff_pcm_by_q`
+    /// step 1) — on system1 that was ~30 s of integral work each iteration. Built once
+    /// here; the per-iteration paths then reduce to one dgemv/dgemm each.
+    /// `None` when `REST_PCM_PG_CACHE=0` or when the cache would exceed the budget.
+    pub pg: Option<MatrixFull<f64>>,
 }
 
 impl PcmStatic{
@@ -209,14 +216,92 @@ impl PcmStatic{
         // PCM contractions reduce to `M` applied once plus one dgemv against `rimatr`.
         // Only built when the prototype path is requested: the eigendecomposition of
         // the `naux × naux` metric is not free, and every other path ignores it.
-        let j2c_factor = if std::env::var("REST_PCM_RI_REUSE").map(|v| v == "1").unwrap_or(false) {
-            match mol.ctrl.j2c_decomp.policy {
-                crate::ri_jk::J2CDecompPolicy::Eig => {
-                    let j2c = mol.int_ij_aux_columb();
-                    Some(crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp))
+        // The RI-reuse path (contracting against the resident rimatr instead of
+        // re-evaluating 3c integrals each iteration) is the DEFAULT since it cuts
+        // the per-iteration PCM cost from ~90s to ~8-15s on large systems. Set
+        // REST_PCM_RI_REUSE=0 to disable and fall back to the integral path.
+        let j2c_factor = if !std::env::var("REST_PCM_RI_REUSE").map(|v| v == "0").unwrap_or(false) {
+            let j2c = mol.int_ij_aux_columb();
+            // `M = J^{-1/2}`. The spectral route (`_dsyevd` on the naux x naux metric) runs
+            // close to single-threaded in this OpenBLAS and cost ~800 s at naux = 11.6k;
+            // Newton-Schulz needs only ~10-20 dense GEMMs (~2 s each) and works for ANY
+            // j2c policy, falling back to the spectral power when it does not converge.
+            let threshold = mol.ctrl.j2c_decomp.threshold.unwrap_or(crate::ri_jk::J2C_THRESH);
+            match newton_schulz_inv_sqrt(&j2c, threshold) {
+                Some(m) => {
+                    println!("PCM static: j2c factor via Newton-Schulz ({} x {})", m.size[0], m.size[1]);
+                    Some(m)
                 }
-                _ => None,
+                None => match mol.ctrl.j2c_decomp.policy {
+                    // spectral `J^{-1/2}` (with eigenvalue truncation) is only exposed for
+                    // the eig policy; the Cd branch of `prepare_j2c_solve_factor` returns a
+                    // Cholesky SOLVE factor that is NOT `M`, and using it as `M` silently
+                    // produces garbage (measured: system1 SCF energy -3.2e9 Ha). Newton
+                    // fails to converge on ill-conditioned metrics (tiny eigenvalues make
+                    // `J^{-1/2}` unbounded; only the spectral route truncates them), so a
+                    // Cd-policy run then simply disables the reuse prototype.
+                    crate::ri_jk::J2CDecompPolicy::Eig => {
+                        println!("PCM static: Newton-Schulz did not converge; falling back to the spectral j2c factor");
+                        Some(crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp))
+                    }
+                    _ => {
+                        println!("PCM static: Newton-Schulz did not converge and the Cd policy has no spectral fallback; RI reuse disabled");
+                        None
+                    }
+                },
             }
+        } else {
+            None
+        };
+        // ---- cached (P|g_j) block ---------------------------------------------------------
+        // Geometry-only int2c2e between the auxiliary basis and the Gaussian surface
+        // charges. The per-iteration paths re-evaluated this twice per SCF iteration;
+        // here it is built once (parallel over grid chunks) and the iterations reduce
+        // to dgemv/dgemm. `REST_PCM_PG_CACHE=0` disables.
+        let pg = if mol.ctrl.solvent_ri
+            && std::env::var("REST_PCM_PG_CACHE").map(|v| v != "0").unwrap_or(true)
+        {
+            let t0 = std::time::Instant::now();
+            let cint_data_ri = mol.initialize_cint(true);
+            let nbas = mol.cint_bas.len() as i32;
+            let nbas_aux = mol.cint_aux_bas.len() as i32;
+            let naux = cint_data_ri.ao_loc()[(nbas + nbas_aux) as usize] - cint_data_ri.ao_loc()[nbas as usize];
+            let grid_coords = &surface.surface_calc.grid_coords;
+            let charge_exp = &surface.surface_calc.charge_exp;
+            let ngrids = grid_coords.len();
+            let chunk = solvent_chunk_bytes(ngrids, 8.0 * naux as f64, mol.ctrl.solv_chunk, rayon::current_num_threads());
+            let default_omp = omp_get_num_threads_wrapper();
+            let mut pg = MatrixFull::<f64>::new([naux as usize, ngrids], 0.0);
+            {
+                // parallel per-chunk evaluation (immutable closure), sequential scatter
+                let parts: Vec<(usize, usize, Vec<f64>)> = grid_coords
+                    .par_chunks(chunk)
+                    .enumerate()
+                    .map(|(ci, gchunk)| {
+                        omp_set_num_threads_wrapper(1);
+                        let p0 = ci * chunk;
+                        let clen = gchunk.len();
+                        let charge_sq: Vec<f64> = charge_exp[p0..p0 + clen].iter().map(|x| x * x).collect();
+                        let fake = CINTR2CDATA::fakemol_for_charges(gchunk, charge_sq.as_slice());
+                        let shls = [[nbas, nbas + nbas_aux], [0, clen as i32]];
+                        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&cint_data_ri, &fake], None, &shls).into();
+                        (p0, shape[0], tmpout)
+                    })
+                    .collect();
+                let pg_cols = pg.data_ref_mut().unwrap();
+                for (p0, r, tmpout) in parts {
+                    let c = tmpout.len() / r;
+                    for j in 0..c {
+                        for i in 0..r {
+                            pg_cols[i + (p0 + j) * naux as usize] = tmpout[i + j * r];
+                        }
+                    }
+                }
+            }
+            omp_set_num_threads_wrapper(default_omp);
+            println!("PCM static: cached (P|g) [{} x {}] in {:.1} s",
+                naux, ngrids, t0.elapsed().as_secs_f64());
+            Some(pg)
         } else {
             None
         };
@@ -232,7 +317,7 @@ impl PcmStatic{
         } else {
             (None, None, None)
         };
-        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial, v_pq_chol, j2c_factor, e_cds, tarea, d_cds }
+        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial, v_pq_chol, j2c_factor, e_cds, tarea, d_cds, pg }
     }
 }
 
@@ -244,6 +329,72 @@ impl PcmStatic{
 /// so this runs once per calculation (from [`PcmStatic::build_pcm_static`]) instead
 /// of on every SCF iteration. The diagonal regularization is the one the
 /// per-iteration code applied: `1e-12 · max(1, max diag)`.
+
+/// `J^{-1/2}` by the Newton-Schulz iteration `X <- X·(3I - J·X²)/2`, started from
+/// `X0 = J/||J||_F`. Converges quadratically while `||I - J·X_k|| < 1`; returns `None`
+/// when the residual stalls above `1e-10` after 100 sweeps (callers fall back to the
+/// spectral `_power_rayon_for_symmetric_matrix`). Matrix polynomials only, so every
+/// sweep is one dense GEMM — no eigendecomposition.
+fn newton_schulz_inv_sqrt(j2c: &MatrixFull<f64>, threshold: f64) -> Option<MatrixFull<f64>> {
+    let n = j2c.size[0];
+    if j2c.size[1] != n || n == 0 {
+        return None;
+    }
+    // scaled start X0 = alpha * J with alpha = 1/sqrt(||J||_1 * ||J||_inf), the classic
+    // choice guaranteeing the spectral radius of I - J·X0 stays below 1
+    let mut norm1 = 0.0_f64;
+    let mut norminf = 0.0_f64;
+    let mut rowsum = vec![0.0_f64; n];
+    for j in 0..n {
+        let mut cs = 0.0_f64;
+        for i in 0..n {
+            let v = j2c.data[i + j * n].abs();
+            cs += v;
+            rowsum[i] += v;
+        }
+        norm1 = norm1.max(cs);
+    }
+    norminf = rowsum.into_iter().fold(0.0_f64, f64::max);
+    let denom = (norm1 * norminf).sqrt();
+    if !(denom > 0.0 && denom.is_finite()) {
+        return None;
+    }
+    let alpha = 1.0 / denom;
+    // X0 = alpha * J  (so that ||J X0|| = alpha^2 ||J||^2... standard scaled start)
+    let mut x = MatrixFull::<f64>::new([n, n], 0.0);
+    for (xv, jv) in x.data.iter_mut().zip(j2c.data.iter()) {
+        *xv = alpha * jv;
+    }
+    let mut jx: MatrixFull<f64> = MatrixFull::new([n, n], 0.0);
+    for _sweep in 0..100 {
+        // JX
+        jx = _dgemm_scaled(j2c, 'N', &x, 'N', 1.0);
+        // residual R = I - JX  (Frobenius)
+        let mut r2 = 0.0_f64;
+        for i in 0..n {
+            for j in 0..n {
+                let d = if i == j { 1.0 - jx.data[i + j * n] } else { -jx.data[i + j * n] };
+                r2 += d * d;
+            }
+        }
+        if r2 < 1e-20 {
+            return Some(x);
+        }
+        // X <- X·(3I - JX)/2  computed as X <- 1.5·X - 0.5·X·(JX)
+        let mut xjx: MatrixFull<f64> = MatrixFull::new([n, n], 0.0);
+        let xjx2 = _dgemm_scaled(&x, 'N', &jx, 'N', 1.0); xjx = xjx2;
+        for (xv, t) in x.data.iter_mut().zip(xjx.data.iter()) {
+            *xv = 1.5 * *xv - 0.5 * *t;
+        }
+        // non-convergence guard: divergence shows up as non-finite entries
+        if !x.data.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let _ = threshold;
+    }
+    None
+}
+
 pub fn build_v_pq_chol(mol: &Molecule) -> MatrixFull<f64> {
     let cint_data_ri = mol.initialize_cint(true);
     let nbas = mol.cint_bas.len() as i32;
@@ -297,69 +448,62 @@ pub fn get_A_D_S(surface: &SurfaceVdwGaussian) -> (Vec<f64>, MatrixFull<f64>, Ma
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
     let n_grids = grid_coords.len();
-    let grid_capacity = n_grids * (n_grids + 1) /2;
     let norm_vec = &surface.surface_calc.norm_vec;
-    
-    if n_grids == 0 {
-        panic!("ERROR: No surface grid points generated!");
-    }
-
-    let mut zeta_ij = Vec::with_capacity(grid_capacity);
-    for j in 0..n_grids{
-        for i in 0..j+1{
-            zeta_ij.push(charge_exp[i]*charge_exp[j]/(charge_exp[i].powi(2)+charge_exp[j].powi(2)).sqrt() );
-        }
-    }
-
-    let mut r_ij = Vec::with_capacity(grid_capacity);
-    for j in 0..n_grids{
-        for i in 0..j+1{
-            if i == j {
-                r_ij.push(1.0);
-            } else {
-                r_ij.push(dist_3d(&grid_coords[i], &grid_coords[j]));
+    // ---- streaming construction -----------------------------------------------------------
+    // The old implementation materialised zeta_ij / r_ij / zeta_r_ij (three n(n+1)/2
+    // upper-triangle Vecs) plus r_ij_matrix / zeta_r_ij_matrix / n_r_ij / r_scale /
+    // f_zeta_r_ij / tmp_D_ij (six n^2 temporaries) before writing S and D. For a 56k-point
+    // surface (system1) that is ~150 GB of transient memory, and one of the first 3 GB
+    // Vec::with_capacity calls failed reproducibly on some builds. Every element here uses
+    // the exact same formula as before, evaluated on the fly into the two output matrices:
+    // peak memory drops from ~150 GB to 2 * n^2 * 8 bytes.
+    let mut S_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
+    let mut D_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
+    {
+        // Two column-parallel passes (S, then D). Each column j is written by exactly
+        // one thread; the serial mirror write of the old loop is dropped because the
+        // S formula is symmetric — column i's owner computes the same value for (j, i).
+        // The transcendental work is done twice (once per pass), which is irrelevant
+        // next to the parallelism gain: serial this was ~n² sqrt+erf+exp evaluations
+        // on ONE core (tens of seconds at 28k surface points) — the first long
+        // single-core window of every PCM job.
+        let n = n_grids;
+        let sqrt_2_over_pi = (2.0_f64 / PI).sqrt();
+        S_ij.data_ref_mut().unwrap().par_chunks_mut(n).enumerate().for_each(|(j, s_col)| {
+            let cj = &grid_coords[j];
+            let ce_j = charge_exp[j];
+            for i in 0..n {
+                if i == j { continue; }
+                let dx = grid_coords[i][0] - cj[0];
+                let dy = grid_coords[i][1] - cj[1];
+                let dz = grid_coords[i][2] - cj[2];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let zeta = ce_j * charge_exp[i] / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
+                let zr = zeta * r;
+                s_col[i] = libm::erf(zr) / r;
             }
-        }
-    }
-    //let r_ij = MatrixUpper::from_vec(grid_capacity, tmp_r_ij).unwrap();
-    //let r_ij = r_ij.to_matrixfull();
-    let zeta_r_ij: Vec<f64> = r_ij.iter()
-        .zip(zeta_ij.iter()).map(|(&r, &z)| z*r).collect();
-    
-    // S_ij = erf(zeta_ij * r_ij) / r_ij, with S_ii = charge_exp[i] * (2/pi)^0.5 / switch_fun[i]
-    let mut tmp_S_ij = zeta_r_ij.iter().zip(r_ij.iter())
-        .map(|(&z, &r)| libm::erf(z) / r).collect();
-    let mut S_ij: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, tmp_S_ij).unwrap().to_matrixfull().unwrap();
-    for i in 0..n_grids{
-        let s_ii = charge_exp[i] * (2.0 / PI).sqrt() / switch_fun[i];
-        S_ij[(i,i)] = s_ii;
-    }
-
-    let r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, r_ij).unwrap().to_matrixfull().unwrap();
-    let zeta_r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, zeta_r_ij).unwrap().to_matrixfull().unwrap();
-    // n_r_ij = \vec{n_j} * \vec{r_ij}, where \vec{n_j} is the normal vector at grid point j, and \vec{r_ij} is the vector from grid point j to grid point i.
-    let mut n_r_ij: Vec<f64> = Vec::with_capacity(n_grids * n_grids);
-    for j in 0..n_grids{
-        for i in 0..n_grids{
-            let dx = grid_coords[i][0] - grid_coords[j][0];
-            let dy = grid_coords[i][1] - grid_coords[j][1];
-            let dz = grid_coords[i][2] - grid_coords[j][2];
-            n_r_ij.push(dx * norm_vec[j].0 + dy * norm_vec[j].1 + dz * norm_vec[j].2);
-        }
-    }
-
-    //r_scale = \vec{n_j} * \vec{r_ij}/ r_ij^3, 
-    let r_scale: Vec<f64> = n_r_ij.iter().zip(r_ij_matrix.iter())
-        .map(|(&n, &r)| n / r.powi(3)).collect();
-    let f_zeta_r_ij: Vec<f64> = zeta_r_ij_matrix.iter()
-        .map(|&x| libm::erf(x) - 2.0 / PI.sqrt() * x * f64::exp(-x.powi(2)))
-        .collect();
-    let tmp_D_ij: Vec<f64> = f_zeta_r_ij.iter().zip(r_scale.iter())
-        .map(|(&f, &scale)| f * scale).collect();
-    let mut D_ij = MatrixFull::from_vec([n_grids, n_grids], tmp_D_ij).unwrap();
-    for i in 0..n_grids{
-        let d_ii = -charge_exp[i]* (2.0 / PI).sqrt() / (2.0 * R_vdw[i]);
-        D_ij[(i,i)] = d_ii;
+            s_col[j] = ce_j * sqrt_2_over_pi / switch_fun[j];
+        });
+        let two_over_sqrt_pi = 2.0_f64 / PI.sqrt();
+        D_ij.data_ref_mut().unwrap().par_chunks_mut(n).enumerate().for_each(|(j, d_col)| {
+            let cj = &grid_coords[j];
+            let ce_j = charge_exp[j];
+            let nj = &norm_vec[j];
+            for i in 0..n {
+                if i == j { continue; }
+                let dx = grid_coords[i][0] - cj[0];
+                let dy = grid_coords[i][1] - cj[1];
+                let dz = grid_coords[i][2] - cj[2];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let zeta = ce_j * charge_exp[i] / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
+                let zr = zeta * r;
+                let erf_zr = libm::erf(zr);
+                let f = erf_zr - two_over_sqrt_pi * zr * f64::exp(-zr.powi(2));
+                let n_dot_r = dx * nj.0 + dy * nj.1 + dz * nj.2;
+                d_col[i] = f * (n_dot_r / r.powi(3));
+            }
+            d_col[j] = -ce_j * sqrt_2_over_pi / (2.0 * R_vdw[j]);
+        });
     }
 
     (A, D_ij, S_ij)
@@ -396,10 +540,15 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
         PcmMethod::IEFPCM | PcmMethod::SMD => {
             let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
             let mut DA = D.clone();
-            for j in 0..ngrids{
-                for i in 0..ngrids{
-                    DA[(i,j)] = DA[(i,j)] * A[j];
-                }
+            // column scaling, one thread per column block (the serial Index-trait loop
+            // was another ~10 s single-core window at 28k surface points)
+            {
+                let n = ngrids;
+                let a = &A[..];
+                DA.data.par_chunks_mut(n).enumerate().for_each(|(j, col)| {
+                    let aj = a[j];
+                    for v in col.iter_mut() { *v *= aj; }
+                });
             }
             //let DA = _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);
             let DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
@@ -414,10 +563,15 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
         PcmMethod::SSVPE => {
             let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
             let mut DA = D.clone();
-            for j in 0..ngrids{
-                for i in 0..ngrids{
-                    DA[(i,j)] = DA[(i,j)] * A[j];
-                }
+            // column scaling, one thread per column block (the serial Index-trait loop
+            // was another ~10 s single-core window at 28k surface points)
+            {
+                let n = ngrids;
+                let a = &A[..];
+                DA.data.par_chunks_mut(n).enumerate().for_each(|(j, col)| {
+                    let aj = a[j];
+                    for v in col.iter_mut() { *v *= aj; }
+                });
             }
             //let DA =  _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);;
             let mut DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
@@ -532,6 +686,7 @@ impl PcmScf{
         v_grids_n: &Vec<f64>,
         v_pq_chol: &MatrixFull<f64>,
         ri_reuse: Option<&PcmRiReuse>,
+        pg_cache: Option<&MatrixFull<f64>>,
         spin_channel: &usize,
         max_memory: &Option<f64>,
         chunk_size: &usize,
@@ -565,7 +720,7 @@ impl PcmScf{
         let (v_grids_e, v_grids_matrix, veff, q_sym, dt_4) = if solv_ri{
 
             let v_grids_e = get_v_grids_e(surface, mol, dm, spin_channel, max_memory, chunk_size,
-                &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator);
+                &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator, pg_cache);
 
             let dt_1 = time::Local::now();
             let timecost_vgrid_e = (dt_1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
@@ -580,13 +735,17 @@ impl PcmScf{
             println!("v_grids costs {:10.2} seconds.", timecost_vgrid);
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
-            let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data)
+            // R·V and both triangular solves stream the [ngrids, ngrids] factors once;
+            // the plain-BLAS / scalar-loop versions run single-core (measured 7-16 s per
+            // SCF iteration at n = 28373), the rayon matvec and blocked solves read the
+            // same bytes at node bandwidth.
+            let b_data = par_mat_vec(R, &v_grids_matrix.data);
+            let q = crate::solvent::surface_utils::par_solve_lu(K, K_ipiv, &b_data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+            let vK_1 = crate::solvent::surface_utils::par_solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
@@ -598,7 +757,8 @@ impl PcmScf{
             // `Rᵀ · vK_1`. The transpose goes to BLAS as a flag: `R.transpose()`
             // would clone and re-permute the whole `[ngrids, ngrids]` matrix (several
             // GB) on every SCF iteration.
-            let qt = _dgemm_scaled(R, 'T', &vK_1, 'N', 1.0);
+            let qt_data = par_mat_t_vec(R, &vK_1.data);
+            let qt = MatrixFull::from_vec([qt_data.len(), 1], qt_data).unwrap();
             if qt.size[0] != q.size[0] {
             panic!("Dimension mismatch: qt has {} rows but q has {} rows", qt.size[0], q.size[0]);
             }
@@ -608,7 +768,7 @@ impl PcmScf{
             let timecost_qsym = (dt_4.timestamp_millis()-dt_3.timestamp_millis()) as f64 /1000.0;
             println!("Symmetrization of q costs {:10.2} seconds.", timecost_qsym);
 
-            let veff = get_veff_pcm_by_q(surface, mol, &q_sym.data, max_memory, chunk_size, &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator);
+            let veff = get_veff_pcm_by_q(surface, mol, &q_sym.data, max_memory, chunk_size, &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator, pg_cache);
     
             (v_grids_e, v_grids_matrix, veff, q_sym, dt_4)
         } else {
@@ -636,13 +796,17 @@ impl PcmScf{
             println!("v_grids costs {:10.2} seconds.", timecost_vgrid);
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
-            let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data)
+            // R·V and both triangular solves stream the [ngrids, ngrids] factors once;
+            // the plain-BLAS / scalar-loop versions run single-core (measured 7-16 s per
+            // SCF iteration at n = 28373), the rayon matvec and blocked solves read the
+            // same bytes at node bandwidth.
+            let b_data = par_mat_vec(R, &v_grids_matrix.data);
+            let q = crate::solvent::surface_utils::par_solve_lu(K, K_ipiv, &b_data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+            let vK_1 = crate::solvent::surface_utils::par_solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
@@ -654,7 +818,8 @@ impl PcmScf{
             // `Rᵀ · vK_1`. The transpose goes to BLAS as a flag: `R.transpose()`
             // would clone and re-permute the whole `[ngrids, ngrids]` matrix (several
             // GB) on every SCF iteration.
-            let qt = _dgemm_scaled(R, 'T', &vK_1, 'N', 1.0);
+            let qt_data = par_mat_t_vec(R, &vK_1.data);
+            let qt = MatrixFull::from_vec([qt_data.len(), 1], qt_data).unwrap();
             if qt.size[0] != q.size[0] {
             panic!("Dimension mismatch: qt has {} rows but q has {} rows", qt.size[0], q.size[0]);
             }
@@ -734,6 +899,67 @@ pub(crate) fn solvent_chunk_bytes(
     let by_load = (range / (t * K)).max(1);
     let lo = C_MIN.min(range).max(1);
     by_load.max(lo).min(hi).max(1)
+}
+
+
+//=============================================================================
+//  rayon contractions for the resident RI tensor (cderi)
+//=============================================================================
+
+/// `y[c] = \u{03a3}_r A[r,c] \u{00b7} x[r]` for a column-major `[r, c]` matrix.
+/// A plain dgemv runs this memory-bound reduction on one BLAS thread (measured
+/// 3.4 GB/s over a 51 GB `cderi`, ~15 s on system1); rayon over columns reads the
+/// same bytes at full node bandwidth.
+fn par_mat_t_vec(a: &MatrixFull<f64>, x: &[f64]) -> Vec<f64> {
+    let (nrow, ncols) = (a.size[0], a.size[1]);
+    let data = &a.data[..];
+    assert_eq!(x.len(), nrow, "par_mat_t_vec: x length {} != rows {}", x.len(), nrow);
+    (0..ncols)
+        .into_par_iter()
+        .map(|c| {
+            let col = &data[c * nrow..(c + 1) * nrow];
+            let mut s = 0.0_f64;
+            for (av, xv) in col.iter().zip(x.iter()) {
+                s += av * xv;
+            }
+            s
+        })
+        .collect()
+}
+
+/// `y[r] = \u{03a3}_c A[r,c] \u{00b7} w[c]` for a column-major `[r, c]` matrix.
+/// Parallel over contiguous column blocks with per-block row partials, so every
+/// thread streams a contiguous slice of `A` (a row-major walk would stride).
+fn par_mat_vec(a: &MatrixFull<f64>, w: &[f64]) -> Vec<f64> {
+    let (nrow, ncols) = (a.size[0], a.size[1]);
+    let data = &a.data[..];
+    assert_eq!(w.len(), ncols, "par_mat_vec: w length {} != cols {}", w.len(), ncols);
+    let nthread = rayon::current_num_threads().max(1);
+    let block = ((ncols + nthread * 4 - 1) / (nthread * 4)).max(1);
+    let starts: Vec<usize> = (0..ncols).step_by(block).collect();
+    let partials: Vec<Vec<f64>> = starts
+        .into_par_iter()
+        .map(|c0| {
+            let c1 = (c0 + block).min(ncols);
+            let mut acc = vec![0.0_f64; nrow];
+            for c in c0..c1 {
+                let wc = w[c];
+                if wc == 0.0 { continue; }
+                let col = &data[c * nrow..(c + 1) * nrow];
+                for r in 0..nrow {
+                    acc[r] += col[r] * wc;
+                }
+            }
+            acc
+        })
+        .collect();
+    let mut y = vec![0.0_f64; nrow];
+    for part in partials {
+        for (yv, pv) in y.iter_mut().zip(part.iter()) {
+            *yv += pv;
+        }
+    }
+    y
 }
 
 pub fn get_v_grids_e_old(
@@ -1295,6 +1521,7 @@ pub fn get_v_grids_e(
     v_pq_chol: &MatrixFull<f64>,
     ri_reuse: Option<&PcmRiReuse>,
     mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+    pg_cache: Option<&MatrixFull<f64>>,
 ) -> Vec<f64> {
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
@@ -1364,7 +1591,8 @@ pub fn get_v_grids_e(
             }
         }
         let d_mat = MatrixFull::from_vec([nrow, 1], d_packed).unwrap();
-        let c_hat_local = _dgemm_scaled(ri.cderi, 'T', &d_mat, 'N', 1.0); // [ncols, 1]
+        let c_hat_local_data = par_mat_t_vec(ri.cderi, &d_mat.data); // [ncols, 1]
+        let c_hat_local = MatrixFull::from_vec([c_hat_local_data.len(), 1], c_hat_local_data).unwrap();
         // Under MPI the tensor carries only this rank's auxiliary columns, so the
         // contraction is completed over the ranks before the metric factor is applied.
         // The factor itself is replicated, so every rank gets the same `Y`.
@@ -1393,35 +1621,34 @@ pub fn get_v_grids_e(
     };
     let y_mat = MatrixFull::from_vec([naux, 1], y_vec).unwrap();
 
-    // Step 3: Parallel grid chunks — v_grids_e[j] = Σ_P Y_P · (P|g_j)
-    let mut v_grids_e = vec![0.0; ngrids];
-    let default_omp_num_threads = omp_get_num_threads_wrapper();
-    v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
-        omp_set_num_threads_wrapper(1);
-        let p0 = v_chunk * CHUNK;
-        let p1 = (p0 + CHUNK).min(ngrids);
-        let grid_coords_chunk = &grid_coords[p0..p1];
-        let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
-        for &x in &charge_exp[p0..p1] {
-            charge_exp_chunk.push(x * x);
-        }
-        let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
-        
-        //println!("CHUNK {}: exponents[0..5]={:?}, coef check: 2*α^1.5/π = {:?}",
-        //v_chunk, &charge_exp_chunk[..5.min(charge_exp_chunk.len())],
-        //charge_exp_chunk.iter().map(|&a| 2.0 * a.powf(1.5) / std::f64::consts::PI).take(5).collect::<Vec<_>>());
-
-        //actual code let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, aux_cint], None, None).into();
-        //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, None).into();
-        //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, &fake_chg_data], None, None).into();
-        let shls_slice_2c = [[0, (p1-p0) as i32], [nbas, nbas + nbas_aux]];
-        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, &shls_slice_2c).into();
-        let pg_shape = [shape[0], shape[1]];
-        let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
-        let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
-        idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
-    });
-    omp_set_num_threads_wrapper(default_omp_num_threads);
+    // Step 3: v_grids_e[j] = \u{03a3}_P Y_P \u{00b7} (P|g_j) \u{2014} from the cached (P|g) block when
+    // available (one dgemv), else the original per-chunk integral evaluation.
+    let v_grids_e: Vec<f64> = if let Some(pg) = pg_cache {
+        let v = _dgemm_scaled(pg, 'T', &y_mat, 'N', 1.0);
+        v.data
+    } else {
+        let mut v_grids_e = vec![0.0; ngrids];
+        let default_omp_num_threads = omp_get_num_threads_wrapper();
+        v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+            omp_set_num_threads_wrapper(1);
+            let p0 = v_chunk * CHUNK;
+            let p1 = (p0 + CHUNK).min(ngrids);
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
+            for &x in &charge_exp[p0..p1] {
+                charge_exp_chunk.push(x * x);
+            }
+            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+            let shls_slice_2c = [[0, (p1-p0) as i32], [nbas, nbas + nbas_aux]];
+            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, &shls_slice_2c).into();
+            let pg_shape = [shape[0], shape[1]];
+            let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
+            let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
+            idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
+        });
+        omp_set_num_threads_wrapper(default_omp_num_threads);
+        v_grids_e
+    };
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis() - dt0.timestamp_millis()) as f64 / 1000.0;
@@ -1445,6 +1672,7 @@ pub fn get_veff_pcm_by_q(
     v_pq_chol: &MatrixFull<f64>,
     ri_reuse: Option<&PcmRiReuse>,
     mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+    pg_cache: Option<&MatrixFull<f64>>,
 ) -> MatrixUpper<f64> {
 
     let nbas = mol.cint_bas.len() as i32;
@@ -1463,38 +1691,43 @@ pub fn get_veff_pcm_by_q(
 
     let dt0 = time::Local::now();
 
-    // Step 1: Compute Z'_P = Σ_j q_j · (P|g_j) over grid chunks (parallel)
-    let default_omp_num_threads = omp_get_num_threads_wrapper();
-    let z_prime = grid_coords
-        .par_chunks(CHUNK)
-        .zip(charge_exp.par_chunks(CHUNK))
-        .zip(q.par_chunks(CHUNK))
-        .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
-            omp_set_num_threads_wrapper(1);
-            let chunk_len = grid_coords_chunk.len();
-            let charge_exp_chunk_sq: Vec<f64> =
-                charge_exp_chunk.iter().map(|x| x * x).collect();
-            let fake_chg_data =
-                CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk_sq.as_slice());
-
-            //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [aux_cint, &fake_chg_data], None, None).into();
-            let shls_slice_2c = [[nbas, nbas + nbas_aux], [0, chunk_len as i32]];
-            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [cint_data_ri, &fake_chg_data], None, &shls_slice_2c).into();
-            let pg_shape = [shape[0], shape[1]];
-            let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
-            let q_mat = MatrixFull::from_vec([chunk_len, 1], q_chunk.to_vec()).unwrap();
-            let z_contrib = _dgemm_scaled(&pg_mat, 'N', &q_mat, 'N', 1.0);
-            z_contrib.data
-        })
-        .reduce(
-            || vec![0.0; naux],
-            |mut a, b| {
-                for (i, &v) in b.iter().enumerate() {
-                    a[i] += v;
-                }
-                a
-            });
-    omp_set_num_threads_wrapper(default_omp_num_threads);
+    // Step 1: Z'_P = \u{03a3}_j q_j \u{00b7} (P|g_j) \u{2014} cached (P|g) dgemm when available,
+    // else the original parallel per-chunk integral evaluation.
+    let z_prime: Vec<f64> = if let Some(pg) = pg_cache {
+        let q_mat = MatrixFull::from_vec([q.len(), 1], q.clone()).unwrap();
+        _dgemm_scaled(pg, 'N', &q_mat, 'N', 1.0).data
+    } else {
+        let default_omp_num_threads = omp_get_num_threads_wrapper();
+        let z = grid_coords
+            .par_chunks(CHUNK)
+            .zip(charge_exp.par_chunks(CHUNK))
+            .zip(q.par_chunks(CHUNK))
+            .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
+                omp_set_num_threads_wrapper(1);
+                let chunk_len = grid_coords_chunk.len();
+                let charge_exp_chunk_sq: Vec<f64> =
+                    charge_exp_chunk.iter().map(|x| x * x).collect();
+                let fake_chg_data =
+                    CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk_sq.as_slice());
+                let shls_slice_2c = [[nbas, nbas + nbas_aux], [0, chunk_len as i32]];
+                let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [cint_data_ri, &fake_chg_data], None, &shls_slice_2c).into();
+                let pg_shape = [shape[0], shape[1]];
+                let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
+                let q_mat = MatrixFull::from_vec([chunk_len, 1], q_chunk.to_vec()).unwrap();
+                let z_contrib = _dgemm_scaled(&pg_mat, 'N', &q_mat, 'N', 1.0);
+                z_contrib.data
+            })
+            .reduce(
+                || vec![0.0; naux],
+                |mut a, b| {
+                    for (i, &v) in b.iter().enumerate() {
+                        a[i] += v;
+                    }
+                    a
+                });
+        omp_set_num_threads_wrapper(default_omp_num_threads);
+        z
+    };
 
     // Step 2: Solve V · Z = Z' via the precomputed Cholesky factor of V (V is symmetric)
     let z_vec = solve_cholesky_factorized(v_pq_chol, &z_prime);
@@ -1513,7 +1746,8 @@ pub fn get_veff_pcm_by_q(
             [ri.aux_cols.len(), 1],
             w.data[ri.aux_cols.clone()].to_vec(),
         ).unwrap();
-        let vp_local = _dgemm_scaled(ri.cderi, 'N', &w_local, 'N', 1.0); // [nrow, 1]
+        let vp_local_data = par_mat_vec(ri.cderi, &w_local.data); // [nrow, 1]
+        let vp_local = MatrixFull::from_vec([vp_local_data.len(), 1], vp_local_data).unwrap();
         let vp_data = reduce_aux_contribution(ri, mpi_operator, &vp_local.data, vp_local.size[0], 0);
         let vp = MatrixFull::from_vec([vp_data.len(), 1], vp_data).unwrap();
         match ri.map {

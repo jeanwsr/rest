@@ -3,7 +3,7 @@ use crate::constants::{SQRT_THRESHOLD};
 use crate::mpi_io::MPIOperator;
 use rayon::prelude::*;
 use tensors::matrix_blas_lapack::{_dgemm_full, _dsymm, _pinv, _get_sqrt_and_inv_sqrt};
-use tensors::{BasicMatrix, MathMatrix, MatrixFull, MatrixUpper, TensorOpt, TensorOptMut, TensorSlice};
+use tensors::{BasicMatrix, MathMatrix, ParMathMatrix, MatrixFull, MatrixUpper, TensorOpt, TensorOptMut, TensorSlice};
 use log::{debug, warn};
 
 
@@ -37,6 +37,12 @@ pub struct ScfTraceRecord {
     /// target_vector. This allows clearing DIIS history (when transitioning
     /// from EDIIS to DIIS) without losing the EDIIS B-matrix data.
     pub ediis_fock: Vec<[MatrixFull<f64>;2]>,
+    /// Norm of the DIIS error vector at each iteration (for stagnation detection).
+    pub diis_error_norm_history: Vec<f64>,
+    /// Number of consecutive iterations the DIIS error has not decreased (stagnation).
+    pub diis_stagnation_count: usize,
+    /// How many times the subspace has been shrunk since the last progress.
+    pub diis_shrink_count: usize,
     /// Flag set when prepare_next_input applied density-matrix extrapolation
     /// (EDIIS/ADIIS) for HF: D_mixed is the next density, skip generate_density_matrix.
     pub extrapolated_density: bool,
@@ -79,6 +85,9 @@ impl ScfTraceRecord {
             ediis_density: Vec::<[MatrixFull<f64>;2]>::new(),
             ediis_energy: Vec::<f64>::new(),
             ediis_fock: Vec::<[MatrixFull<f64>;2]>::new(),
+            diis_error_norm_history: Vec::<f64>::new(),
+            diis_stagnation_count: 0,
+            diis_shrink_count: 0,
             extrapolated_density: false,
             needs_fock_rebuild: false,
             prev_density_extrapolated: false,
@@ -112,7 +121,10 @@ impl ScfTraceRecord {
         // update later. Restricted to the plain "diis" mixer and to the default
         // start cycle so that the EDIIS/ADIIS paths and explicit
         // start_diis_cycle settings keep their existing history semantics.
-        if tmp_records.mixer.eq(&"diis") && scf.mol.ctrl.start_diis_cycle <= 1 {
+        if tmp_records.mixer.eq(&"diis")
+            && scf.mol.ctrl.start_diis_cycle <= 1
+            && scf.mol.ctrl.force_state_occupation.is_empty()
+        {
             let mut dm_for_err = [tmp_records.density_matrix[0].clone(),
                                   tmp_records.density_matrix[1].clone()];
             let (guess_err, guess_target) = generate_diis_error_vector(
@@ -185,6 +197,60 @@ impl ScfTraceRecord {
         let alpha = self.mix_param;
         let beta = 1.0-self.mix_param;
         let mut level_shift_applied = false;
+        // ---- dynamic density damping ---------------------------------------------------
+        // While max|D_out - D_prev| (the same metric as the scf_acc_rho criterion)
+        // exceeds the threshold, the density fed to the next Fock build is a damped
+        // mixture D_prev + alpha_damp*(D_out - D_prev). The damped density replaces the
+        // cycle's output in the record as well, so the DIIS error vector stays a
+        // consistent [F(D), D] pair and the convergence trajectory bookkeeping is exact.
+        // alpha_damp = 0.5 in the moderate regime, 0.25 above |ΔD| > 0.1 (strong
+        // oscillation, e.g. the 0.5-Ha jumps observed on system1 iterations 24-28);
+        // damping switches itself off below the threshold.
+        let mut damping_applied = false;
+        // NOTE: scoped to the pre-DIIS phase only. Applying density damping on top of
+        // an active DIIS extrapolation stacked three mixing mechanisms (damped density,
+        // Pulay extrapolation, oscillation-triggered Fock mixing) and destabilized
+        // open-shell metallic trajectories catastrophically (system1: energies
+        // oscillating by thousands of Ha vs a converging undamped baseline). Before
+        // DIIS engages, damping replaces the fixed linear mix parameter.
+        if scf.mol.ctrl.dynamic_damping
+            && self.num_iter < start_pulay
+            && (self.mixer.eq(&"linear") || self.mixer.eq(&"diis"))
+        {
+            let thr = scf.mol.ctrl.damping_error_threshold;
+            let mut err = 0.0_f64;
+            for i_spin in 0..spin_channel {
+                let a = &self.density_matrix[0][i_spin].data;
+                let b = &self.density_matrix[1][i_spin].data;
+                let e = a.par_iter().zip(b.par_iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .reduce(|| 0.0_f64, |m, v| m.max(v));
+                err = err.max(e);
+            }
+            if err > 2.0 * thr {
+                // logarithmic taper: alpha = 1 (off) just above the threshold, 0.5 at
+                // 100x, flooring at 0.2. A constant alpha (0.5 up to the threshold)
+                // turned the tail into geometric halving — measured on the atomic
+                // reference SCFs: 300 iterations where ~30 suffice, because near the
+                // threshold the 50% mixing dominates and DIIS never engages. With the
+                // taper the damping fades out exactly where DIIS becomes superlinear.
+                let ratio = (err / thr).log10();
+                let alpha_d = (1.0 - 0.25 * ratio).clamp(0.2, 1.0);
+                for i_spin in 0..spin_channel {
+                    let residual = self.density_matrix[1][i_spin]
+                        .sub(&self.density_matrix[0][i_spin]).unwrap();
+                    let damped = self.density_matrix[0][i_spin]
+                        .scaled_add(&residual, alpha_d).unwrap();
+                    scf.density_matrix[i_spin] = damped.clone();
+                    self.density_matrix[1][i_spin] = damped;
+                }
+                damping_applied = true;
+                if scf.mol.ctrl.print_level > 0 {
+                    println!("[damping] iter {:3}: max|ΔD| = {:9.3e} > {:9.3e} -> {}% new density",
+                        self.num_iter, err, thr, (alpha_d * 100.0) as usize);
+                }
+            }
+        }
         if self.mixer.eq(&"direct") {
             scf.generate_hf_hamiltonian(mpi_operator);
             scf.grad_dm = scf.get_grad_dm();
@@ -193,6 +259,12 @@ impl ScfTraceRecord {
             || (self.mixer.eq(&"diis") && self.num_iter<start_pulay) 
         {
             debug!("using linear mixer");
+            if damping_applied {
+                // dynamic damping already set the input density above; only the Fock
+                // rebuild remains (its fixed mix_param mixing would double-damp)
+                scf.generate_hf_hamiltonian(mpi_operator);
+                scf.grad_dm = scf.get_grad_dm();
+            } else {
             let mut alpha = self.mix_param;
             let mut beta = 1.0-alpha;
             // n1[in] = a*n0[out] + (1-a)*n0[in] = n0[out]-(1-a)*Rn0 = n0[in] + a*Rn0
@@ -206,6 +278,7 @@ impl ScfTraceRecord {
             }
             scf.generate_hf_hamiltonian(mpi_operator);
             scf.grad_dm = scf.get_grad_dm();
+            }
         } else if self.mixer.eq(&"diis") && self.num_iter>=start_pulay {
             debug!("using diis mixer");
             // 
@@ -289,6 +362,80 @@ impl ScfTraceRecord {
             self.error_vector.push(cur_error_vec);
             self.target_vector.push(cur_target);
 
+            // ---- Gaussian-style DIIS subspace shrinking on stagnation ----------
+            // When the DIIS residual norm stops decreasing for several consecutive
+            // iterations, the accumulated history contains redundant or conflicting
+            // directions: the pseudo-inverse stays well-conditioned but the
+            // extrapolation no longer makes progress. Dropping the oldest vectors
+            // (keeping the most recent ones) changes the extrapolation landscape and
+            // can break through the plateau. Observed in practice: this is what
+            // mature SCF codes do when NSaved collapses from 20 to a handful.
+            {
+                let cur_norm: f64 = self.error_vector.last().unwrap()
+                    .iter().map(|x| x * x).sum::<f64>().sqrt();
+                let hist = &mut self.diis_error_norm_history;
+                hist.push(cur_norm);
+                if hist.len() >= 2 {
+                    let prev = hist[hist.len() - 2];
+                    // stagnation: current error not meaningfully smaller than previous
+                    if cur_norm > prev * 0.95 {
+                        self.diis_stagnation_count += 1;
+                    } else {
+                        self.diis_stagnation_count = 0;
+                        self.diis_shrink_count = 0;
+                    }
+                }
+                // shrink when stagnant for enough iterations; require more evidence
+                // at later stages (shrinking too eagerly in the early descent phase
+                // destroys useful history)
+                //
+                // CRITICAL GUARD: only shrink in the fine-convergence regime, where
+                // the per-iteration energy change is already small. During the basin
+                // search (energy changes of Ha-scale per iteration) the accumulated
+                // history is exactly what enables the eventual jump to the correct
+                // solution; destroying it with a shrink traps the SCF in the wrong
+                // basin (measured on system1: without this guard the shrink fires at
+                // iteration 8 and prevents the -6649→-6659 basin jump that the
+                // baseline makes at iteration 23).
+                let energy_change_recent = if self.energy_records.len() >= 2 {
+                    (self.energy_records[self.energy_records.len()-1]
+                     - self.energy_records[self.energy_records.len()-2]).abs()
+                } else { f64::INFINITY };
+                let in_fine_convergence = energy_change_recent < 1.0e-3;
+                // absolute error norm guard: even when the energy temporarily
+                // plateaus in a wrong basin (measured: -6649.91 for 2 iterations,
+                // ΔE=4e-4 < 1e-3), an error norm of O(1) means we are nowhere near
+                // any self-consistent solution — shrinking is inappropriate.
+                // Only shrink when the error norm itself indicates proximity to
+                // convergence (G16 convergence-tail error norms are ~1e-4..1e-6).
+                let near_convergence = cur_norm < 1.0e-3;
+                let stagnation_threshold = 4 + self.diis_shrink_count;
+                if self.diis_stagnation_count >= stagnation_threshold
+                    && self.error_vector.len() > 2
+                    && self.num_iter > 5
+                    && in_fine_convergence
+                    && near_convergence
+                {
+                    // progressive: keep half → keep quarter → keep 2
+                    let keep = match self.diis_shrink_count {
+                        0 => self.error_vector.len() / 2,
+                        1 => self.error_vector.len() / 4,
+                        _ => 2,
+                    };
+                    let keep = keep.max(2).min(self.error_vector.len() - 1);
+                    let drop = self.error_vector.len() - keep;
+                    if drop > 0 {
+                        self.error_vector.drain(0..drop);
+                        self.target_vector.drain(0..drop);
+                        self.diis_shrink_count += 1;
+                        self.diis_stagnation_count = 0;
+                        warn!(
+                            "DIIS stagnation detected (error norm {:.3e} not decreasing):                              shrinking subspace from {} to {} vectors (shrink #{})",
+                            cur_norm, keep + drop, keep, self.diis_shrink_count
+                        );
+                    }
+                }
+            }
 
             // solve the DIIS against the error vector
             if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len(), self.diis_pinv_threshold) {
@@ -296,7 +443,7 @@ impl ScfTraceRecord {
                 if let SCFType::ROHF = scf.scftype {
                     let mut next_roothaan = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
                     coeff.iter().enumerate().for_each(|(i, value)| {
-                        next_roothaan.self_scaled_add(&self.target_vector[i + start_dim][0], *value);
+                        next_roothaan.par_self_scaled_add(&self.target_vector[i + start_dim][0], *value);
                     });
                     let next_roothaan = next_roothaan.to_matrixupper();
 
@@ -311,7 +458,7 @@ impl ScfTraceRecord {
                 (0..spin_channel).into_iter().for_each(|i_spin| {
                     let mut next_hamiltonian = MatrixFull::new(self.target_vector[0][i_spin].size.clone(),0.0);
                     coeff.iter().enumerate().for_each(|(i,value)| {
-                        next_hamiltonian.self_scaled_add(&self.target_vector[i+start_dim][i_spin], *value);
+                        next_hamiltonian.par_self_scaled_add(&self.target_vector[i+start_dim][i_spin], *value);
                     });
                     let next_hamiltonian = next_hamiltonian.to_matrixupper();
 
@@ -391,12 +538,12 @@ impl ScfTraceRecord {
                 // The SCF loop diagonalizes F̃ → idempotent D_next.
                 if let SCFType::ROHF = scf.scftype {
                     let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                    for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                     scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                 } else {
                     for i_spin in 0..spin_channel {
                         let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                         scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
                 }
@@ -453,12 +600,12 @@ impl ScfTraceRecord {
                 if ediis_ok {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -470,12 +617,12 @@ impl ScfTraceRecord {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.target_vector[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.target_vector[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -539,12 +686,12 @@ impl ScfTraceRecord {
                 if adiis_ok {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.ediis_fock[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -556,12 +703,12 @@ impl ScfTraceRecord {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        for (k, ck) in coeff.iter().enumerate() { next_r.par_self_scaled_add(&self.target_vector[k][0], *ck); }
                         scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
                     } else {
                         for i_spin in 0..spin_channel {
                             let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            for (k, ck) in coeff.iter().enumerate() { next_h.par_self_scaled_add(&self.target_vector[k][i_spin], *ck); }
                             scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                         }
                     }
@@ -808,17 +955,26 @@ pub fn diis_solver(em: &Vec<Vec<f64>>,
     //let mut sum_inv_norm_rdm = [0.0,0.0];
     let mut sum_inv_norm_rdm = 0.0_f64;
 
-    // now prepare the norm matrix of the residual density matrix
+    // now prepare the norm matrix of the residual density matrix.
+    // Parallel over the independent (i, j) inner products; each dot uses a
+    // fixed-block deterministic reduction (chunks of DOT_BLK elements, block
+    // sums combined in ascending block order), so the value of every entry is
+    // bitwise independent of the number of worker threads.
     let mut opta = MatrixFull::new([dim,dim],0.0);
-    (start_dim..dim_vec).into_iter().for_each(|i| {
-        (start_dim..dim_vec).into_iter().for_each(|j| {
-            let mut inv_norm_rdm = em[i].iter()
-                .zip(em[j].iter())
-                .fold(0.0,|c,(d,e)| {c + d*e});
-            opta.set2d([i-start_dim,j-start_dim],inv_norm_rdm);
-            //sum_inv_norm_rdm += inv_norm_rdm;
+    const DOT_BLK: usize = 1 << 18;
+    let dots: Vec<((usize, usize), f64)> = (start_dim..dim_vec).into_par_iter().flat_map(|i| {
+        (start_dim..dim_vec).into_par_iter().map(move |j| {
+            let d = &em[i][..];
+            let e = &em[j][..];
+            let total = d.chunks(DOT_BLK).zip(e.chunks(DOT_BLK))
+                .map(|(db, eb)| db.iter().zip(eb.iter()).fold(0.0, |c, (x, y)| c + x * y))
+                .fold(0.0, |a, b| a + b);
+            ((i, j), total)
         })
-    });
+    }).collect();
+    for ((i, j), v) in dots {
+        opta.set2d([i-start_dim,j-start_dim],v);
+    }
     let inv_opta = _pinv(&opta, Some(pinv_threshold)).unwrap();
     let sum_inv = inv_opta.data.iter().sum::<f64>();
     if sum_inv.abs() < 1.0e-6 {

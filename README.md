@@ -213,6 +213,7 @@ guessfile = "my_checkpoint.rchk"
      threshold = 1.0e-13      # 缺省 1.0e-13
      uplo = "upper"           # 仅 Cholesky 使用；开发者选项，缺省 "upper"
      distributed = "auto"     # 仅 Cholesky + MPI 使用，缺省 "auto"
+     cd_threads = 0           # 仅 Cholesky 使用；0=自动，缺省 0
 ````
 
 - `policy`：取值String。
@@ -222,6 +223,7 @@ guessfile = "my_checkpoint.rchk"
 - `threshold`：取值f64。缺省 1.0e-13。`policy = "cd"` 时，若 Cholesky 因子对角元小于该阈值，先将矩阵补正到满足该阈值的正定程度再重新分解；`policy = "eig"` 时，只保留大于该阈值的特征值来构造 $J^{-1/2}$。
 - `uplo`：取值String。`"upper"`（缺省）或 `"lower"`，仅对 Cholesky 有效。列主序下通常使用 upper；lower 仅供调试与测试。
 - `distributed`：取值String。`"auto"`（缺省）/`"on"`/`"off"`。仅在（1）编译了 `scalapack` 与 `mpi` 特性、（2）MPI 进程数 ≥ 2、（3）`policy = "cd"` 三条同时满足时生效，其余组合一律回退到 rank-0 串行路径（特征分解没有分布式实现）。`auto` 仅在辅助基函数数 $n_{aux} \ge 8192$ 且进程数 ≥ 32 时才启用分布式 Cholesky 与三角求解；小体系测试可用 `on` 强制打开。
+- `cd_threads`：取值i32。仅对 Cholesky 有效。OpenBLAS 在 Cholesky 分解（dpotrf）期间使用的最大线程数。`0`（缺省）为自动：取 $\min(8,\ n_{aux}/512,\ \text{NUMA 节点核数},\ \texttt{num\_threads})$——实测 LAPACK 并行甜点在 8 线程附近（线程更多反而退化），矩阵太小则按面板数缩减，跨 NUMA 节点的线程争内存域。正整数显式覆盖自动值，但仍然不会超过 `num_threads` 设定的全局线程数：单线程运行不会因该键多占核。
 
 **与其他关键词的关系**：`algorithm_jk`/`algorithm_j`/`algorithm_k` 决定 $Y_{\mu\nu,P}$ 是常驻内存（`ri-incore`）还是即算即用（`ri-direct`），`j2c_decomp` 决定 $Y$ 的构造方式，两者正交、可自由组合。`ri-incore` 需要约 $0.5\,n_{ao}^2 n_{aux}$ 个双精度数的存储，通常是内存峰值的主要来源。
 
@@ -231,6 +233,12 @@ guessfile = "my_checkpoint.rchk"
 - `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-5
 - `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-3
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
+- `pexsi`: 取值布尔类型。是否用 PEXSI（极点展开 + 选择性求逆）替代 $O(N^3)$ 对角化求解自洽场。缺省为 `false`，即走对角化。该关键词是**运行期开关**，同一个可执行文件即可切换两种求解器，不需要重新编译；但可执行文件本身必须带 `pexsi` 特性（`cargo build --features pexsi`），否则该关键词会被接受、打印提示并忽略，仍走对角化。
+  - 稀疏结构在进入 SCF 之前由 `h_core` 在 1e-10 阈值下冻结一次（`H_core` 的支持包含 $S$，故 $F = H_{core} + J + V_{xc} \subseteq H_{core}$ 对局域泛函成立）。之后每一轮只更新 $F$ 与 $D$ 的数值，符号分解（`isSymbolicFactorize = 0`）跨轮复用。
+  - **适用范围**：LDA/GGA 已验证。H2O20/cc-pVDZ 实测与对角化路径相差 **+1.58 µHa**（0.71 µeV/atom）。精确交换（`xc = "hf"` 或杂化泛函）**不被拒绝但结果有偏**：$K_{ij} = -\sum_{kl} D_{kl}(ik|jl)$ 只需 $(i,k)$、$(j,l)$ 分别重叠，尾部按 $1/R$ 衰减，落在 `h_core` 模式之外，实测 H2O20 收敛能偏差 **−13.7 mHa**。程序只打印警告（含被丢弃的 $|F_{off}|$ 与其隐含的密度误差），由使用者权衡速度与精度。
+  - 只支持闭壳层（RHF）：RHF 之外会打印警告并退回对角化。`atom_sad = true` 的嵌套 SAD 自洽场是二重态，同样退回对角化。
+  - 渐近占据由极点展开的 Fermi–Dirac 函数给出，因此 `smear` 只能是 `fermi`（`gaussian` 会退回对角化），`smear_sigma` 即 $k_BT$（单位 Ha）；未指定时取 $0.05\times$gap 并夹在 $[5\times10^{-3}, 10^{-2}]$ Ha。`scf_conv_criteria` 建议用 `"dm"`：极点展开的密度噪声约 $10^{-6}$，`etot` 判据在这一量级以下无法闭合（该轮 `scf_acc_etot` 会自动放宽到不小于 `1e-4`），`g` 判据（$\|FDS - SDF\|_F$）也到不了 $10^{-5}$。
+  - 收敛后仍会做一次对角化，以给出属于收敛密度的本征值/本征向量（HOMO/LUMO、电荷、梯度与后自洽场分析都读这一套）。`OCCType::FRAC` 是轨道层面的构造，在 PEXSI 轮次中不适用并会给出警告。
 - `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
     - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
     - `ri-incore`: 强制使用 incore RI 算法 (储存完整的 Cholesky decomposed 3c-2e ERI $Y_{\mu \nu, P}$)。该算法对内存需求较大，但计算速度更快。
@@ -257,6 +265,10 @@ guessfile = "my_checkpoint.rchk"
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
+- `incremental_fock`: 取值bool。是否启用**密度增量 Fock**：当相邻两步的密度变化 `max|ΔD|` 落在 `scf_acc_rho` 与 `3 × scf_acc_rho` 之间时，J/K 直接复用缓存并只按密度差更新，省掉整张 RI 张量的重算。缺省为 false（实验性）。
+    - 复用只在收敛中段生效：`scf_acc_rho ≤ max|ΔD| < 3 × scf_acc_rho`。密度变化低于 `scf_acc_rho` 时强制全量重建，保证判据被接受时 Fock 与密度同步；连续复用满 4 步也强制重建一次。
+    - 收敛判据通过后还会多跑一次全量新鲜验证迭代，避免滞后的 Fock 使能量停在错误的收敛点。
+    - 能量误差与 `scf_acc_rho` 同量级（实测 w30 严格判据下与无增量路径差 < 1e-13 Ha）。适合迭代数多、单步 J/K 占比高的体系。默认关闭。
 
 ### 自洽场初猜相关关键词
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
@@ -318,6 +330,11 @@ chkfile = "mychk.rchk"
 - `ediis_switch_gap`：取值f64。预留关键词。当前实现中 EDIIS→DIIS 的切换由 DIIS 误差范数自动确定（阈值 1e-3），本关键词暂不生效。缺省为 0.1。
 - `adiis_penalty`：取值f64。ADIIS 惩罚参数 μ（Hu-Yang, JCP 2010, 132, 054109）。缺省为 0.5。仅当 `mixer = "adiis+diis"` 时生效。
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
+- `dynamic_damping`: 取值bool。是否在 DIIS 尚未接管的**早期迭代**（`num_iter < start_diis_cycle`）对密度做自适应阻尼。缺省为 false。
+    - 开启后，下一步的 Fock 由阻尼密度 `D_in + α·(D_out − D_in)` 构建，而不是直接用本轮的原始输出 `D_out`。α 取 0.5；当最大密度变化超过 0.1 a.u.（强振荡，例如数百 Ha 量级的能量跳变）时取 0.25。密度变化落到 `damping_error_threshold` 以下后自动关闭。
+    - 该选项只作用于 DIIS 之前的阶段。与已启用的 DIIS 外推叠加时会同时存在阻尼、Pulay 外推与振荡触发的线性混合三种机制，实测在开壳层过渡金属体系上互相破坏稳定性（能量千 Ha 级振荡），因此不要与 `start_diis_cycle = 1` 同时依赖。
+    - 适用于 DIIS 首轮即失控、需要先压住早期振荡的体系。绝大多数体系保持缺省 false。
+- `damping_error_threshold`: 取值f64。`dynamic_damping = true` 时的密度变化阈值（最大元，a.u.），低于该值不施加阻尼。缺省为 1.0e-3
 - `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
     - `"fermi"`：Fermi-Dirac 展宽
     - `"gaussian"`：Gaussian 展宽  
