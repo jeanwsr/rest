@@ -307,6 +307,20 @@ pub struct QuasiParticle {
     /// Automatically enabled for `job_type = "excited_state_opt"`.
     /// Default `false`.
     pub gradient_follow_state:bool,
+    /// How [`Self::gradient_follow_state`] identifies the state from one
+    /// geometry to the next.
+    ///
+    /// * `"auto"` (default): `"ao_transition"` for
+    ///   `job_type = "excited_state_opt"`, `"amplitude"` otherwise.
+    /// * `"amplitude"`: the historical `X^T X - Y^T Y` overlap of the BSE
+    ///   amplitudes.  Cheap, but tied to the MO gauge and to a stable active
+    ///   orbital ordering.
+    /// * `"ao_transition"`: overlap of the AO-basis transition density
+    ///   `T_{mu nu} = sum_ia (X_ia+Y_ia) C_{mu i} C_{nu a}`.  This is invariant
+    ///   under separate occupied/virtual MO rotations, and near-degenerate
+    ///   roots are matched by projecting onto the whole degenerate subspace
+    ///   instead of comparing arbitrary individual eigenvectors.
+    pub gradient_track_mode:String,
     /// Keep the BSE active space fixed at the indices used by the first
     /// geometry-optimization step.
     ///
@@ -969,6 +983,7 @@ impl Default for QuasiParticle {
             gradient_state:0,
             gradient_nroots:0,
             gradient_follow_state:false,
+            gradient_track_mode:String::from("auto"),
             gradient_pin_active_space:false,
             gradient_bse_window:0.0,
             gradient_bse_nvir:0,
@@ -1203,6 +1218,7 @@ impl QuasiParticle {
         table.insert("gradient_state".to_string(), toml::Value::Integer(self.gradient_state as i64));
         table.insert("gradient_nroots".to_string(), toml::Value::Integer(self.gradient_nroots as i64));
         table.insert("gradient_follow_state".to_string(), toml::Value::Boolean(self.gradient_follow_state));
+        table.insert("gradient_track_mode".to_string(), toml::Value::String(self.gradient_track_mode.clone()));
         table.insert("gradient_pin_active_space".to_string(), toml::Value::Boolean(self.gradient_pin_active_space));
         table.insert("gradient_bse_window".to_string(), toml::Value::Float(self.gradient_bse_window));
         table.insert("gradient_bse_nvir".to_string(), toml::Value::Integer(self.gradient_bse_nvir as i64));
@@ -1845,6 +1861,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.gradient_follow_state = match tmp_ctrl.get("gradient_follow_state").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => false,
+            };
+            tmp_input.gradient_track_mode = match tmp_ctrl.get("gradient_track_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("auto"),
             };
             tmp_input.gradient_pin_active_space = match tmp_ctrl.get("gradient_pin_active_space").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,

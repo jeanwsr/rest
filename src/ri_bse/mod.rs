@@ -18,6 +18,7 @@ use crate::solvers::davidson::{lr_davidson_solver, tda_davidson_solver, Davidson
 use crate::solvers::feast;
 use std::time::Instant;
 use std::{f64, fs::File, io::Write};
+pub mod state_tracking;
 pub mod dipoles;
 pub mod matvec;
 pub mod matvec_fast;

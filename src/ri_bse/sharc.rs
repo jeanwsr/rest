@@ -624,6 +624,22 @@ fn cross_ao_overlap(mol0: &Molecule, mol1: &Molecule, nao: usize) -> Vec<f64> {
     out
 }
 
+/// Cross-geometry AO overlap in row-major form,
+/// `s[mu*nao + nu] = <mu(R0)|nu(R1)>`.
+///
+/// This is the AO-level primitive behind [`cross_mo_overlap_at`] and behind
+/// the AO transition-density state tracker (`ri_bse::state_tracking`).
+pub fn cross_ao_overlap_at(
+    mol: &Molecule,
+    geom0: &[[f64; 3]],
+    geom1: &[[f64; 3]],
+    nao: usize,
+) -> Vec<f64> {
+    let mol0 = molecule_at_geometry(mol, geom0);
+    let mol1 = molecule_at_geometry(mol, geom1);
+    cross_ao_overlap(&mol0, &mol1, nao)
+}
+
 /// `S^MO_{pq} = sum_{mu nu} C0_{mu p} <mu(R0)|nu(R1)> C1_{nu q}` for one
 /// fixed ket geometry, row-major `[nmo,nmo]`.
 pub fn cross_mo_overlap_at(

@@ -1327,10 +1327,18 @@ dE/dR  = dE_SCF/dR + dOmega_S/dR
   梯度实际使用的 `[occ_start, vir_end)` 会写回并固定下来，避免能量窗口随几何
   漂移导致 `Omega(R)` 不连续。生产计算建议仍在卡里显式写出
   `bse_active_occ_start` / `bse_active_vir_end`，这样作业重投时活性空间不变。
-- `gradient_follow_state`（默认对 `excited_state_opt` 为 true）：按上一步 BSE
-  振幅的重叠 `X_old^T X_new - Y_old^T Y_new` 跟踪同一个电子态，而不是死守根序号。
-  `gradient_nroots` 需覆盖可能交换的根；未显式设置时至少求解 `gradient_state + 2`
-  个根，但只组装被跟踪根的梯度。
+- `gradient_follow_state`（默认对 `excited_state_opt` 为 true）：跟踪同一个电子态，
+  而不是死守根序号。`gradient_nroots` 需覆盖可能交换的根；未显式设置时至少求解
+  `gradient_state + 2` 个根，但只组装被跟踪根的梯度。
+- `gradient_track_mode`：跟踪判据。`"auto"`（缺省）对 `excited_state_opt` 使用
+  `"ao_transition"`，其他任务使用 `"amplitude"`。
+  - `"amplitude"`：历史上的 BSE 振幅重叠
+    `X_old^T X_new - Y_old^T Y_new`。便宜，但依赖 MO 规范。
+  - `"ao_transition"`：把每个根写成 AO 基跃迁密度
+    `T_{mu nu} = sum_ia (X_ia+Y_ia) C_{mu i} C_{nu a}`，用跨几何 AO 重叠
+    `S_{mu nu}(R0,R1)=<mu(R0)|nu(R1)>` 计算状态重叠。该量对占据-占据、虚-虚
+    的独立酉旋转严格不变；若目标根落入 BSE 简并流形，则把上一步状态投影到
+    整个新流形（子空间匹配），并对流形内所有根组装、平均梯度。
 
 最小示例（AC-GW、TDA、固定 27×46 活性空间）：
 

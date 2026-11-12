@@ -393,6 +393,31 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     );
     let follow_bse_state = qp_ctrl.gradient_follow_state || is_excited_state_opt;
     let pin_bse_active_space = qp_ctrl.gradient_pin_active_space || is_excited_state_opt;
+    // Resolve `auto`: an excited-state optimization uses the rotation-invariant
+    // AO transition-density tracker; a plain single-point card keeps the
+    // historical amplitude overlap unless it asks explicitly.
+    let resolved_track_mode = {
+        let m = qp_ctrl.gradient_track_mode.trim().to_lowercase();
+        match m.as_str() {
+            "" | "auto" => {
+                if is_excited_state_opt {
+                    "ao_transition".to_string()
+                } else {
+                    "amplitude".to_string()
+                }
+            }
+            "ao" | "ao_transition" | "transition_density" => "ao_transition".to_string(),
+            "amplitude" => "amplitude".to_string(),
+            other => panic!(
+                "Unknown gradient_track_mode = \"{other}\". \
+                 Expected \"auto\", \"amplitude\" or \"ao_transition\"."
+            ),
+        }
+    };
+    let use_ao_tracking = follow_bse_state && resolved_track_mode == "ao_transition";
+    if follow_bse_state {
+        println!("BSE state tracking mode: {resolved_track_mode}");
+    }
     // `"cvs bse"` is the documented spelling; accept the underscore/dash
     // variants as a convenience.  Matching is case-insensitive.
     let normalized_output_type = output_type.trim().to_lowercase();
@@ -755,7 +780,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 qp_ctrl.gradient_state
             );
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
-            let (grads, omegas, state, tracked_x, tracked_y,
+            let (grads, omegas, state, tracked_x, tracked_y, tracked_t,
+                 grad_group, geom_now, ao_mode_this_step,
                  used_occ_start, used_vir_end, active_nocc, active_nvir) = {
                 let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
                 let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
@@ -852,58 +878,201 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     );
                     return bse_output;
                 }
-                // Select the root this step differentiates.  With
-                // `gradient_follow_state` the previous step's amplitudes decide
-                // which current root is the *same electronic state*, so the
-                // optimization does not jump when two roots swap order.
+                // Select the root this step differentiates.
+                //
+                // Two trackers are available:
+                //  * "amplitude"    -- X^T X - Y^T Y of the BSE amplitudes
+                //                      (historical, cheap, MO-gauge dependent);
+                //  * "ao_transition"-- overlap of the AO transition density
+                //                      T_{mu nu} = sum_ia (X+Y)_ia C_{mu i} C_{nu a},
+                //                      which is invariant under separate
+                //                      occupied/virtual MO rotations.  A
+                //                      detected degenerate manifold is matched
+                //                      as a whole by subspace projection.
                 let dim = bse.screen.nocc * bse.screen.nvir;
+                let nao = scf_data.mol.num_basis;
+                let natm = scf_data.mol.geom.elem.len();
+                let geom_now = current_geometry_bohr(scf_data);
                 let mut selected_state = qp_ctrl.gradient_state;
                 let mut tracked_x = Vec::new();
                 let mut tracked_y = Vec::new();
-                let mut tracked_sign = 1.0f64;
+                let mut tracked_t = Vec::new();
                 let mut track_score = f64::NEG_INFINITY;
-                let have_previous = follow_bse_state
-                    && scf_data.bse_tracked_state.is_some()
-                    && scf_data.bse_tracked_nocc == bse.screen.nocc
-                    && scf_data.bse_tracked_nvir == bse.screen.nvir
-                    && scf_data.bse_tracked_x.len() == dim
-                    && !bse.roots.is_empty();
-                if have_previous {
-                    for (k, root) in bse.roots.iter().enumerate() {
-                        if root.x.len() < dim || root.y.len() < dim {
-                            continue;
-                        }
-                        let mut score = 0.0f64;
-                        for p in 0..dim {
-                            score += scf_data.bse_tracked_x[p] * root.x[p];
-                            score -= scf_data.bse_tracked_y[p] * root.y[p];
-                        }
-                        if score.abs() > track_score {
-                            track_score = score.abs();
-                            selected_state = k;
-                            tracked_sign = if score < 0.0 { -1.0 } else { 1.0 };
-                        }
+                let mut grad_group: Option<Vec<usize>> = None;
+                let mut ao_mode_this_step = use_ao_tracking;
+
+                if use_ao_tracking {
+                    let s_new_rm = crate::ri_bse::sharc::cross_ao_overlap_at(
+                        &scf_data.mol, &geom_now, &geom_now, nao);
+                    let s_new =
+                        crate::ri_bse::state_tracking::row_major_to_col(&s_new_rm, nao);
+                    let mut t_roots: Vec<Vec<f64>> = Vec::with_capacity(bse.roots.len());
+                    let mut any_valid = false;
+                    for root in bse.roots.iter() {
+                        let mut t = crate::ri_bse::state_tracking::transition_density_ao(
+                            &scf_data.eigenvectors[0],
+                            nao,
+                            &root.x,
+                            &root.y,
+                            bse.screen.nocc,
+                            bse.screen.nvir,
+                            bse.screen.occ_start,
+                            bse.screen.vir_start,
+                        );
+                        let n = crate::ri_bse::state_tracking::normalize_density(
+                            &mut t, &s_new, nao);
+                        any_valid |= n > 1.0e-10;
+                        t_roots.push(t);
                     }
-                    if selected_state != qp_ctrl.gradient_state {
+                    let have_previous = scf_data.bse_tracked_state.is_some()
+                        && scf_data.bse_tracked_nao == nao
+                        && scf_data.bse_tracked_t_ao.len() == nao * nao
+                        && scf_data.bse_tracked_geom_bohr.len() == natm
+                        && scf_data.bse_tracked_nocc == bse.screen.nocc
+                        && scf_data.bse_tracked_nvir == bse.screen.nvir
+                        && !bse.roots.is_empty();
+                    if !any_valid {
                         println!(
-                            "BSE state tracking: root {} -> root {} (amplitude overlap |S| = {:.6})",
+                            "BSE AO tracking: every solved root has a zero transition \
+                             density; falling back to amplitude overlap for this step."
+                        );
+                        ao_mode_this_step = false;
+                    } else if have_previous {
+                        let s_cross_rm = crate::ri_bse::sharc::cross_ao_overlap_at(
+                            &scf_data.mol,
+                            &scf_data.bse_tracked_geom_bohr,
+                            &geom_now,
+                            nao,
+                        );
+                        let s_cross =
+                            crate::ri_bse::state_tracking::row_major_to_col(&s_cross_rm, nao);
+                        let prev_t = &scf_data.bse_tracked_t_ao;
+                        let mut best = 0usize;
+                        let mut best_score = f64::NEG_INFINITY;
+                        for (k, t) in t_roots.iter().enumerate() {
+                            if !t.iter().any(|v| v.abs() > 0.0) {
+                                continue;
+                            }
+                            let sc = crate::ri_bse::state_tracking::cross_overlap(
+                                prev_t, t, &s_cross, nao);
+                            if sc.abs() > best_score {
+                                best_score = sc.abs();
+                                best = k;
+                            }
+                        }
+                        selected_state = best;
+                        track_score = best_score;
+                        if let Some(group) = bse
+                            .degenerate_groups
+                            .iter()
+                            .find(|g| g.contains(&best))
+                            .cloned()
+                        {
+                            let group_ts: Vec<Vec<f64>> =
+                                group.iter().map(|&j| t_roots[j].clone()).collect();
+                            let (proj, coeff) =
+                                crate::ri_bse::state_tracking::project_onto_subspace(
+                                    prev_t, &group_ts, &s_cross, &s_new, nao,
+                                );
+                            tracked_t = proj;
+                            grad_group = Some(group.clone());
+                            println!(
+                                "BSE AO tracking: root {} -> degenerate group {:?}, \
+                                 projected coefficients {:?}",
+                                qp_ctrl.gradient_state,
+                                group,
+                                coeff.iter().map(|c| format!("{c:+.3}")).collect::<Vec<_>>()
+                            );
+                        } else {
+                            let sign = if crate::ri_bse::state_tracking::cross_overlap(
+                                prev_t, &t_roots[best], &s_cross, nao,
+                            ) < 0.0
+                            {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            tracked_t = t_roots[best].iter().map(|v| sign * v).collect();
+                        }
+                        println!(
+                            "BSE AO tracking: root {} -> root {} \
+                             (transition-density overlap |S| = {:.6})",
                             qp_ctrl.gradient_state, selected_state, track_score
                         );
+                        if track_score < 0.5 {
+                            println!(
+                                "WARNING: BSE AO tracking overlap |S| = {:.3} < 0.5; \
+                                 the state character changed substantially.",
+                                track_score
+                            );
+                        }
                     } else {
+                        selected_state =
+                            qp_ctrl.gradient_state.min(bse.roots.len().saturating_sub(1));
+                        tracked_t = t_roots[selected_state].clone();
                         println!(
-                            "BSE state tracking: kept root {} (amplitude overlap |S| = {:.6})",
-                            selected_state, track_score
+                            "BSE AO tracking: first step, storing the transition density \
+                             of root {}",
+                            selected_state
                         );
                     }
-                    if track_score < 0.5 {
-                        println!(
-                            "WARNING: BSE state tracking overlap |S| = {:.3} < 0.5; \
-                             the root character changed substantially -- check the root composition.",
-                            track_score
-                        );
+                    if ao_mode_this_step && grad_group.is_none() {
+                        if let Some(group) = bse
+                            .degenerate_groups
+                            .iter()
+                            .find(|g| g.contains(&selected_state))
+                            .cloned()
+                        {
+                            grad_group = Some(group);
+                        }
                     }
-                } else if follow_bse_state {
-                    selected_state = qp_ctrl.gradient_state.min(bse.roots.len().saturating_sub(1));
+                }
+
+                if !ao_mode_this_step {
+                    let mut tracked_sign = 1.0f64;
+                    let have_previous = follow_bse_state
+                        && scf_data.bse_tracked_state.is_some()
+                        && scf_data.bse_tracked_nocc == bse.screen.nocc
+                        && scf_data.bse_tracked_nvir == bse.screen.nvir
+                        && scf_data.bse_tracked_x.len() == dim
+                        && !bse.roots.is_empty();
+                    if have_previous {
+                        for (k, root) in bse.roots.iter().enumerate() {
+                            if root.x.len() < dim || root.y.len() < dim {
+                                continue;
+                            }
+                            let mut score = 0.0f64;
+                            for p in 0..dim {
+                                score += scf_data.bse_tracked_x[p] * root.x[p];
+                                score -= scf_data.bse_tracked_y[p] * root.y[p];
+                            }
+                            if score.abs() > track_score {
+                                track_score = score.abs();
+                                selected_state = k;
+                                tracked_sign = if score < 0.0 { -1.0 } else { 1.0 };
+                            }
+                        }
+                        println!(
+                            "BSE amplitude tracking: root {} -> root {} \
+                             (amplitude overlap |S| = {:.6})",
+                            qp_ctrl.gradient_state, selected_state, track_score
+                        );
+                        if track_score < 0.5 {
+                            println!(
+                                "WARNING: BSE amplitude tracking overlap |S| = {:.3} < 0.5; \
+                                 the root character changed substantially.",
+                                track_score
+                            );
+                        }
+                    } else if follow_bse_state {
+                        selected_state =
+                            qp_ctrl.gradient_state.min(bse.roots.len().saturating_sub(1));
+                    }
+                    if follow_bse_state {
+                        let root = &bse.roots[selected_state];
+                        tracked_x = root.x.iter().map(|v| tracked_sign * v).collect();
+                        tracked_y = root.y.iter().map(|v| tracked_sign * v).collect();
+                    }
                 }
                 assert!(
                     selected_state < bse.roots.len(),
@@ -911,20 +1080,17 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     selected_state,
                     bse.roots.len()
                 );
-                if follow_bse_state {
-                    let root = &bse.roots[selected_state];
-                    tracked_x = root.x.iter().map(|v| tracked_sign * v).collect();
-                    tracked_y = root.y.iter().map(|v| tracked_sign * v).collect();
-                }
                 // `gradient_only_state`: solve `nroots` roots (the spectrum the
                 // card asked for) but assemble the gradient of the selected root
-                // alone.  Each extra assembled root costs a full fold + adjoint
-                // solve; an optimiser reads one.  An excited-state optimization
-                // always takes this branch: state tracking needs the extra
-                // roots' amplitudes, never their gradients.
-                let only = (qp_ctrl.gradient_only_state || is_excited_state_opt)
+                // alone.  A degenerate manifold is the exception: its gradient is
+                // only meaningful as the manifold average, so every member is
+                // assembled and the engine averages them.
+                let only = grad_group.is_none()
+                    && (qp_ctrl.gradient_only_state || is_excited_state_opt)
                     && selected_state < bse.roots.len();
-                if only {
+                if let Some(group) = &grad_group {
+                    bse.set_grad_roots(Some(group.clone()));
+                } else if only {
                     bse.set_grad_roots(Some(vec![selected_state]));
                 }
                 let (grads, omegas) = bse.analytic_gradients();
@@ -932,12 +1098,36 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 let used_vir_end = bse.screen.vir_start + bse.screen.nvir;
                 let active_nocc = bse.screen.nocc;
                 let active_nvir = bse.screen.nvir;
-                (grads, omegas, selected_state, tracked_x, tracked_y,
+                (grads, omegas, selected_state, tracked_x, tracked_y, tracked_t,
+                 grad_group, geom_now, ao_mode_this_step,
                  used_occ_start, used_vir_end, active_nocc, active_nvir)
             };
-            // with the one-root branch the returned vector holds that root alone;
-            // otherwise every solved root was assembled and `grads[state]` is it.
-            let g_state = if grads.len() == 1 && (qp_ctrl.gradient_only_state || is_excited_state_opt) {
+            // With the one-root branch the returned vector holds that root
+            // alone.  A degenerate manifold contributes one gradient per member,
+            // already replaced by the manifold average inside the engine.
+            let g_state = if let Some(group) = &grad_group {
+                assert_eq!(
+                    grads.len(),
+                    group.len(),
+                    "BSE degenerate manifold {:?}: {} gradients for {} members",
+                    group,
+                    grads.len(),
+                    group.len()
+                );
+                let mut mean = vec![0.0f64; grads[0].len()];
+                for g in grads.iter() {
+                    for (to, from) in mean.iter_mut().zip(g.iter()) {
+                        *to += from;
+                    }
+                }
+                let inv = 1.0 / grads.len() as f64;
+                for v in mean.iter_mut() {
+                    *v *= inv;
+                }
+                mean
+            } else if grads.len() == 1
+                && (qp_ctrl.gradient_only_state || is_excited_state_opt)
+            {
                 grads[0].clone()
             } else {
                 grads[state].clone()
@@ -963,10 +1153,21 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             }
             if follow_bse_state {
                 scf_data.bse_tracked_state = Some(state);
-                scf_data.bse_tracked_x = tracked_x;
-                scf_data.bse_tracked_y = tracked_y;
                 scf_data.bse_tracked_nocc = active_nocc;
                 scf_data.bse_tracked_nvir = active_nvir;
+                if ao_mode_this_step {
+                    scf_data.bse_tracked_t_ao = tracked_t;
+                    scf_data.bse_tracked_nao = scf_data.mol.num_basis;
+                    scf_data.bse_tracked_geom_bohr = geom_now;
+                    scf_data.bse_tracked_x.clear();
+                    scf_data.bse_tracked_y.clear();
+                } else {
+                    scf_data.bse_tracked_x = tracked_x;
+                    scf_data.bse_tracked_y = tracked_y;
+                    scf_data.bse_tracked_t_ao.clear();
+                    scf_data.bse_tracked_nao = 0;
+                    scf_data.bse_tracked_geom_bohr.clear();
+                }
             }
             // The geometry optimizer consumes exactly these two numbers; keep
             // them under fixed keys so `eval_force` does not have to parse the
@@ -1286,6 +1487,16 @@ fn sharc_step(
     }
 
     Ok(omegas)
+}
+
+/// Nuclear geometry currently stored in `scf_data`, in bohr, as one
+/// `[x, y, z]` per atom.  Used by the AO transition-density tracker.
+fn current_geometry_bohr(scf_data: &SCF) -> Vec<[f64; 3]> {
+    let natm = scf_data.mol.geom.elem.len();
+    let p = &scf_data.mol.geom.position;
+    (0..natm)
+        .map(|a| [p[[0, a]], p[[1, a]], p[[2, a]]])
+        .collect()
 }
 
 /// Energy cut-offs that define the BSE transition space for the analytic

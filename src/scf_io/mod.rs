@@ -142,6 +142,15 @@ pub struct SCF {
     /// Active-space shape of the stored amplitudes: `(nocc, nvir)`.
     pub bse_tracked_nocc: usize,
     pub bse_tracked_nvir: usize,
+    /// AO-basis transition density `T_{mu nu}` of the tracked state at the
+    /// previous geometry (column-major `[nao, nao]`).  Used by
+    /// `gradient_track_mode = "ao_transition"`; this representation is
+    /// invariant under separate occupied/virtual MO rotations.
+    pub bse_tracked_t_ao: Vec<f64>,
+    /// `nao` of [`Self::bse_tracked_t_ao`] (0 when no AO state is stored).
+    pub bse_tracked_nao: usize,
+    /// Nuclear geometry (bohr) at which `bse_tracked_t_ao` was computed.
+    pub bse_tracked_geom_bohr: Vec<[f64; 3]>,
 }
 
 #[derive(Clone,Copy)]
@@ -210,6 +219,9 @@ impl SCF {
             bse_tracked_y: Vec::new(),
             bse_tracked_nocc: 0,
             bse_tracked_nvir: 0,
+            bse_tracked_t_ao: Vec::new(),
+            bse_tracked_nao: 0,
+            bse_tracked_geom_bohr: Vec::new(),
         };
 
         // at first check the scf type: RHF, ROHF or UHF
