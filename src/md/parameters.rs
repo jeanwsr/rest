@@ -48,27 +48,21 @@ pub struct MdParameters {
     #[serde(default)]
     pub pdb_template: String,
 
-    /// PDB 轨迹输出间隔（步）。0 表示跟随 traj_interval。
     #[serde(default)]
     pub pdb_interval: usize,
 
-    /// PDB 轨迹跳过溶剂（水）原子。
     #[serde(default)]
     pub pdb_skip_solvent: bool,
 
-    /// XTC 压缩轨迹输出间隔（步）。0 表示跟随 traj_interval。
     #[serde(default)]
     pub xtc_interval: usize,
 
-    /// QM/MM link 对谐波约束（restrained-link，恢复切割键机械连接）。
     #[serde(default)]
     pub link_restraints: bool,
 
-    /// NPT Monte-Carlo 体积移动的尝试间隔（步）。
     #[serde(default = "default_baro_interval")]
     pub baro_interval: usize,
 
-    /// NPT Monte-Carlo 体积移动的初始尺度（自适应调节）。
     #[serde(default = "default_baro_scale")]
     pub baro_scale: f64,
 

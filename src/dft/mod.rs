@@ -2612,8 +2612,6 @@ impl Grids {
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
         let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
-        // Per-atom grid levels: atoms listed in grid_level_map use their own
-        // level (same scale as grid_generation_level), others the global level.
         let mut atom_levels: Vec<usize> = vec![grid_gen_level; mol.basis4elem.len()];
         if !mol.ctrl.grid_level_map.is_empty() {
             for (tmp_i, tmp_lv) in mol.ctrl.grid_level_map.iter() {

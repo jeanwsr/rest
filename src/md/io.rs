@@ -263,25 +263,7 @@ pub fn read_velocities_file(path: &str, symbols: &[String]) -> anyhow::Result<Ve
     Ok(vel)
 }
 
-// ---------------------------------------------------------------------------
-// PDB trajectory output (template driven)
-// ---------------------------------------------------------------------------
 
-/// Atom metadata read from a reference PDB.
-///
-/// Parsing follows the PDB fixed-column specification (records ATOM/HETATM):
-///   cols  1-6  record name
-///   cols 13-16 atom name   (kept verbatim so output reproduces the input)
-///   col  17    altLoc      (only blank / 'A' are kept)
-///   cols 18-20 residue name
-///   col  22    chain id
-///   cols 23-26 residue sequence number (kept verbatim; hex/hybrid-36 safe)
-///   cols 31-54 x, y, z
-///   cols 77-78 element symbol
-/// Only the first MODEL of a multi-model file is used.  Files without the
-/// element column are handled by an inference chain that follows the usual
-/// PDB conventions (ion residue names / known two-letter symbols / column
-/// alignment / first letter).
 pub struct PdbTemplate {
     pub names_raw: Vec<String>,
     pub resnames: Vec<String>,
@@ -306,11 +288,6 @@ pub(crate) const TWO_LETTER_ELEMENTS: &[&str] = &[
     "BA", "AL", "SI", "SE", "CA", "AG", "AU", "HG", "PT", "PD", "SN", "PB", "TI", "CR", "MO",
 ];
 
-/// Residue names denoting ions/metals: their atom names carry a two-letter
-/// element symbol (NA, CL, MG, CA...).  In non-ion residues the same
-/// spellings are organic atom labels (protein CA = alpha carbon,
-/// PB = P-beta, HG = H-gamma) whose element is only the first letter.
-/// Covers the PDB / CHARMM / GROMACS / AMBER spellings of common ions.
 pub(crate) const ION_RESNAMES: &[&str] = &[
     "NA", "CL", "MG", "CA", "K", "ZN", "FE", "MN", "CO", "NI", "CU", "CD", "HG", "PB",
     "SOD", "CLA", "CAL", "POT", "MG2", "ZN2", "FE2", "FE3", "CD2", "HG2", "PB2",
@@ -323,14 +300,6 @@ pub(crate) const ION_RESNAMES: &[&str] = &[
 pub(crate) const WATER_RESNAMES: &[&str] =
     &["SOL", "HOH", "WAT", "TIP3", "TIP", "TIP3P", "TIP4P", "SPC", "DOD", "H2O"];
 
-/// Atom-name spellings that are unambiguously elemental: no organic atom
-/// label uses them, so a match always denotes the element.  Covers heme iron
-/// (HEM/FE), selenomethionine (MSE/SE), ligand halogens (CL, BR) and the
-/// common transition metals.  The four spellings that DO collide with
-/// standard organic labels (CA = C-alpha, CD = C-delta, HG = H-gamma,
-/// PB = P-beta, and HO = hydroxyl H in AMBER) are deliberately absent —
-/// their ionic meaning is expressed through ION_RESNAMES instead, exactly
-/// the (resname, atomname) disambiguation GROMACS' atomprop database uses.
 pub(crate) const ELEMENTAL_ATOM_NAMES: &[&str] = &[
     "FE", "ZN", "MN", "CU", "NI", "MG", "SE", "BR", "CL", "NA", "LI", "RB", "BA", "SR",
     "AL", "SI", "SN", "TI", "CR", "MO", "W", "AU", "AG", "PT", "PD", "GA", "GE", "AS",
@@ -350,7 +319,6 @@ fn norm_element(s: &str) -> String {
     }
 }
 
-/// Canonical capitalisation for output ("NA" -> "Na", "CL" -> "Cl").
 fn canon_element(s: &str) -> String {
     let u = norm_element(s);
     let mut chars = u.chars();
@@ -361,17 +329,9 @@ fn canon_element(s: &str) -> String {
     }
 }
 
-/// Shared element inference from an atom name (+ residue context).  Used by
-/// BOTH the PDB template reader and the GRO topology reader so the two sides
-/// can never disagree.  Priority follows the production tools: an explicit
-/// element column wins (checked by the caller), then ion residues carry full
-/// element symbols, then unambiguous elemental spellings (HEM/FE, MSE/SE,
-/// ligand CL/BR), then organic atom-label conventions.  Returns the
-/// canonical capitalisation ("Na", "Cl", "Fe"), matching [geom] conventions.
 pub(crate) fn element_from_name(name_raw: &str, resname: &str) -> String {
     let up_res = resname.trim().to_ascii_uppercase();
     let up_name = name_raw.trim().to_ascii_uppercase();
-    // letters-only prefix of the atom name (handles 1HB, CL1, CD1, O5', ...)
     let letters: Vec<char> = name_raw
         .trim()
         .trim_start_matches(|c: char| !c.is_ascii_alphabetic())
@@ -379,9 +339,6 @@ pub(crate) fn element_from_name(name_raw: &str, resname: &str) -> String {
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
     let letters_up: String = letters.iter().map(|c| c.to_ascii_uppercase()).collect();
-    // 1) ion/metal residues: the atom name (or the residue name) carries the
-    //    element; try full name, then its two-letter prefix, then the
-    //    residue name (CHARMM CAL/CAL, GROMACS SOD/NA, ...)
     if ION_RESNAMES.contains(&up_res.as_str()) {
         let el = norm_element(&up_name);
         if TWO_LETTER_ELEMENTS.contains(&el.as_str()) {
@@ -397,16 +354,12 @@ pub(crate) fn element_from_name(name_raw: &str, resname: &str) -> String {
         }
         return canon_element(&el);
     }
-    // 2) unambiguous elemental spellings (also with trailing digits/charges)
     if ELEMENTAL_ATOM_NAMES.contains(&letters_up.as_str()) {
         return canon_element(&letters_up);
     }
-    // 3) organic labels: a lowercase second letter ("Fe", "Cl") still denotes
-    //    a two-letter element; uppercase spellings are Greek-position labels
     if letters.len() >= 2 && letters[1].is_lowercase() {
         return canon_element(&letters_up[..2]);
     }
-    // 4) fallback: first alphabetic character
     letters
         .first()
         .map(|c| c.to_ascii_uppercase().to_string())
@@ -414,7 +367,6 @@ pub(crate) fn element_from_name(name_raw: &str, resname: &str) -> String {
 }
 
 fn infer_element(name_raw: &str, resname: &str, elems_raw: &str) -> String {
-    // trust an explicit element column verbatim (GROMACS/OpenMM behaviour)
     let from_col = elems_raw.trim();
     if !from_col.is_empty() {
         return norm_element(from_col);
@@ -478,9 +430,6 @@ pub fn read_pdb_template(path: &str) -> std::io::Result<PdbTemplate> {
     Ok(t)
 }
 
-/// Map each system atom onto a template atom (nearest same-element within
-/// 1.5 A of the initial coordinates).  Unmatched atoms (e.g. link hydrogens)
-/// get `None` and are written with synthesized metadata.
 pub fn map_pdb_template(
     tmpl: &PdbTemplate,
     symbols: &[String],
@@ -550,9 +499,6 @@ fn pad_or_trunc(s: &str, n: usize) -> String {
     s.chars().take(n).collect::<String>()
 }
 
-/// Write one trajectory frame as a PDB MODEL, reproducing the reference
-/// record layout (atom-name and element columns are copied verbatim from the
-/// template; synthesized atoms follow the fixed-column conventions).
 #[allow(clippy::too_many_arguments)]
 pub fn write_pdb_frame<W: Write>(
     file: &mut W,
@@ -616,8 +562,6 @@ pub fn write_pdb_frame<W: Write>(
     Ok(())
 }
 
-/// 4-character atom-name field: keep the template text when present,
-/// otherwise right-align a short name (columns 14-16) as PDB does.
 fn name_field(src: &str) -> String {
     if src.len() == 4 && !src.trim().is_empty() {
         return src.to_string();
@@ -632,9 +576,6 @@ fn name_field(src: &str) -> String {
     }
 }
 
-/// 2-character element field (columns 77-78), right-justified canonical
-/// symbol — always normalised rather than copied verbatim, so files written
-/// by tools with sloppy element columns still come out consistent.
 fn elem_field(canonical: &str) -> String {
     format!("{:>2}", canon_element(canonical))
 }
@@ -645,7 +586,6 @@ mod tests {
 
     #[test]
     fn element_protein_labels() {
-        // protein atom labels: only the first letter is the element
         for (name, res, el) in [
             ("CA", "ALA", "C"),  // alpha carbon, NOT calcium
             ("CD", "ILE", "C"),  // C-delta
@@ -678,7 +618,6 @@ mod tests {
 
     #[test]
     fn element_unambiguous_names() {
-        // elemental spellings that are never organic labels
         for (name, res, el) in [
             ("FE", "HEM", "Fe"),  // heme iron, not fluorine
             ("SE", "MSE", "Se"),  // selenomethionine

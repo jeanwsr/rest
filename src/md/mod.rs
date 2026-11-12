@@ -107,7 +107,6 @@ struct EvalCtx {
     n_qm: usize,
     last_feval: std::rc::Rc<std::cell::RefCell<Option<ForceEval>>>,
     want_dipole: bool,
-    /// QM/MM link 对谐波约束: (QM 索引, MM 索引, r0_bohr, k_hartree/bohr2)
     link_rst: std::rc::Rc<Vec<(usize, usize, f64, f64)>>,
 }
 
@@ -161,7 +160,6 @@ impl EvalCtx {
             update_links(&mut pos, &mut vel, false, self.rt.as_deref(), self.params.qmmm.as_ref());
         }
         let mut fe = self.force(&pos, cell_nm);
-        // link 对谐波约束: 恢复被切共价键的机械连接 (restrained-link 方案)
         for &(i, j, r0_bohr, k_au) in self.link_rst.iter() {
             let dx = pos[3 * i] - pos[3 * j];
             let dy = pos[3 * i + 1] - pos[3 * j + 1];
@@ -1067,9 +1065,6 @@ pub fn run_md(
         mm_charges = top.charges[gro_skip..].to_vec();
         symbols.extend_from_slice(&top.symbols[gro_skip..]);
         mass_amu.extend_from_slice(&top.masses[gro_skip..]);
-        // Prefer OpenMM's own particle masses (serialised from the force-field
-        // topology) over gro atom-name guesses — topology truth beats naming
-        // heuristics for every force field.
         if let Some(sys) = mm_sys_owned.as_ref() {
             let n_mm = n_gro - gro_skip;
             if sys.masses.len() >= n_gro {
@@ -1629,12 +1624,6 @@ pub fn run_md(
 
         let link_lo = rt.map(|r| r.n_qm_geom - r.n_link).unwrap_or(0);
         let link_hi = rt.map(|r| r.n_qm_geom).unwrap_or(0);
-        // NPT Monte-Carlo volume moves rescale every position by the same
-        // factor; compare against the uniformly scaled reference so accepted
-        // moves do not trip the corruption guard.  Read the TRUE cell from
-        // the ASE driver: rt.box_nm can be stale right after a REJECTED move
-        // (the proposal's energy evaluation pushes the proposal cell into the
-        // tracker before Python restores the state).
         let box_now: [f64; 3] = {
             let c = ase_engine.cell_ang();
             c.map(|x| [x[0] / 10.0, x[1] / 10.0, x[2] / 10.0])

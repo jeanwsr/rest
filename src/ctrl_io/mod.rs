@@ -339,15 +339,8 @@ pub struct InputKeywords {
     pub basis_path: String,
     #[pyo3(get, set)]
     pub basis_type: String,
-    /// Per-atom basis-set overrides: (1-based atom index, basis-set name).
-    /// Atoms not listed fall back to `basis_path`. Indices run over `[geom]`
-    /// atoms first, then ghost-basis atoms.
     pub basis_map: Vec<(usize, String)>,
-    /// Per-atom auxiliary basis-set overrides (grammar identical to `basis_map`).
-    /// Atoms not listed fall back to `auxbas_path`.
     pub auxbas_map: Vec<(usize, String)>,
-    /// Per-atom DFT grid level overrides (0-9, same scale as `grid_generation_level`).
-    /// Atoms not listed fall back to `grid_generation_level`.
     pub grid_level_map: Vec<(usize, usize)>,
     #[pyo3(get, set)]
     pub auxbas_path: String,
@@ -728,7 +721,6 @@ pub struct InputKeywords {
     pub analdrv_tasks: Vec<AnalDrvTask>,
 }
 
-/// Parse the shared "i" / "i-j" (1-based, inclusive) atom-range key grammar.
 fn parse_atm_range_key(tmp_key: &str, tmp_keyword: &str) -> (usize, usize) {
     let tmp_spec: Vec<&str> = tmp_key.split('-').map(|s| s.trim()).collect();
     let (tmp_start, tmp_end) = match tmp_spec.as_slice() {
@@ -749,7 +741,6 @@ fn parse_atm_range_key(tmp_key: &str, tmp_keyword: &str) -> (usize, usize) {
     (tmp_start, tmp_end)
 }
 
-/// Sort by atom index and reject overlapping keys/ranges.
 fn dedup_atm_map<T>(mut out: Vec<(usize, T)>, tmp_keyword: &str) -> Vec<(usize, T)> {
     out.sort_by_key(|(tmp_i, _)| *tmp_i);
     if out.windows(2).any(|w| w[0].0 == w[1].0) {
@@ -758,8 +749,6 @@ fn dedup_atm_map<T>(mut out: Vec<(usize, T)>, tmp_keyword: &str) -> Vec<(usize, 
     out
 }
 
-/// Parse the shared grammar of `basis_map` / `auxbas_map`: a table mapping
-/// 1-based atom indices (or inclusive "i-j" ranges) to basis-set names.
 pub fn parse_atm_basis_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, String)> {
     match tmp_val {
         serde_json::Value::Object(tmp_map) => {
@@ -781,9 +770,6 @@ pub fn parse_atm_basis_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Ve
     }
 }
 
-/// Parse `grid_level_map`: a table mapping 1-based atom indices (or inclusive
-/// "i-j" ranges) to DFT grid generation levels (0-9, same scale as
-/// `grid_generation_level`).
 pub fn parse_atm_grid_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, usize)> {
     match tmp_val {
         serde_json::Value::Object(tmp_map) => {
@@ -1389,9 +1375,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level> 0 {println!("The {}-GTO basis set is taken from {}", tmp_input.basis_type,tmp_input.basis_path)};
 
-            // Per-atom basis overrides: basis_map = { "1" = "def2-tzvp", "5-8" = "cc-pvtz" }
-            // Keys are 1-based atom indices or inclusive ranges; values are basis-set
-            // names resolved like `basis_path` (pool lookup / BSE auto-download).
             tmp_input.basis_map = parse_atm_basis_map(tmp_ctrl.get("basis_map").unwrap_or(&serde_json::Value::Null), "basis_map");
             if !tmp_input.basis_map.is_empty() && tmp_input.basis_path == "chkfile" {
                 panic!("basis_map is not supported together with basis_path = \"chkfile\"");
@@ -1521,7 +1504,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             //    println!("The {}-GTO auxiliary basis set is taken from {}", tmp_input.auxbas_type,tmp_input.auxbas_path)
             //};
 
-            // Per-atom auxiliary basis overrides (grammar identical to basis_map)
             tmp_input.auxbas_map = parse_atm_basis_map(tmp_ctrl.get("auxbas_map").unwrap_or(&serde_json::Value::Null), "auxbas_map");
             // ===============================================
             //  Keywords for Gradient calculation
@@ -1799,7 +1781,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {3_usize},
             };
 
-            // Per-atom grid level overrides: grid_level_map = { "56-555" = 0 }
             tmp_input.grid_level_map = parse_atm_grid_map(tmp_ctrl.get("grid_level_map").unwrap_or(&serde_json::Value::Null), "grid_level_map");
 
             tmp_input.even_tempered_basis = match tmp_ctrl.get("even_tempered_basis").unwrap_or(&serde_json::Value::Null) {

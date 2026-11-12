@@ -89,13 +89,6 @@ class _RestAseMD:
             self.dyn = Langevin(atoms, timestep=timestep, temperature_K=temperature_k,
                                 friction=fric, fixcm=True, rng=rng)
         elif ensemble == 'npt':
-            # Exact NPT: Langevin thermostat + Monte-Carlo volume moves (the
-            # scheme OpenMM's MonteCarloBarostat implements).  The former ASE
-            # NPTBerendsen path was removed: it needs a calculator stress and
-            # the per-atom virial (sum r x f) misses the reciprocal-space PME
-            # virial, biasing the internal pressure by O(1000 bar) in polar
-            # systems and driving runaway box expansion.  Volume moves only
-            # need energies, which are exact.
             fric = friction if friction_units == 'ase' else friction / units.fs
             self.dyn = Langevin(atoms, timestep=timestep, temperature_K=temperature_k,
                                 friction=fric, fixcm=True, rng=rng)
@@ -130,7 +123,6 @@ class _RestAseMD:
         return [c for row in p for c in row], self.velocities_ang_fs()
 
     def _xtc_write(self):
-        # compressed Gromacs trajectory via mdtraj; positions/box in nm
         if self._xtc_fh is None:
             try:
                 from mdtraj.formats import XTCTrajectoryFile
@@ -154,10 +146,6 @@ class _RestAseMD:
             self._xtc_fh = None
 
     def _volume_mc(self, b):
-        # one Metropolis volume move:
-        #   accept if dG = dE + P dV - N kT ln(V'/V) < 0  (or Boltzmann draw)
-        # proposal scales all three cell axes isotropically; the step size is
-        # adapted to keep the acceptance rate near 30 %.
         atoms = self.atoms
         V0 = atoms.get_volume()
         n = len(atoms)
@@ -191,10 +179,6 @@ class _RestAseOpt:
         self.fixed = list(fixed)
         if self.fixed:
             atoms.set_constraint(FixAtoms(indices=self.fixed))
-        # Forces are supplied externally via step(f=...), but some ASE versions
-        # probe the calculator (get_forces/get_potential_energy) already at
-        # optimizer construction.  Attach a lazy calculator that replays the
-        # most recent external forces (zeros initially) so such versions work.
         self._last_f = np.zeros((len(atoms), 3))
         atoms.calc = _RestCalculator(lambda flat: (0.0, self._last_f.flatten()))
         from ase.optimize import FIRE
@@ -347,8 +331,6 @@ impl AseMd {
             let cls = locals
                 .get_item("_RestAseMD")?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("_RestAseMD missing"))?;
-            // NPT now uses Monte-Carlo volume moves inside the Python driver:
-            // pressure is passed in bar and converted with ase.units there.
             let args = pyo3::types::PyTuple::new(py, vec![
                 symbols.to_vec().into_py(py),
                 masses_amu.to_vec().into_py(py),
@@ -378,14 +360,12 @@ impl AseMd {
         .map_err(|e| anyhow::anyhow!("ASE MD engine construction failed: {}", e))
     }
 
-    /// Flush and close the XTC trajectory, if one is open.
     pub fn finish(&self) {
         Python::with_gil(|py| {
             let _ = self.driver.bind(py).call_method0("close_xtc");
         });
     }
 
-    /// Current cell edge lengths (Angstrom), when the dynamics carries a cell.
     pub fn cell_ang(&self) -> Option<[f64; 3]> {
         Python::with_gil(|py| -> Option<[f64; 3]> {
             let res = self.driver.bind(py).call_method0("cell_ang").ok()?;

@@ -27,8 +27,6 @@ pub(crate) fn prepare_atomic_scf(
     let mut atom_ctrl = InputKeywords::init_ctrl();
     atom_ctrl.xc = String::from("hf");
     atom_ctrl.basis_path = mol.ctrl.basis_path.clone();
-    // Same element may use a different basis on specific atoms (ctrl.basis_map);
-    // the atomic guess must be generated in that same basis.
     if let Some(b) = basis_override {
         atom_ctrl.basis_map = vec![(1usize, b.clone())];
     }
@@ -80,8 +78,6 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
     //let mut dms_beta: Vec<MatrixFull<f64>> = vec![];
     let mut atom_dms: HashMap<String, Vec<MatrixFull<f64>>> = HashMap::new();
 
-    // Same element may carry different basis sets (ctrl.basis_map), so atomic
-    // SAD densities are cached and block-diagonalized per (element, basis) pair.
     let basis_name_of = |atm_index: usize| -> String {
         match mol.ctrl.basis_map.binary_search_by_key(&(atm_index + 1), |(tmp_i, _)| *tmp_i) {
             Ok(tmp_pos) => mol.ctrl.basis_map[tmp_pos].1.clone(),

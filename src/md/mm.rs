@@ -183,11 +183,6 @@ pub fn parse_openmm_system_xml(path: &str) -> anyhow::Result<MmSystem> {
     Ok(sys)
 }
 
-/// Three-site water models: charges, oxygen LJ, geometry and internal force
-/// constants, straight from the official OpenMM templates.
-///   tip3p — charmm36.xml water (flexible TIP3P, Jorgensen 1983)
-///   opc3  — amber14/opc3.xml (Izadi & Onufriev, JCP 145, 074501 (2016);
-///           theta = arccos(1 - 1.598507^2 / (2*0.978882^2)) = 109.4712 deg)
 #[derive(Clone, Copy)]
 pub(crate) struct WaterModel {
     pub name: &'static str,
@@ -228,7 +223,6 @@ pub(crate) const WATER_OPC3: WaterModel = WaterModel {
     k_hoh_kjmol_rad2: 628.02,
 };
 
-/// Resolve a card `qmmm_water_model` value to its parameter set.
 pub(crate) fn water_model(name: &str) -> anyhow::Result<&'static WaterModel> {
     match name.trim().to_ascii_lowercase().as_str() {
         "tip3p" => Ok(&WATER_TIP3P),
@@ -559,7 +553,6 @@ fn flush_water(top: &mut MmTopology, water_atoms: &[(usize, bool)], water: &Wate
 }
 
 fn element_from_atomname(name: &str, resname: &str) -> String {
-    // shared with the PDB template reader so both sides always agree
     super::io::element_from_name(name, resname)
 }
 
@@ -852,8 +845,6 @@ impl OpenMmEngine {
         Ok((e_ha, f_au))
     }
 
-    /// Update the periodic box (nm) used by the OpenMM context. Needed by the
-    /// NPT barostat, which rescales the cell every step.
     pub fn set_box(&mut self, box_nm: [f64; 3]) -> anyhow::Result<()> {
         Python::with_gil(|py| -> PyResult<()> {
             self.driver.bind(py).call_method1("set_box", (box_nm.to_vec(),))?;
@@ -1189,9 +1180,7 @@ mod tests {
         assert_eq!(t.r_oh_a, 0.9572);
         let o = water_model("opc3").unwrap();
         assert_eq!(o.name, "opc3");
-        // neutral: q_o + 2 q_h = 0
         assert!((o.q_o + 2.0 * o.q_h).abs() < 1e-12);
-        // theta matches the OpenMM template value (1.9106321528999624 rad)
         assert!((o.theta_hoh_deg.to_radians() - 1.9106321528999624).abs() < 1e-6);
         assert_eq!(o.r_oh_nm, 0.0978882);
         assert_eq!(o.eps_o_kjmol, 0.683690704);
