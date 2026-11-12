@@ -5,7 +5,7 @@ use pyo3::types::PyDict;
 
 pub const ASE_TIME_PER_FS: f64 = 10.180512809629851;
 
-type EvalFn = dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)>;
+type EvalFn = dyn FnMut(&[f64], Option<&[f64]>) -> anyhow::Result<(f64, Vec<f64>)>;
 
 #[pyclass(unsendable)]
 struct PyForceHook {
@@ -14,12 +14,18 @@ struct PyForceHook {
 
 #[pymethods]
 impl PyForceHook {
-    fn __call__(&self, positions: Vec<f64>) -> PyResult<(f64, Vec<f64>)> {
+    #[pyo3(signature = (positions, cell=None))]
+    fn __call__(
+        &self,
+        positions: Vec<f64>,
+        cell: Option<Vec<f64>>,
+    ) -> PyResult<(f64, Vec<f64>)> {
         let mut slot = self.slot.borrow_mut();
         let f = slot.as_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("REST MD: force hook not initialized")
         })?;
-        f(&positions).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        f(&positions, cell.as_deref())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -41,22 +47,36 @@ class _RestCalculator(Calculator):
 
     def calculate(self, atoms=None, properties=('energy',), system_changes=all_changes):
         Calculator.calculate(self, atoms)
-        energy, forces = self._hook(list(atoms.get_positions().flatten()))
-        self.results = {'energy': energy,
-                        'forces': np.asarray(forces, dtype=float).reshape(-1, 3)}
+        have_cell = getattr(self.atoms, 'cell', None) is not None and self.atoms.cell.rank == 3
+        cell = [float(self.atoms.cell[i, i]) for i in range(3)] if have_cell else None
+        energy, forces = self._hook(list(atoms.get_positions().flatten()), cell)
+        f = np.asarray(forces, dtype=float).reshape(-1, 3)
+        self.results = {'energy': energy, 'forces': f}
 
 class _RestAseMD:
     def __init__(self, symbols, masses, positions_ang, velocities_ang_fs,
                  temperature_k, friction, friction_units, dt_fs, ensemble,
-                 seed, fixed, hook):
+                 seed, fixed, hook, cell_ang=None, pressure_bar=1.01325,
+                 taut_fs=100.0, taup_fs=2000.0, compressibility_au=None,
+                 baro_interval=25, baro_scale=0.02,
+                 xtc_path='', xtc_interval=0):
         atoms = Atoms(symbols=symbols,
                       positions=np.asarray(positions_ang, dtype=float).reshape(-1, 3),
                       masses=masses)
+        if cell_ang is not None:
+            atoms.set_cell(np.diag(np.asarray(cell_ang, dtype=float)))
+            atoms.pbc = True
         if fixed:
             atoms.set_constraint(FixAtoms(indices=list(fixed)))
         atoms.calc = _RestCalculator(hook)
         self._hook = hook
         rng = np.random.default_rng(seed)
+        self._rng = rng
+        self._temp_k = temperature_k
+        self._xtc_path = str(xtc_path)
+        self._xtc_interval = int(xtc_interval)
+        self._xtc_fh = None
+        self._n = 0
         if velocities_ang_fs is None:
             if temperature_k > 0.0:
                 MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_k, rng=rng)
@@ -68,9 +88,29 @@ class _RestAseMD:
             fric = friction if friction_units == 'ase' else friction / units.fs
             self.dyn = Langevin(atoms, timestep=timestep, temperature_K=temperature_k,
                                 friction=fric, fixcm=True, rng=rng)
+        elif ensemble == 'npt':
+            # Exact NPT: Langevin thermostat + Monte-Carlo volume moves (the
+            # scheme OpenMM's MonteCarloBarostat implements).  The former ASE
+            # NPTBerendsen path was removed: it needs a calculator stress and
+            # the per-atom virial (sum r x f) misses the reciprocal-space PME
+            # virial, biasing the internal pressure by O(1000 bar) in polar
+            # systems and driving runaway box expansion.  Volume moves only
+            # need energies, which are exact.
+            fric = friction if friction_units == 'ase' else friction / units.fs
+            self.dyn = Langevin(atoms, timestep=timestep, temperature_K=temperature_k,
+                                friction=fric, fixcm=True, rng=rng)
+            self._baro = {'interval': max(1, int(baro_interval)),
+                          'p_bar': float(pressure_bar),
+                          'delta': float(baro_scale),
+                          'hist': [], 'n': 0}
         else:
             self.dyn = VelocityVerlet(atoms, timestep=timestep)
         self.atoms = atoms
+
+    def cell_ang(self):
+        if getattr(self.atoms, 'cell', None) is not None and self.atoms.cell.rank == 3:
+            return [float(self.atoms.cell[i, i]) for i in range(3)]
+        return None
 
     def velocities_ang_fs(self):
         v = self.atoms.get_velocities()
@@ -78,8 +118,70 @@ class _RestAseMD:
 
     def step(self):
         self.dyn.step()
+        b = getattr(self, '_baro', None)
+        if b:
+            b['n'] += 1
+            if b['n'] % b['interval'] == 0:
+                self._volume_mc(b)
+        self._n += 1
+        if self._xtc_interval > 0 and self._xtc_path and self._n % self._xtc_interval == 0:
+            self._xtc_write()
         p = self.atoms.get_positions()
         return [c for row in p for c in row], self.velocities_ang_fs()
+
+    def _xtc_write(self):
+        # compressed Gromacs trajectory via mdtraj; positions/box in nm
+        if self._xtc_fh is None:
+            try:
+                from mdtraj.formats import XTCTrajectoryFile
+            except ImportError as e:
+                raise RuntimeError(
+                    'md output "xtc" requires the mdtraj package '
+                    '(pip install mdtraj)') from e
+            self._xtc_fh = XTCTrajectoryFile(self._xtc_path, 'w')
+        atoms = self.atoms
+        p = np.asarray(atoms.get_positions()) / 10.0
+        have_cell = getattr(atoms, 'cell', None) is not None and atoms.cell.rank == 3
+        box = None
+        if have_cell:
+            edges = np.array([float(atoms.cell[i, i]) for i in range(3)]) / 10.0
+            box = np.diag(edges)
+        self._xtc_fh.write(p, box=box)
+
+    def close_xtc(self):
+        if getattr(self, '_xtc_fh', None) is not None:
+            self._xtc_fh.close()
+            self._xtc_fh = None
+
+    def _volume_mc(self, b):
+        # one Metropolis volume move:
+        #   accept if dG = dE + P dV - N kT ln(V'/V) < 0  (or Boltzmann draw)
+        # proposal scales all three cell axes isotropically; the step size is
+        # adapted to keep the acceptance rate near 30 %.
+        atoms = self.atoms
+        V0 = atoms.get_volume()
+        n = len(atoms)
+        kT = units.kB * self._temp_k
+        p_eva3 = b['p_bar'] * units.bar
+        s = 1.0 + b['delta'] * (2.0 * self._rng.random() - 1.0)
+        E0 = atoms.get_potential_energy()
+        cell0 = np.array(atoms.get_cell())
+        pos0 = atoms.get_positions().copy()
+        atoms.set_cell(np.diag(np.diag(cell0) * s), scale_atoms=True)
+        E1 = atoms.get_potential_energy()
+        dG = (E1 - E0) + p_eva3 * V0 * (s ** 3 - 1.0) - n * kT * 3.0 * np.log(s)
+        ok = dG <= 0.0 or self._rng.random() < np.exp(-dG / kT)
+        if not ok:
+            atoms.set_cell(cell0, scale_atoms=False)
+            atoms.set_positions(pos0)
+        b['hist'].append(ok)
+        if len(b['hist']) >= 10:
+            rate = sum(b['hist']) / float(len(b['hist']))
+            if rate > 0.5:
+                b['delta'] = min(b['delta'] * 1.1, 0.05)
+            elif rate < 0.2:
+                b['delta'] = max(b['delta'] * 0.9, 1e-6)
+            b['hist'] = []
 
 class _RestAseOpt:
     def __init__(self, symbols, masses, positions_ang, fixed):
@@ -205,6 +307,7 @@ pub struct AseMd {
 impl AseMd {
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     pub fn new<F>(
         symbols: &[String],
         masses_amu: &[f64],
@@ -217,10 +320,19 @@ impl AseMd {
         ensemble: &str,
         seed: u64,
         fixed_rows: &[usize],
+        cell_ang: Option<[f64; 3]>,
+        pressure_bar: f64,
+        taut_fs: f64,
+        taup_fs: f64,
+        compressibility_bar: f64,
+        baro_interval: usize,
+        baro_scale: f64,
+        xtc_path: String,
+        xtc_interval: usize,
         eval: F,
     ) -> anyhow::Result<Self>
     where
-        F: FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + 'static,
+        F: FnMut(&[f64], Option<&[f64]>) -> anyhow::Result<(f64, Vec<f64>)> + 'static,
     {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| -> PyResult<Self> {
@@ -235,23 +347,56 @@ impl AseMd {
             let cls = locals
                 .get_item("_RestAseMD")?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("_RestAseMD missing"))?;
-            let driver = cls.call1((
-                symbols.to_vec(),
-                masses_amu.to_vec(),
-                pos_ang.to_vec(),
-                velocities_ang_fs.map(|v| v.to_vec()),
-                temperature_k,
-                friction,
-                friction_units.to_string(),
-                dt_fs,
-                ensemble.to_string(),
-                seed,
-                fixed_rows.to_vec(),
-                hook.clone_ref(py),
-            ))?;
+            // NPT now uses Monte-Carlo volume moves inside the Python driver:
+            // pressure is passed in bar and converted with ase.units there.
+            let args = pyo3::types::PyTuple::new(py, vec![
+                symbols.to_vec().into_py(py),
+                masses_amu.to_vec().into_py(py),
+                pos_ang.to_vec().into_py(py),
+                velocities_ang_fs.map(|v| v.to_vec()).into_py(py),
+                temperature_k.into_py(py),
+                friction.into_py(py),
+                friction_units.to_string().into_py(py),
+                dt_fs.into_py(py),
+                ensemble.to_string().into_py(py),
+                seed.into_py(py),
+                fixed_rows.to_vec().into_py(py),
+                hook.clone_ref(py).into_py(py),
+                cell_ang.map(|c| c.to_vec()).into_py(py),
+                pressure_bar.into_py(py),
+                taut_fs.into_py(py),
+                taup_fs.into_py(py),
+                compressibility_bar.into_py(py),
+                baro_interval.into_py(py),
+                baro_scale.into_py(py),
+                xtc_path.into_py(py),
+                xtc_interval.into_py(py),
+            ])?;
+            let driver = cls.call(args, None)?;
             Ok(AseMd { driver: driver.into(), _hook: hook })
         })
         .map_err(|e| anyhow::anyhow!("ASE MD engine construction failed: {}", e))
+    }
+
+    /// Flush and close the XTC trajectory, if one is open.
+    pub fn finish(&self) {
+        Python::with_gil(|py| {
+            let _ = self.driver.bind(py).call_method0("close_xtc");
+        });
+    }
+
+    /// Current cell edge lengths (Angstrom), when the dynamics carries a cell.
+    pub fn cell_ang(&self) -> Option<[f64; 3]> {
+        Python::with_gil(|py| -> Option<[f64; 3]> {
+            let res = self.driver.bind(py).call_method0("cell_ang").ok()?;
+            let v: Option<Vec<f64>> = res.extract().ok()?;
+            let v = v?;
+            if v.len() == 3 {
+                Some([v[0], v[1], v[2]])
+            } else {
+                None
+            }
+        })
     }
 
     pub fn velocities_ang_fs(&self) -> Vec<f64> {

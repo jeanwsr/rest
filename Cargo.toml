@@ -17,7 +17,7 @@ num = "0.4"
 num-complex = "0.4"
 libc = "0.2"
 #hdf5 = "0.8.0"
-hdf5-metno = "0.12"
+hdf5-metno = { version = "0.12", features = ["static"] }
 chrono = "0.4"
 #jemallocator = "0.3.2"
 #mimalloc = "0.1.43"

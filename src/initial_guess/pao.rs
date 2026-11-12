@@ -78,7 +78,7 @@ fn atom_basis_ranges(mol: &Molecule) -> Vec<[usize; 2]> {
 }
 
 fn atomic_guess_for_element(mol: &Molecule, ielem: &String) -> Option<AtomicGuessData> {
-    let atom_scf = prepare_atomic_scf(mol, ielem);
+    let atom_scf = prepare_atomic_scf(mol, ielem, None);
     let n_a = atom_scf.mol.num_basis;
     if atom_scf.eigenvectors[0].size()[0] != n_a {
         return None;

@@ -39,7 +39,7 @@ struct QmmmRuntime {
     n_gro: usize,
     mm_start: usize,
     charges: Vec<f64>,
-    box_nm: [f64; 3],
+    box_nm: std::cell::Cell<[f64; 3]>,
     mm_cutoff: f64,
     pbc: bool,
     xml_mode: bool,
@@ -107,10 +107,12 @@ struct EvalCtx {
     n_qm: usize,
     last_feval: std::rc::Rc<std::cell::RefCell<Option<ForceEval>>>,
     want_dipole: bool,
+    /// QM/MM link 对谐波约束: (QM 索引, MM 索引, r0_bohr, k_hartree/bohr2)
+    link_rst: std::rc::Rc<Vec<(usize, usize, f64, f64)>>,
 }
 
 impl EvalCtx {
-    fn force(&self, pos_bohr: &[f64]) -> ForceEval {
+    fn force(&self, pos_bohr: &[f64], cell_nm: Option<[f64; 3]>) -> ForceEval {
         let mut scf_b = self.scf.borrow_mut();
         let mut tm_b = self.tm.borrow_mut();
         let mut eng_b = self.engine.borrow_mut();
@@ -126,6 +128,7 @@ impl EvalCtx {
             self.params.qmmm.as_ref(),
             self.bias.as_deref(),
             self.want_dipole,
+            cell_nm,
         );
         if !scf_b.scf_converged {
             panic!(
@@ -136,19 +139,44 @@ impl EvalCtx {
         fe
     }
 
-    fn eval_ang(&self, positions_ang: &[f64]) -> anyhow::Result<(f64, Vec<f64>)> {
+    fn eval_ang(
+        &self,
+        positions_ang: &[f64],
+        cell_ang: Option<&[f64]>,
+    ) -> anyhow::Result<(f64, Vec<f64>)> {
         let pos_bohr: Vec<f64> =
             positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
-        self.eval_bohr(&pos_bohr)
+        let cell_nm = cell_ang.map(|c| [c[0] / 10.0, c[1] / 10.0, c[2] / 10.0]);
+        self.eval_bohr(&pos_bohr, cell_nm)
     }
 
-    fn eval_bohr(&self, pos_bohr: &[f64]) -> anyhow::Result<(f64, Vec<f64>)> {
+    fn eval_bohr(
+        &self,
+        pos_bohr: &[f64],
+        cell_nm: Option<[f64; 3]>,
+    ) -> anyhow::Result<(f64, Vec<f64>)> {
         let mut pos = pos_bohr.to_vec();
         if self.rt.is_some() {
             let mut vel = vec![0.0f64; pos.len()];
             update_links(&mut pos, &mut vel, false, self.rt.as_deref(), self.params.qmmm.as_ref());
         }
-        let fe = self.force(&pos);
+        let mut fe = self.force(&pos, cell_nm);
+        // link 对谐波约束: 恢复被切共价键的机械连接 (restrained-link 方案)
+        for &(i, j, r0_bohr, k_au) in self.link_rst.iter() {
+            let dx = pos[3 * i] - pos[3 * j];
+            let dy = pos[3 * i + 1] - pos[3 * j + 1];
+            let dz = pos[3 * i + 2] - pos[3 * j + 2];
+            let d = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-12);
+            let diff = d - r0_bohr;
+            fe.epot += 0.5 * k_au * diff * diff;
+            let fsc = k_au * diff / d;
+            fe.force[3 * i] -= fsc * dx / d;
+            fe.force[3 * i + 1] -= fsc * dy / d;
+            fe.force[3 * i + 2] -= fsc * dz / d;
+            fe.force[3 * j] += fsc * dx / d;
+            fe.force[3 * j + 1] += fsc * dy / d;
+            fe.force[3 * j + 2] += fsc * dz / d;
+        }
         let out = (
             fe.epot * HARTREE2EV,
             fe.force.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect::<Vec<f64>>(),
@@ -164,6 +192,24 @@ fn eval_pure_mm(
 ) -> anyhow::Result<(f64, Vec<f64>)> {
     let (e_ha, f_au) = engine.evaluate(pos_bohr)?;
     if f_au.iter().any(|x| !x.is_finite()) {
+        let bad: Vec<(usize, f64)> = f_au
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| !x.is_finite())
+            .map(|(i, x)| (i, *x))
+            .take(5)
+            .collect();
+        let max_finite = f_au
+            .iter()
+            .filter(|x| x.is_finite())
+            .fold(0.0f64, |a, x| a.max(x.abs()));
+        eprintln!(
+            "[debug] e_ha={:e} n_bad={} first_bad={:?} max_finite={:e}",
+            e_ha,
+            f_au.iter().filter(|x| !x.is_finite()).count(),
+            bad,
+            max_finite
+        );
         panic!("Pure-MM run: non-finite forces — check for overlapping particles");
     }
     Ok((e_ha, f_au))
@@ -181,8 +227,17 @@ fn evaluate_forces(
     qmmm_params: Option<&parameters::QmmmParams>,
     bias: Option<&UmbrellaBias>,
     want_dipole: bool,
+    cell_nm: Option<[f64; 3]>,
 ) -> ForceEval {
     let n_total = pos.len() / 3;
+    if let (Some(rt), Some(cell)) = (rt, cell_nm) {
+        rt.box_nm.set(cell);
+        if let Some(eng) = engine.as_mut() {
+            eng.set_box(cell).unwrap_or_else(|e| {
+                panic!("MD run: cannot update the periodic box for the NPT barostat: {}", e)
+            });
+        }
+    }
     let mut epot_mm = 0.0f64;
     let mut f_mm: Vec<f64> = Vec::new();
     let mut sites: Vec<mm::EmbeddingSite> = Vec::new();
@@ -214,7 +269,7 @@ fn evaluate_forces(
             &pos[..3 * n_qm_geom],
             &pos[3 * rt.mm_start..],
             &rt.charges,
-            rt.box_nm,
+            rt.box_nm.get(),
             qp.pbc,
             rt.mm_cutoff,
         );
@@ -444,10 +499,15 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         .map(|q| q.mm_file.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| panic!("pure_mm run requires qmmm_mm_file"));
+    let prefix = params.out_prefix.clone();
     let wall = std::time::Instant::now();
 
     let base = std::path::Path::new(ctrl_file).parent().unwrap_or(std::path::Path::new("."));
-    let top = mm::parse_gro(base.join(&mm_file).to_str().unwrap())?;
+    let water = mm::water_model(
+        params.qmmm.as_ref().map(|q| q.water_model.as_str()).unwrap_or("tip3p"),
+    )
+    .unwrap_or_else(|e| panic!("MD run: {}", e));
+    let top = mm::parse_gro(base.join(&mm_file).to_str().unwrap(), water)?;
 
     let lj_table = params.qmmm.as_ref().map(|q| q.lj.clone()).unwrap_or_default();
 
@@ -482,7 +542,7 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         )
         .unwrap_or_else(|e| panic!("MD run: {}", e))
     };
-    let engine = std::rc::Rc::new(engine);
+    let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
 
     let n = top.n_mm;
     let mut pos: Vec<f64> = top.pos_bohr.clone();
@@ -491,8 +551,8 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
     let mass_au = integrator::masses_amu_to_au(&mass_amu);
 
     println!(
-        "Pure-MM run: {} particles from {}, engine = OpenMM (SOL residues typed as TIP3P)",
-        n, mm_file
+        "Pure-MM run: {} particles from {}, engine = OpenMM (SOL residues typed as {})",
+        n, mm_file, water.name
     );
 
     let last_e = std::rc::Rc::new(std::cell::Cell::new(0.0f64));
@@ -501,17 +561,22 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
     let f_slot = last_f.clone();
     let hook_engine = engine.clone();
     let hook_e = last_e.clone();
-    let mut hook = move |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
+    let mut hook = move |positions_ang: &[f64], cell_ang: Option<&[f64]>|
+        -> anyhow::Result<(f64, Vec<f64>)> {
         let pos_bohr: Vec<f64> =
             positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
-        let (e_ha, f_au) = eval_pure_mm(&hook_engine, &pos_bohr)?;
+        let mut eng = hook_engine.borrow_mut();
+        if let Some(c) = cell_ang {
+            eng.set_box([c[0] / 10.0, c[1] / 10.0, c[2] / 10.0])?;
+        }
+        let (e_ha, f_au) = eval_pure_mm(&eng, &pos_bohr)?;
         hook_e.set(e_ha);
         *f_slot.borrow_mut() = f_au.clone();
         Ok((e_ha * HARTREE2EV, f_au.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect()))
     };
 
     if is_single_point {
-        let (e_ha, f_au) = eval_pure_mm(&engine, &pos)?;
+        let (e_ha, f_au) = eval_pure_mm(&engine.borrow(), &pos)?;
         let fmax_au = f_au.iter().fold(0.0f64, |a, x| a.max(x.abs()));
         println!("Potential Energy = {:.9} a.u.", e_ha);
         println!("Max force = {:.9} a.u.", fmax_au);
@@ -545,7 +610,7 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         let mut converged = false;
         loop {
             let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
-            let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
+            let (_e_ev, f_ev) = hook(&pos_ang, None).unwrap_or_else(|e| panic!("MD run: {}", e));
             let fmax = f_ev
                 .chunks(3)
                 .map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt())
@@ -618,6 +683,14 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
     let md_engine = engine.clone();
     let md_e = last_e.clone();
     let md_f = last_f.clone();
+    let mm_is_npt = params.ensemble.eq("npt");
+    let mm_cell_ang: Option<[f64; 3]> = if mm_is_npt {
+        let b = top.box_nm;
+        Some([b[0] * 10.0, b[1] * 10.0, b[2] * 10.0])
+    } else {
+        None
+    };
+    let mm_taut_fs = if params.friction > 0.0 { 1.0 / params.friction_fs_inv() } else { 500.0 };
     let md = ase::AseMd::new(
         &symbols,
         &mass_amu,
@@ -630,10 +703,33 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         &params.ensemble,
         seed,
         &[],
-        move |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
+        mm_cell_ang,
+        params.pressure,
+        mm_taut_fs,
+        params.tau_p * 1000.0,
+        params.compressibility,
+        params.baro_interval,
+        params.baro_scale,
+        if params.output_enabled("xtc") {
+            format!("{}dump_{}.xtc", prefix, params.ensemble)
+        } else {
+            String::new()
+        },
+        if params.output_enabled("xtc") {
+            if params.xtc_interval > 0 { params.xtc_interval } else { params.traj_interval.max(1) }
+        } else {
+            0
+        },
+        move |positions_ang: &[f64], cell_ang: Option<&[f64]>|
+            -> anyhow::Result<(f64, Vec<f64>)> {
             let pos_bohr: Vec<f64> =
                 positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
-            let (e_ha, f_au) = eval_pure_mm(&md_engine, &pos_bohr)?;
+            let mut eng = md_engine.borrow_mut();
+            if let Some(c) = cell_ang {
+                eng.set_box([c[0] / 10.0, c[1] / 10.0, c[2] / 10.0])?;
+            }
+            let (e_ha, f_au) = eval_pure_mm(&eng, &pos_bohr)?;
+            drop(eng);
             md_e.set(e_ha);
             *md_f.borrow_mut() = f_au.clone();
             Ok((e_ha * HARTREE2EV, f_au.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect()))
@@ -655,6 +751,21 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         let ekin = integrator::kinetic_energy_hartree(&vel, &mass_au);
         let epot = last_e.get();
         let temp = 2.0 * ekin / (3.0 * n as f64 * KB_HARTREE_PER_K);
+        if params.print_interval(step) {
+            match md.cell_ang() {
+                Some(b) => println!(
+                    "Pure-MM MD step {:6} / {} : Epot = {:.4} kJ/mol, T = {:.2} K, \
+                     box = {:.4} x {:.4} x {:.4} nm (V = {:.3} nm^3)",
+                    step, params.steps, epot * crate::constants::HARTREE2KJMOL, temp,
+                    b[0] / 10.0, b[1] / 10.0, b[2] / 10.0,
+                    b[0] * b[1] * b[2] / 1000.0
+                ),
+                None => println!(
+                    "Pure-MM MD step {:6} / {} : Epot = {:.4} kJ/mol, T = {:.2} K",
+                    step, params.steps, epot * crate::constants::HARTREE2KJMOL, temp
+                ),
+            }
+        }
         if step > params.equil_steps {
             let epot_kj = epot * crate::constants::HARTREE2KJMOL;
             let ekin_kj = ekin * crate::constants::HARTREE2KJMOL;
@@ -696,6 +807,7 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         &vel,
     )
     .unwrap();
+    md.finish();
     println!(
         "Pure-MM MD finished: {} steps in {:.1} s (md.log / dump_mm.xyz / md_restart)",
         params.steps,
@@ -738,6 +850,8 @@ pub fn run_md(
             };
             let use_gro = qp.mm_pdb.is_empty() && !qp.mm_file.is_empty();
             let gro_path = if use_gro { qp.mm_file.clone() } else { String::new() };
+            let water = mm::water_model(&qp.water_model)
+                .unwrap_or_else(|e| panic!("MD run: {}", e));
             let n_atoms = mm_build::build_system_from_top(
                 base.join(&qp.mm_pdb).to_str().unwrap(),
                 base.join(&qp.top).to_str().unwrap(),
@@ -750,6 +864,7 @@ pub fn run_md(
                 base.join("auto_system.xml").to_str().unwrap(),
                 base.join("auto_mm.gro").to_str().unwrap(),
                 &gro_path,
+                water,
             )
             .unwrap_or_else(|e| panic!("MD run: {}", e));
             qp.gro_skip = qm_atoms.len();
@@ -864,11 +979,13 @@ pub fn run_md(
 
         let base = std::path::Path::new(ctrl_file).parent().unwrap_or(std::path::Path::new("."));
 
+        let water = mm::water_model(&qp.water_model)
+            .unwrap_or_else(|e| panic!("MD run: {}", e));
         let top = if qp.build_box {
             if is_root {
                 println!(
-                    "QM/MM: building a TIP3P water box around the [geom] solute (margin = {:.1} A, spacing = {:.1} A)...",
-                    qp.box_margin, qp.box_spacing
+                    "QM/MM: building a {} water box around the [geom] solute (margin = {:.1} A, spacing = {:.1} A)...",
+                    water.name, qp.box_margin, qp.box_spacing
                 );
             }
             let (gro_text, n_waters) = mm::build_solute_water_box(
@@ -878,6 +995,7 @@ pub fn run_md(
                 qp.box_spacing,
                 0,
                 params.seed,
+                water,
             );
             let box_path = base.join("auto_box.gro");
             std::fs::write(&box_path, &gro_text)
@@ -885,10 +1003,12 @@ pub fn run_md(
             if is_root {
                 println!("QM/MM: {} waters generated, box written to auto_box.gro", n_waters);
             }
-            mm::parse_gro(box_path.to_str().unwrap()).unwrap_or_else(|e| panic!("MD run: {}", e))
+            mm::parse_gro(box_path.to_str().unwrap(), water)
+                .unwrap_or_else(|e| panic!("MD run: {}", e))
         } else {
             let gro_path = base.join(&qp.mm_file);
-            mm::parse_gro(gro_path.to_str().unwrap()).unwrap_or_else(|e| panic!("MD run: {}", e))
+            mm::parse_gro(gro_path.to_str().unwrap(), water)
+                .unwrap_or_else(|e| panic!("MD run: {}", e))
         };
         n_gro = top.n_mm + 0;
         box_nm = top.box_nm;
@@ -947,6 +1067,20 @@ pub fn run_md(
         mm_charges = top.charges[gro_skip..].to_vec();
         symbols.extend_from_slice(&top.symbols[gro_skip..]);
         mass_amu.extend_from_slice(&top.masses[gro_skip..]);
+        // Prefer OpenMM's own particle masses (serialised from the force-field
+        // topology) over gro atom-name guesses — topology truth beats naming
+        // heuristics for every force field.
+        if let Some(sys) = mm_sys_owned.as_ref() {
+            let n_mm = n_gro - gro_skip;
+            if sys.masses.len() >= n_gro {
+                for k in 0..n_mm {
+                    let xm = sys.masses[gro_skip + k];
+                    if xm > 0.0 {
+                        mass_amu[gro_skip + k] = xm;
+                    }
+                }
+            }
+        }
         pos.extend_from_slice(&top.pos_bohr[3 * gro_skip..]);
     }
     let n_total = symbols.len();
@@ -987,7 +1121,7 @@ pub fn run_md(
 
                 mm_charges.clone()
             },
-            box_nm,
+            box_nm: std::cell::Cell::new(box_nm),
             mm_cutoff: qp.mm_cutoff,
             pbc: qp.pbc,
             xml_mode,
@@ -1078,6 +1212,54 @@ pub fn run_md(
     } else {
         None
     };
+    let (mut f_pdb, pdb_tmpl, pdb_map) = if params.output_enabled("pdb") {
+        let base0 = std::path::Path::new(ctrl_file).parent().unwrap_or(std::path::Path::new("."));
+        let base = if base0.as_os_str().is_empty() { std::path::Path::new(".") } else { base0 };
+        let tmpl_path: Option<std::path::PathBuf> = if !params.pdb_template.is_empty() {
+            Some(base.join(&params.pdb_template))
+        } else {
+            let mut found = None;
+            if let Ok(rd) = std::fs::read_dir(base) {
+                let mut cands: Vec<_> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|q| q.extension().map_or(false, |x| x.eq_ignore_ascii_case("pdb")))
+                    .collect();
+                cands.sort();
+                found = cands.into_iter().next();
+            }
+            found
+        };
+        let tmpl = match tmpl_path {
+            Some(q) => io::read_pdb_template(q.to_str().unwrap()).unwrap_or_else(|e| {
+                panic!("MD run: cannot read pdb template '{}': {}", q.display(), e)
+            }),
+            None => {
+                panic!(
+                    "MD run: outputs include \"pdb\" but no .pdb template was found next to \
+                     '{}'; put the reference PDB there or set md pdb_template",
+                    ctrl_file
+                )
+            }
+        };
+        let pos_ang0: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+        let map = io::map_pdb_template(&tmpl, &symbols, &pos_ang0);
+        let matched = map.iter().filter(|m| m.is_some()).count();
+        if is_root {
+            println!(
+                "PDB output: template with {} atoms, {} of {} system atoms matched \
+                 (unmatched written as UNK)",
+                tmpl.names_raw.len(), matched, n_total
+            );
+        }
+        (
+            open(format!("{}dump_{}.pdb", prefix, params.ensemble)),
+            Some(tmpl),
+            map,
+        )
+    } else {
+        (None, None, Vec::new())
+    };
     let mut f_efl = if params.qmmm.is_some() && params.output_enabled("energy_force") {
         let mut f = open(format!("{}energy_force.log", prefix));
         if let Some(f) = f.as_mut() {
@@ -1112,7 +1294,7 @@ pub fn run_md(
     if params.ensemble.eq("sp") || params.ensemble.eq("singlepoint") {
         let fe = evaluate_forces(
             &mut scf_data, &mut time_mark, &mpi_operator, &pos, is_root, n_qm, rt, &mut engine,
-            params.qmmm.as_ref(), bias, params.output_enabled("dipole"),
+            params.qmmm.as_ref(), bias, params.output_enabled("dipole"), None,
         );
         if is_root {
             let fmax =
@@ -1169,7 +1351,7 @@ pub fn run_md(
             }
             let fe = evaluate_forces(
                 &mut scf_data, &mut time_mark, &mpi_operator, &pos_bohr, is_root, n_qm, rt,
-                &mut engine, params.qmmm.as_ref(), bias, false,
+                &mut engine, params.qmmm.as_ref(), bias, false, None,
             );
             if !fe.force.iter().all(|x| x.is_finite()) {
                 panic!("MD run: non-finite forces during optimization — aborting");
@@ -1290,12 +1472,54 @@ pub fn run_md(
     let bias_rc: Option<std::rc::Rc<UmbrellaBias>> = bias_owned.take().map(std::rc::Rc::new);
     let params = std::rc::Rc::new(params);
     let last_feval = std::rc::Rc::new(std::cell::RefCell::new(None::<ForceEval>));
+        let link_rst_au: Vec<(usize, usize, f64, f64)> = if params.link_restraints && params.qmmm.is_some() {
+        let lr_path = std::path::Path::new(ctrl_file).parent().unwrap_or(std::path::Path::new("."))
+            .join("link_restraints.dat");
+        let txt = std::fs::read_to_string(&lr_path)
+            .unwrap_or_else(|e| panic!("MD run: cannot read link_restraints.dat: {}", e));
+        let mut rows: Vec<(f64, f64)> = Vec::new();
+        for line in txt.lines() {
+            let f: Vec<f64> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            if f.len() >= 2 {
+                rows.push((f[0], f[1]));
+            }
+        }
+        let links = params.qmmm.as_ref().map(|q| q.links.clone()).unwrap_or_default();
+        if rows.len() != links.len() {
+            panic!(
+                "MD run: link_restraints.dat has {} rows but qmmm_links has {} pairs",
+                rows.len(),
+                links.len()
+            );
+        }
+        let conv_r = 10.0 * crate::constants::BOHR;                 // nm -> bohr
+        let conv_k = conv_r * conv_r / crate::constants::HARTREE2KJMOL;               // kJ/mol/nm2 -> hartree/bohr2
+        println!(
+            "MD run: link pair restraints ON ({} pairs, r0 in nm, k in kJ/mol/nm2)",
+            links.len()
+        );
+        links
+            .iter()
+            .zip(rows)
+            .map(|(l, (r0, k))| {
+                (
+                    l.0,
+                    l.1,
+                    r0 * conv_r,
+                    k * conv_k,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let ctx = std::rc::Rc::new(EvalCtx {
         scf: scf.clone(),
         tm: tm.clone(),
         mpi: mpi.clone(),
         engine: engine_cell.clone(),
         rt: rt_rc.clone(),
+        link_rst: std::rc::Rc::new(link_rst_au),
         bias: bias_rc.clone(),
         params: params.clone(),
         is_root,
@@ -1319,6 +1543,25 @@ pub fn run_md(
     };
     let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
     let ctx_hook = ctx.clone();
+    let is_npt = params.ensemble.eq("npt");
+    if is_npt && rt.is_none() {
+        panic!(
+            "MD run: ensemble npt needs a periodic MM box (QM/MM with qmmm_system_xml/gro); \
+             pure-QM NPT is not supported"
+        );
+    }
+    let cell_ang: Option<[f64; 3]> = if is_npt {
+        rt.map(|r| {
+            let b = r.box_nm.get();
+            [b[0] * 10.0, b[1] * 10.0, b[2] * 10.0]
+        })
+    } else {
+        None
+    };
+    let taut_fs = if params.friction > 0.0 { 1.0 / params.friction_fs_inv() } else { 500.0 };
+
+
+
     let ase_engine = ase::AseMd::new(
         &symbols,
         &mass_amu,
@@ -1331,7 +1574,24 @@ pub fn run_md(
         &params.ensemble,
         seed,
         &fixed_rows,
-        move |p: &[f64]| ctx_hook.eval_ang(p),
+        cell_ang,
+        params.pressure,
+        taut_fs,
+        params.tau_p * 1000.0,
+        params.compressibility,
+        params.baro_interval,
+        params.baro_scale,
+        if params.output_enabled("xtc") {
+            format!("{}dump_{}.xtc", prefix, params.ensemble)
+        } else {
+            String::new()
+        },
+        if params.output_enabled("xtc") {
+            if params.xtc_interval > 0 { params.xtc_interval } else { params.traj_interval.max(1) }
+        } else {
+            0
+        },
+        move |p: &[f64], cell: Option<&[f64]>| ctx_hook.eval_ang(p, cell),
     )
     .unwrap_or_else(|e| panic!("MD run: {}", e));
     vel = ase_engine
@@ -1339,17 +1599,26 @@ pub fn run_md(
         .iter()
         .map(|v| v * integrator::AU_TIME_TO_FS / crate::constants::BOHR)
         .collect();
-    let g_fs = if params.ensemble.eq("nvt") { params.friction_fs_inv() } else { 0.0 };
-    println!(
-        "MD engine: ASE {} (friction = {} {} -> {:.4} 1/fs, tau = {:.1} fs)",
-        if params.ensemble.eq("nvt") { "Langevin" } else { "VelocityVerlet" },
-        params.friction,
-        params.friction_units,
-        g_fs,
-        if g_fs > 0.0 { 1.0 / g_fs } else { f64::INFINITY }
-    );
+    if params.ensemble.eq("npt") {
+        println!(
+            "MD engine: ASE NPT = Langevin + Monte-Carlo volume moves \
+             (P = {} bar, interval = {} steps, initial scale = {:.3} adaptive)",
+            params.pressure, params.baro_interval, params.baro_scale
+        );
+    } else {
+        let g_fs = if params.ensemble.eq("nvt") { params.friction_fs_inv() } else { 0.0 };
+        println!(
+            "MD engine: ASE {} (friction = {} {} -> {:.4} 1/fs, tau = {:.1} fs)",
+            if params.ensemble.eq("nvt") { "Langevin" } else { "VelocityVerlet" },
+            params.friction,
+            params.friction_units,
+            g_fs,
+            if g_fs > 0.0 { 1.0 / g_fs } else { f64::INFINITY }
+        );
+    }
     let last_feval = ctx.last_feval.clone();
     let mut prev_pos = pos.clone();
+    let mut prev_box: [f64; 3] = rt.map(|r| r.box_nm.get()).unwrap_or([1.0; 3]);
 
     for step in 1..=params.steps {
         let (p_ang, v_ang) = ase_engine.step().unwrap_or_else(|e| panic!("MD run: {}", e));
@@ -1360,15 +1629,28 @@ pub fn run_md(
 
         let link_lo = rt.map(|r| r.n_qm_geom - r.n_link).unwrap_or(0);
         let link_hi = rt.map(|r| r.n_qm_geom).unwrap_or(0);
+        // NPT Monte-Carlo volume moves rescale every position by the same
+        // factor; compare against the uniformly scaled reference so accepted
+        // moves do not trip the corruption guard.  Read the TRUE cell from
+        // the ASE driver: rt.box_nm can be stale right after a REJECTED move
+        // (the proposal's energy evaluation pushes the proposal cell into the
+        // tracker before Python restores the state).
+        let box_now: [f64; 3] = {
+            let c = ase_engine.cell_ang();
+            c.map(|x| [x[0] / 10.0, x[1] / 10.0, x[2] / 10.0])
+                .unwrap_or_else(|| rt.map(|r| r.box_nm.get()).unwrap_or([1.0; 3]))
+        };
+        let s_baro = if is_npt && prev_box[0] > 1e-9 { box_now[0] / prev_box[0] } else { 1.0 };
+        prev_box = box_now;
         let mut worst = 0.0f64;
         let mut worst_atom = 0usize;
         for i in 0..n_total {
             if i >= link_lo && i < link_hi {
                 continue;
             }
-            let dx = pos[3 * i] - prev_pos[3 * i];
-            let dy = pos[3 * i + 1] - prev_pos[3 * i + 1];
-            let dz = pos[3 * i + 2] - prev_pos[3 * i + 2];
+            let dx = pos[3 * i] - s_baro * prev_pos[3 * i];
+            let dy = pos[3 * i + 1] - s_baro * prev_pos[3 * i + 1];
+            let dz = pos[3 * i + 2] - s_baro * prev_pos[3 * i + 2];
             let d = (dx * dx + dy * dy + dz * dz).sqrt();
             if d > worst {
                 worst = d;
@@ -1418,7 +1700,10 @@ pub fn run_md(
                     feval.max_f_mm_ev,
                 );
             }
-            if pstep % params.traj_interval == 0 || pstep == params.steps {
+            let traj_due = pstep % params.traj_interval == 0 || pstep == params.steps;
+            let pdb_every = if params.pdb_interval > 0 { params.pdb_interval } else { params.traj_interval };
+            let pdb_due = pstep % pdb_every == 0 || pstep == params.steps;
+            if traj_due {
                 if let Some(f) = f_traj.as_mut() {
                     let _ = io::write_traj_frame(
                         f, &symbols, &pos, &vel, &feval.force, &mass_amu,
@@ -1439,16 +1724,55 @@ pub fn run_md(
                     );
                 }
             }
+            if pdb_due {
+                if let (Some(f), Some(tmpl)) = (f_pdb.as_mut(), pdb_tmpl.as_ref()) {
+                    let box_ang = {
+                        let c = ase_engine.cell_ang();
+                        c.map(|x| [x[0], x[1], x[2]])
+                            .or_else(|| {
+                                rt.map(|r| {
+                                    let b = r.box_nm.get();
+                                    [b[0] * 10.0, b[1] * 10.0, b[2] * 10.0]
+                                })
+                            })
+                    };
+                    let _ = io::write_pdb_frame(
+                        f, tmpl, &pdb_map, &symbols, &pos, pstep, box_ang,
+                        params.pdb_skip_solvent,
+                    );
+                }
+            }
             if params.print_interval(step) {
-                println!(
-                    "MD step {:6} / {} : Epot = {:.6} eV, T = {:.2} K, elapsed {:.1} s",
-                    pstep, params.steps, epot_ev, temp, wall_start.elapsed().as_secs_f64()
-                );
+                if is_npt {
+                    let b = {
+                        let c = ase_engine.cell_ang();
+                        c.map(|x| [x[0] / 10.0, x[1] / 10.0, x[2] / 10.0])
+                            .unwrap_or([0.0; 3])
+                    };
+                    println!(
+                        "MD step {:6} / {} : Epot = {:.6} eV, T = {:.2} K, \
+                         box = {:.4} x {:.4} x {:.4} nm (V = {:.3} nm^3), elapsed {:.1} s",
+                        pstep,
+                        params.steps,
+                        epot_ev,
+                        temp,
+                        b[0], b[1], b[2], b[0] * b[1] * b[2],
+                        wall_start.elapsed().as_secs_f64()
+                    );
+                } else {
+                    println!(
+                        "MD step {:6} / {} : Epot = {:.6} eV, T = {:.2} K, elapsed {:.1} s",
+                        pstep, params.steps, epot_ev, temp, wall_start.elapsed().as_secs_f64()
+                    );
+                }
             }
         }
     }
 
     if is_root {
+        if let Some(f) = f_pdb.as_mut() {
+            let _ = writeln!(f, "END");
+        }
         if write_restart_files {
             let _ = io::write_restart(
                 std::path::Path::new(&format!("{}{}", prefix, params.restart_output)),
@@ -1463,6 +1787,7 @@ pub fn run_md(
         );
         let _ = std::io::stdout().flush();
     }
+    ase_engine.finish();
     ase_engine.clear_hook();
     drop(ase_engine);
     drop(ctx);
