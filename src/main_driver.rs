@@ -983,7 +983,22 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
         println!("{}", scf_data.mol.geom.formated_geometry());
     }
     scf_data.free_large_tensors();
-    scf_data.mol.ctrl.initial_guess = String::from("inherit");
+    // An excited-state optimization must find the *ground-state* reference at
+    // every trial geometry.  Inheriting the previous density (the default for a
+    // ground-state relaxation) can keep the SCF on a metastable/higher-energy
+    // solution, which makes Omega(R) collapse (observed on DA1/PBE0: E_SCF rose
+    // from -704.916 to -704.881 Ha while Omega fell from 2.69 to 1.47 eV).
+    // Restart the SCF from the atomic SAD guess instead; the expensive part of
+    // the step is the GW-BSE gradient, not the ~10 SCF iterations.  A card-level
+    // guessfile/chkfile is still used for the initial SCF before the optimizer
+    // starts, but is deliberately cleared here so it is not re-read at every
+    // geometry.
+    if matches!(scf_data.mol.ctrl.job_type, JobType::ExcitedStateOpt) {
+        scf_data.mol.ctrl.initial_guess = String::from("sad");
+        scf_data.mol.ctrl.external_init_guess = None;
+    } else {
+        scf_data.mol.ctrl.initial_guess = String::from("inherit");
+    }
     initialize_scf(scf_data, mpi_operator);
     performance_essential_calculations(scf_data, time_mark, mpi_operator);
     // An excited-state optimization must run the GW-BSE step at *every* trial
