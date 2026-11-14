@@ -1194,8 +1194,8 @@ pub fn feast_gw_main(
             false,
         );
         let vxc_nn = super::vxc_ao2mo(scf_data);
-        let v_mat = super::v_matrix_from_scf(scf_data);
-        let alpha = super::exchange_fraction(scf_data);
+        let v_mat = super::exchange_matrix_from_scf(scf_data);
+        let alpha = super::static_exchange_fraction(scf_data);
         for (pa, &p_global) in window.iter().enumerate() {
             let e = h_static[[pa, pa]];
             let mut exchange = 0.0;

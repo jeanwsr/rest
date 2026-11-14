@@ -297,6 +297,11 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
 /// Fraction of the exact (RI) exchange `Sigma_x,nn` that the reference's own
 /// orbital energies already contain.
 ///
+/// For a range-separated hybrid this is the **short-range** coefficient
+/// `c_SR = dfa_hybrid_scf`; the static GW term does not use it directly because
+/// it needs the separate long-range coefficient as well (see
+/// [`static_exchange_fraction`] and [`exchange_matrix_from_scf`]).
+///
 /// The static term of the quasiparticle equation is
 /// `B_n = e_n + (1 - alpha) Sigma_x,nn - v_xc,nn`: the `(1 - alpha) Sigma_x`
 /// piece *completes* the exchange up to the full exact one, and `v_xc` is
@@ -317,17 +322,34 @@ pub fn exchange_fraction(scf_data:&SCF)->f64{
     }
 }
 
+/// Scalar factor multiplying the exchange matrix in the static term.
+///
+/// For HF/global hybrids this is `1 - alpha` (with `alpha` from
+/// [`exchange_fraction`]).  A range-separated hybrid has no single exchange
+/// fraction: [`exchange_matrix_from_scf`] returns the already assembled
+/// `K_full - K_ref`, so the factor is one (encoded here as `1 - 0`).
+pub fn static_exchange_fraction(scf_data:&SCF)->f64{
+    if scf_data.mol.xc_data.is_rsh() {
+        0.0
+    } else {
+        exchange_fraction(scf_data)
+    }
+}
+
 /// `(1 - alpha) * Sigma_x,nn` with `Sigma_x,nn = -sum_i (n i|n i)` and `alpha`
-/// from [`exchange_fraction`]: the exact-exchange part the static term adds on
-/// top of `e_n`.  Used by every energy path (`gw_calculations`, `linearized_gw`
-/// and their low-rank variants) so that an HF reference is handled like a
-/// hybrid with `alpha = 1`.
+/// from [`static_exchange_fraction`]: the exact-exchange part the static term
+/// adds on top of `e_n`.  Used by every energy path (`gw_calculations`,
+/// `linearized_gw` and their low-rank variants) so that an HF reference is
+/// handled like a hybrid with `alpha = 1`.
+///
+/// For RSH references `v_matrix` must be the completion matrix from
+/// [`exchange_matrix_from_scf`]; the factor is then one.
 pub fn static_exchange(scf_data:&SCF,v_matrix:&MatrixFull<f64>,n:usize,homo:usize)->f64{
     let mut exchange = 0.0;
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    exchange * (1.0 - exchange_fraction(scf_data))
+    exchange * (1.0 - static_exchange_fraction(scf_data))
 }
 
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
@@ -1277,11 +1299,23 @@ pub fn compute_ri3mo_row_spin(scf_data: &SCF, n: usize, spin: usize) -> MatrixFu
     select_ri3mo_spin(vector, spin)
 }
 
-/// Compute V[n,m] = Σ_Q (Q|nm)² directly from scf_data via blocked MO transformation.
-/// Replaces the old v_matrix that required the full ri_mat.
-pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
-    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
-    let start_mo = scf_data.mol.start_mo;
+/// Shared implementation of the RI exchange matrices `V[n,m] = sum_Q (Q|nm)^2`.
+///
+/// `get_blocks` supplies the AO-to-MO transformed three-centre RI tensor for one
+/// row block; the full-range (`rimatr`) and short-range (`rimatr_sr`) matrices
+/// differ only in that callback, so both are built here with identical blocking
+/// and indexing.  `spin = None` selects the (single) restricted channel.
+fn v_matrix_from_ri_blocks<F>(
+    scf_data: &SCF,
+    num_state: usize,
+    start_mo: usize,
+    spin: Option<usize>,
+    get_blocks: F,
+) -> MatrixFull<f64>
+where
+    F: Fn(&SCF, Range<usize>, Range<usize>)
+        -> Vec<(RIFull<f64>, Range<usize>, Range<usize>)>,
+{
     let nmo = num_state - start_mo;
     let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
 
@@ -1290,7 +1324,8 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     while n_start < nmo {
         let n_end = (n_start + block_size).min(nmo);
         // Compute ri3mo[:, n_start..n_end, start_mo..num_state]
-        let ri_block_vec = scf_data.generate_ri3mo_rayon_for_multiple_times(
+        let ri_block_vec = get_blocks(
+            scf_data,
             start_mo + n_start..start_mo + n_end,
             start_mo..num_state,
         );
@@ -1301,7 +1336,15 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
         // (local_m runs in the OUTER/slow strided direction). Using the wrong
         // stride (nmo instead of block_n) silently corrupts V whenever
         // block_n != nmo, i.e. whenever the row range is blocked.
-        let ri_block = ri_block_vec.into_iter().next().unwrap().0.into_matfull_i_jk();
+        let ri_block = match spin {
+            Some(s) => select_ri3mo_spin(ri_block_vec, s),
+            None => {
+                if ri_block_vec.is_empty() {
+                    panic!("v_matrix_from_ri_blocks: no RI channel was generated");
+                }
+                ri_block_vec.into_iter().next().unwrap().0.into_matfull_i_jk()
+            }
+        };
         let naux = ri_block.size[0];
         let block_n = n_end - n_start;
         for local_n in 0..block_n {
@@ -1326,40 +1369,131 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     v_matrix
 }
 
+/// Full-range RI exchange matrix `V[n,m] = sum_Q (Q|nm)^2` (Coulomb operator).
+pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    v_matrix_from_ri_blocks(
+        scf_data,
+        num_state,
+        scf_data.mol.start_mo,
+        None,
+        |s, a, b| s.generate_ri3mo_rayon_for_multiple_times(a, b),
+    )
+}
+
+/// Short-range RI exchange matrix `V_SR[n,m] = sum_Q (Q^SR|nm)^2` built from the
+/// `erfc(omega r12)/r12` three-centre integrals (`rimatr_sr`).
+///
+/// This is the RSH counterpart of [`v_matrix_from_scf`].  It requires the
+/// short-range RI tensor that `SCF::prepare_necessary_integrals` builds for a
+/// range-separated reference with in-core RI integrals (`algorithm_jk =
+/// "ri-incore"`/`"ri-symm"` and `use_ri_symm = true`).
+pub fn v_matrix_sr_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    v_matrix_from_ri_blocks(
+        scf_data,
+        num_state,
+        scf_data.mol.start_mo,
+        None,
+        |s, a, b| s.generate_ri3mo_sr_rayon_for_multiple_times(a, b),
+    )
+}
+
 pub fn v_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
     let op = get_occ_params_per_spin(scf_data, 'Y')[spin];
-    let num_state = op.num_state;
-    let start_mo = op.start_mo;
-    let nmo = num_state - start_mo;
-    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    v_matrix_from_ri_blocks(
+        scf_data,
+        op.num_state,
+        op.start_mo,
+        Some(spin),
+        |s, a, b| s.generate_ri3mo_rayon_for_multiple_times(a, b),
+    )
+}
 
-    let block_size = 50_usize.min(nmo).max(1);
-    let mut n_start = 0_usize;
-    while n_start < nmo {
-        let n_end = (n_start + block_size).min(nmo);
-        let ri_block_vec = scf_data.generate_ri3mo_rayon_for_multiple_times(
-            start_mo + n_start..start_mo + n_end,
-            start_mo..num_state,
-        );
-        let ri_block = select_ri3mo_spin(ri_block_vec, spin);
-        let naux = ri_block.size[0];
-        let block_n = n_end - n_start;
-        for local_n in 0..block_n {
-            for local_m in 0..nmo {
-                let global_n = n_start + local_n;
-                let global_m = local_m;
-                let col = local_n + local_m * block_n;
-                let start = col * naux;
-                let sum: f64 = ri_block.data[start..start + naux].iter().map(|x| x * x).sum();
-                v_matrix[[global_n, global_m]] = sum;
-            }
-        }
-        n_start = n_end;
+/// Spin-resolved short-range RI exchange matrix (see [`v_matrix_sr_from_scf`]).
+pub fn v_matrix_sr_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
+    let op = get_occ_params_per_spin(scf_data, 'Y')[spin];
+    v_matrix_from_ri_blocks(
+        scf_data,
+        op.num_state,
+        op.start_mo,
+        Some(spin),
+        |s, a, b| s.generate_ri3mo_sr_rayon_for_multiple_times(a, b),
+    )
+}
+
+/// Coefficients of the exact-exchange **completion** `K_full - K_ref` used by
+/// the static term of the quasiparticle equation, written as
+/// `c_full * K_full + c_sr * K_SR`.
+///
+/// A range-separated hybrid reference carries
+/// `K_ref = c_LR K_LR + c_SR K_SR` (`c_LR = dfa_rsh_scf.1`,
+/// `c_SR = dfa_hybrid_scf = dfa_rsh_scf.2`).  Since
+/// `K_full = K_LR + K_SR`, the completion is
+/// `(1 - c_LR) K_full + (c_LR - c_SR) K_SR`.
+///
+/// For a global hybrid or a plain HF reference `c_sr = 0`; the scalar factor
+/// returned by [`static_exchange_fraction`] then supplies the usual
+/// `(1 - alpha)`.
+pub fn exchange_completion_coefficients(scf_data: &SCF) -> (f64, f64) {
+    if let Some((_omega, c_lr, c_sr)) = scf_data.mol.xc_data.rsh_params() {
+        (1.0 - c_lr, c_lr - c_sr)
+    } else {
+        (1.0 - exchange_fraction(scf_data), 0.0)
     }
-    for i in 0..num_state {
-        for j in 0..i {
-            v_matrix[[i, j]] = v_matrix[[j, i]];
-        }
+}
+
+/// RI exchange matrix consumed by the static GW term.
+///
+/// For a non-RSH reference this is the plain full-range [`v_matrix_from_scf`].
+/// For a range-separated hybrid it is the already assembled completion
+/// `c_full * V_full + c_sr * V_SR`; the accompanying scalar factor
+/// [`static_exchange_fraction`] is zero in that case.
+pub fn exchange_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let mut v_matrix = v_matrix_from_scf(scf_data);
+    if !scf_data.mol.xc_data.is_rsh() {
+        return v_matrix;
+    }
+    let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
+    v_matrix.data.iter_mut().for_each(|x| *x *= c_full);
+    if c_sr.abs() > 1.0e-14 {
+        assert!(
+            scf_data.rimatr_sr.is_some(),
+            "RSH GW needs the short-range RI tensor (`rimatr_sr`). Build it with \
+             `algorithm_jk = \"ri-incore\"` (or a separated variant) and \
+             `use_ri_symm = true`."
+        );
+        let v_sr = v_matrix_sr_from_scf(scf_data);
+        v_matrix
+            .data
+            .iter_mut()
+            .zip(v_sr.data.iter())
+            .for_each(|(full, sr)| *full += c_sr * sr);
+    }
+    v_matrix
+}
+
+/// Spin-resolved counterpart of [`exchange_matrix_from_scf`].
+pub fn exchange_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
+    let mut v_matrix = v_matrix_from_scf_spin(scf_data, spin);
+    if !scf_data.mol.xc_data.is_rsh() {
+        return v_matrix;
+    }
+    let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
+    v_matrix.data.iter_mut().for_each(|x| *x *= c_full);
+    if c_sr.abs() > 1.0e-14 {
+        assert!(
+            scf_data.rimatr_sr.is_some(),
+            "RSH GW needs the short-range RI tensor (`rimatr_sr`). Build it with \
+             `algorithm_jk = \"ri-incore\"` (or a separated variant) and \
+             `use_ri_symm = true`."
+        );
+        let v_sr = v_matrix_sr_from_scf_spin(scf_data, spin);
+        v_matrix
+            .data
+            .iter_mut()
+            .zip(v_sr.data.iter())
+            .for_each(|(full, sr)| *full += c_sr * sr);
     }
     v_matrix
 }
@@ -1544,6 +1678,18 @@ impl GwContext {
             self.ao_plan = None;
             return GwTensorRoute { plan: None };
         }
+        // The AO route's `V` is built from the full-range `rimatr` only.  The
+        // static term of a range-separated hybrid needs the short-range
+        // `rimatr_sr` matrix as well, which the AO plan does not own, so keep
+        // the MO-basis route for RSH references.
+        if scf_data.mol.xc_data.is_rsh() {
+            println!(
+                "gw_tensor_style = \"ao\": range-separated hybrid references use the \
+                 MO-basis GW tensors (the AO route has no short-range exchange matrix)."
+            );
+            self.ao_plan = None;
+            return GwTensorRoute { plan: None };
+        }
         // The low-rank contour stores `v*chi*v` grids that are built from a
         // materialised `ri_ov`; that path is not part of the zero-copy route.
         if qp_ctrl.use_low_rank_contour {
@@ -1607,11 +1753,16 @@ impl GwTensorRoute {
         }
     }
 
-    /// `V[n,m] = sum_Q (Q|n m)^2`.
+    /// Exchange matrix of the static GW term, `V[n,m] = sum_Q (Q|n m)^2`.
+    ///
+    /// For a range-separated hybrid the AO route is disabled in
+    /// [`GwContext::route`] (it would need the short-range RI tensor), so the
+    /// `None` branch returns the RSH completion matrix from
+    /// [`exchange_matrix_from_scf`].
     pub fn v_matrix(&self, scf_data: &SCF) -> MatrixFull<f64> {
         match &self.plan {
             Some(p) => tensor_ao::v_matrix(scf_data, p),
-            None => v_matrix_from_scf(scf_data),
+            None => exchange_matrix_from_scf(scf_data),
         }
     }
 
@@ -2539,7 +2690,7 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
 }
 pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
-    let mut v_matrix=v_matrix_from_scf(scf_data);
+    let mut v_matrix=exchange_matrix_from_scf(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -2568,7 +2719,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     if qp_ctrl.rs_use_rs_orbitals{
         // The exchange matrix <n i|i n> is itself an RI AO2MO quantity: rebuild it
         // in the RS orbital basis installed above.
-        v_matrix=v_matrix_from_scf(scf_data);
+        v_matrix=exchange_matrix_from_scf(scf_data);
     }
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
@@ -2662,7 +2813,7 @@ fn get_homo_lumo_qp_only_lowrank(
     low_rank_tolerance: f64,
 ) {
     let printlevel = scf_data.mol.ctrl.print_level.clone();
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -4129,7 +4280,7 @@ pub fn gw_calculations_lowrank(
 ) -> Vec<f64> {
     let mut ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let (_start_mo, num_state_cutoff, _occ_size, _vir_size_cutoff, _homo, _lumo) =
@@ -4349,7 +4500,7 @@ pub fn linearized_gw_lowrank(
 ) -> Vec<f64> {
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta = qp_ctrl.gw_linearize_shift;
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let mut num_state_qp_range = num_state;

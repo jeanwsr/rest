@@ -117,7 +117,7 @@ pub fn single_orbital_gw_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let cdgw_eta = qp_ctrl.cdgw_eta;
@@ -174,7 +174,7 @@ fn single_orbital_gw_lowrank_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let res_tol = qp_ctrl.cdgw_res_tol;
@@ -275,7 +275,7 @@ pub fn gw_near_fermi_surface_spin(
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
         let op = ops[spin];
-        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let v_matrix = ri_gw::exchange_matrix_from_scf_spin(scf_data, spin);
         let ks_energies = scf_data.eigenvalues[spin].clone();
         let e_homo = ks_energies[op.homo];
         let e_lumo = ks_energies[op.lumo];
@@ -371,7 +371,7 @@ fn gw_near_fermi_surface_spin_lowrank(
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
         let op = ops[spin];
-        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let v_matrix = ri_gw::exchange_matrix_from_scf_spin(scf_data, spin);
         let ks_energies = scf_data.eigenvalues[spin].clone();
         let e_homo = ks_energies[op.homo];
         let e_lumo = ks_energies[op.lumo];
@@ -1087,7 +1087,7 @@ pub fn single_orbital_gw_ac(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let side = if n >= occ_size { 1.0 } else { -1.0 };
 
@@ -1322,7 +1322,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
     for i in 0..homo+1{
         exchange-=v_matrix[[n,i]];
     }
-    let hybrid_param=ri_gw::exchange_fraction(scf_data);
+    let hybrid_param=ri_gw::static_exchange_fraction(scf_data);
     println!("Exchange={},V_xc={}",exchange,vxc_nn+hybrid_param*exchange);
     let side=if n>=occ_size{1.0}else{-1.0};
     let consts=scf_data.eigenvalues[0][n]+exchange*(1.0-hybrid_param)-vxc_nn;
@@ -1544,7 +1544,7 @@ pub fn gw_near_fermi_surface_ac(
     println!("RI-OV Shape={:?}", ri_ov.size);
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start = Instant::now();
-    let v_matrix = ri_gw::v_matrix_from_scf(scf_data);
+    let v_matrix = ri_gw::exchange_matrix_from_scf(scf_data);
     let time1 = start.elapsed();
     println!("V Matrix Constructed. This step took {:?}", time1);
     let ks_energies = scf_data.eigenvalues[0].clone();
@@ -1711,7 +1711,7 @@ pub fn single_orbital_gw_fscd(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
@@ -1923,7 +1923,7 @@ pub fn gw_near_fermi_surface_fscd(
     // MO route (no AO plan).
     let route = ri_gw::GwTensorRoute { plan: None };
     let ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
-    let v_matrix = ri_gw::v_matrix_from_scf(scf_data);
+    let v_matrix = ri_gw::exchange_matrix_from_scf(scf_data);
     let ks_energies = scf_data.eigenvalues[0].clone();
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         ri_gw::get_occupation_parameters(scf_data, 'Y');
@@ -2367,7 +2367,7 @@ fn single_orbital_gw_lowrank(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
@@ -2542,7 +2542,7 @@ fn single_orbital_gw_lowrank_v2(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = ri_gw::exchange_fraction(scf_data);
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 

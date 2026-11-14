@@ -2699,6 +2699,10 @@ impl<'a> GwGradEngine<'a> {
     pub fn new_with_raw_and_vxc(scf: &'a SCF, mut config: GwGradConfig, raw: RawRiTensors, vxc: GwVxc) -> Self {
         assert_eq!(scf.mol.spin_channel, 1, "gw_grad: restricted closed-shell only");
         assert_eq!(scf.mol.start_mo, 0, "gw_grad: no frozen orbitals supported");
+        assert!(
+            scf.mol.xc_data.omega().is_none(),
+            "gw_grad: range-separated hybrid references are not supported yet"
+        );
         if config.num_freq == 0 {
             config.num_freq = 20;
         }

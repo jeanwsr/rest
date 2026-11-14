@@ -27,7 +27,7 @@ use crate::scf_io::SCF;
 
 use super::{
     compute_ri3mo_row, get_occupation_parameters,
-    linear_interpolation_solver, static_exchange, v_matrix_from_scf, vxc_ao2mo,
+    linear_interpolation_solver, static_exchange, exchange_matrix_from_scf, vxc_ao2mo,
 };
 use super::nonlingw::build_rpa_setup;
 
@@ -149,7 +149,7 @@ pub fn fully_analytic_gw_main(
 
     // ── Static term and scalar QP equation ──────────────────────────────
     let vxc_nn = vxc_ao2mo(scf_data);
-    let v_mat = v_matrix_from_scf(scf_data);
+    let v_mat = exchange_matrix_from_scf(scf_data);
     let mut qp_energies = qp_g.clone();
     println!("\n  Solving scalar QP equations:");
     println!("  MO    E_KS (Ha)       E_QP (Ha)       E_QP (eV)");
