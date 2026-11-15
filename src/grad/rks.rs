@@ -442,6 +442,24 @@ pub fn scatter_to_full(vmat_c: &Tsr<f64>, idx: &[usize], nao: usize, device: &De
     full
 }
 
+/// Scatter-add a compact `[nbb, nbb, 3]` derivative block into a full-size
+/// accumulator owned by the caller (one per rayon worker), instead of
+/// allocating a fresh `[nao, nao, 3]` tensor per grid block.
+pub fn scatter_add_to_full(dst: &mut Tsr<f64>, src: &Tsr<f64>, idx: &[usize], nao: usize) {
+    let nbb = idx.len();
+    let s = src.raw();
+    let d = dst.raw_mut();
+    for p in 0..3 {
+        let off_c = p * nbb * nbb;
+        let off_f = p * nao * nao;
+        for (jj, &nu) in idx.iter().enumerate() {
+            for (ii, &mu) in idx.iter().enumerate() {
+                d[off_f + mu + nu * nao] += s[off_c + ii + jj * nbb];
+            }
+        }
+    }
+}
+
 pub fn gga_grad_sum(vmat: &mut Tsr<f64>, ao: TsrView<f64>, wv: TsrView<f64>) {
     let nao = ao.shape()[0];
     let ng = ao.shape()[1];
@@ -818,7 +836,10 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
     // produces the identical sum.
     let mut vxc = gradient_method
         .par_block_loop(mol, grids, block_settings)
-        .map(|block| {
+        .with_min_len(64)
+        .fold(
+            || rt::zeros(([num_basis, num_basis, 3], device)),
+            |mut acc, block| {
             omp_set_num_threads_wrapper(1);
 
             let ng = block.weights.len();
@@ -898,9 +919,10 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
             }
             GRID_BLOCK_CONTRACT_NS.fetch_add(t_contract.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             match idx_opt {
-                Some(idx) => scatter_to_full(&vmat_c, idx, num_basis, device),
-                None => vmat_c,
+                Some(idx) => scatter_add_to_full(&mut acc, &vmat_c, idx, num_basis),
+                None => acc += vmat_c.view(),
             }
+            acc
         })
         .reduce(
             || rt::zeros(([num_basis, num_basis, 3], device)),

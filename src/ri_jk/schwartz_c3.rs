@@ -47,6 +47,55 @@ use super::pure_schwartz_rij::{PairList, aux_q_bounds};
 /// primitive exponents up to ≈ 5·10⁵ (6-31G core shells reach ≈ 3·10³).
 pub const DERIV_AMP: f64 = 1.0e3;
 
+/// Compact row addressing of a pre-screened AO-pair space for the three-centre
+/// producers.
+///
+/// `full2row[p]` is the compact row of the full packed pair `p`, or
+/// [`CompactRowMap::NOT_KEPT`] when the pre-screen dropped that pair. A
+/// producer that takes one ([`ScreenedC3Engine::evaluate_s2ij`] with
+/// `rows = Some(..)`) skips the shell pairs without a single kept row and
+/// scatters the kept ones directly into the compact row space, so the full
+/// `nao(nao+1)/2 × naux` tensor is never materialized: the output allocation
+/// and every downstream stage (metric solve, row-max sweep) only ever see
+/// `len()` rows.
+///
+/// The compact layout matches what [`super::compact_rimatr_rows`] produces on
+/// the full tensor — one row per kept pair, in the ascending order of `keep`
+/// — so the values of the kept rows are identical to the evaluate-then-compact
+/// path, and a caller that wants the full-space tensor back can zero-pad.
+#[derive(Clone, Debug)]
+pub struct CompactRowMap {
+    /// full packed pair index -> compact row, or [`CompactRowMap::NOT_KEPT`]
+    full2row: Vec<u32>,
+    /// Number of kept (stored) rows.
+    nkept: usize,
+}
+
+impl CompactRowMap {
+    /// Sentinel of [`CompactRowMap::full2row`] for a pair that is not kept.
+    pub const NOT_KEPT: u32 = u32::MAX;
+
+    /// Build from the ascending full packed pair indices of the pre-screen.
+    pub fn from_keep(keep: &[usize], npair: usize) -> Self {
+        let mut full2row = vec![Self::NOT_KEPT; npair];
+        for (slot, &p) in keep.iter().enumerate() {
+            debug_assert!(p < npair, "kept pair {} out of range {}", p, npair);
+            full2row[p] = slot as u32;
+        }
+        Self { full2row, nkept: keep.len() }
+    }
+
+    /// Number of kept (stored) rows.
+    pub fn len(&self) -> usize {
+        self.nkept
+    }
+
+    /// Whether the map keeps nothing.
+    pub fn is_empty(&self) -> bool {
+        self.nkept == 0
+    }
+}
+
 /// Metric-transformation margin for the plain `int3c2e` tensor: dropped raw
 /// entries are bounded by `threshold / RIMATR_AMP`, and the column mixing of
 /// the 2c-2e metric solve amplifies them back below `threshold` for the
@@ -120,11 +169,18 @@ impl ScreenedC3Engine {
     /// `CInt::integrate_cross(intor, [mol, mol, aux], "s2ij",
     /// [[0,nbas],[0,nbas],[aux_range]])` element for element on the kept
     /// triples and zero on the screened ones.
+    ///
+    /// With `rows = Some(map)` the output lives on the compact row space of the
+    /// pre-screen instead (`[nkept, nk]` / `[nkept, nk, 3]`): shell pairs
+    /// without a single kept AO pair are not evaluated at all, and the kept
+    /// ones scatter element-wise to their compact offsets. The kept rows carry
+    /// the same values as the full tensor, in the order of `keep`.
     pub fn evaluate_s2ij(
         &self,
         intor: &str,
         aux_range: [usize; 2],
         log_thresh: f64,
+        rows: Option<&CompactRowMap>,
     ) -> (Vec<f64>, Vec<usize>) {
         let integrator = CInt::get_integrator(intor);
         let opt = self.optimizer_for(intor);
@@ -133,15 +189,21 @@ impl ScreenedC3Engine {
 
         let nk = self.aux_ao_loc[aux_range[1]] - self.aux_ao_loc[aux_range[0]];
         let npair = self.nao * (self.nao + 1) / 2;
+        if let Some(map) = rows {
+            debug_assert_eq!(map.full2row.len(), npair, "row map does not match the packed pair space");
+        }
+        // row count of the output: the compact space when a map is given
+        let nrow = rows.map_or(npair, |m| m.len());
 
-        // task list: (pair task, aux shell) with bound >= threshold
-        let tasks: Vec<(usize, usize)> = self.kept_tasks(aux_range, log_thresh);
+        // task list: (pair task, aux shell) with bound >= threshold, minus the
+        // shell pairs the pre-screen dropped entirely
+        let tasks: Vec<(usize, usize)> = self.kept_tasks(aux_range, log_thresh, rows);
 
-        let mut shape = vec![npair, nk];
+        let mut shape = vec![nrow, nk];
         if n_comp > 1 {
             shape.push(n_comp);
         }
-        let mut out = vec![0.0_f64; npair * nk * n_comp];
+        let mut out = vec![0.0_f64; nrow * nk * n_comp];
 
         let ao_loc = &self.pairs.ao_loc;
         let max_dm = ao_loc.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(1);
@@ -206,12 +268,38 @@ impl ScreenedC3Engine {
                 let offdiag = shl_s != shl_l;
                 for c in 0..n_comp {
                     for k in 0..dk {
+                        // column offset of this (aux ao, component) within `out`
+                        let col = nrow * (k0 + k + nk * c);
                         for j in 0..dj {
                             let nu = loc_l + j;
-                            let base = loc_s + nu * (nu + 1) / 2 + npair * (k0 + k + nk * c);
                             let bbase = di * (j + dj * (k + dk * c));
-                            let nrow = if offdiag { di } else { j + 1 };
-                            out[base..base + nrow].copy_from_slice(&buf[bbase..bbase + nrow]);
+                            let nrun = if offdiag { di } else { j + 1 };
+                            match rows {
+                                // full row space: the run μ ∈ [loc_s, loc_s+nrun)
+                                // is contiguous both in `out` and in the packed
+                                // pair index, so one copy suffices
+                                None => {
+                                    let base = loc_s + nu * (nu + 1) / 2 + col;
+                                    out[base..base + nrun]
+                                        .copy_from_slice(&buf[bbase..bbase + nrun]);
+                                }
+                                // compact row space: each element goes through
+                                // the map (a kept run is contiguous in the map's
+                                // ascending order, but runs interleave kept and
+                                // dropped pairs in general)
+                                Some(map) => {
+                                    let mut p = loc_s + nu * (nu + 1) / 2;
+                                    let mut bb = bbase;
+                                    for _ in 0..nrun {
+                                        let row = map.full2row[p];
+                                        if row != CompactRowMap::NOT_KEPT {
+                                            out[row as usize + col] = buf[bb];
+                                        }
+                                        p += 1;
+                                        bb += 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -221,15 +309,46 @@ impl ScreenedC3Engine {
         (out, shape)
     }
 
+    /// Whether any AO pair the (task's) shell pair scatters to is kept by the
+    /// compact row map. Runs over the same (μ, ν) runs the scatter fills:
+    /// `ν` over the larger shell, `μ ≤ ν` truncated inside the smaller shell,
+    /// `μ` over the full smaller shell across shells.
+    fn pair_has_kept_row(&self, task: usize, map: &CompactRowMap) -> bool {
+        let pair = self.pairs.pairs[task];
+        let (shl_s, shl_l) = (pair.jsh, pair.ish);
+        let ao_loc = &self.pairs.ao_loc;
+        let (i0, i1) = (ao_loc[shl_s], ao_loc[shl_s + 1]);
+        let (j0, j1) = (ao_loc[shl_l], ao_loc[shl_l + 1]);
+        let offdiag = shl_s != shl_l;
+        for (j, nu) in (j0..j1).enumerate() {
+            let nrun = if offdiag { i1 - i0 } else { j + 1 };
+            let p0 = nu * (nu + 1) / 2 + i0;
+            if map.full2row[p0..p0 + nrun]
+                .iter()
+                .any(|&r| r != CompactRowMap::NOT_KEPT)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// (pair task, aux shell) triples whose bound `q_cond + q_aux` reaches
-    /// `log_thresh`. The pair list is sorted by descending `q_cond`, so a
-    /// partition would do for one aux shell; over a *range* of aux shells the
-    /// flat filter is the exact union.
-    fn kept_tasks(&self, aux_range: [usize; 2], log_thresh: f64) -> Vec<(usize, usize)> {
+    /// `log_thresh`, minus the shell pairs the compact row map drops entirely.
+    /// The pair list is sorted by descending `q_cond`, so a partition would do
+    /// for one aux shell; over a *range* of aux shells the flat filter is the
+    /// exact union.
+    fn kept_tasks(
+        &self,
+        aux_range: [usize; 2],
+        log_thresh: f64,
+        rows: Option<&CompactRowMap>,
+    ) -> Vec<(usize, usize)> {
         self.pairs
             .pairs
             .iter()
             .enumerate()
+            .filter(|&(task, _)| rows.map_or(true, |m| self.pair_has_kept_row(task, m)))
             .flat_map(|(task, pair)| {
                 let cutoff = log_thresh - pair.q_cond;
                 (aux_range[0]..aux_range[1])
@@ -240,14 +359,15 @@ impl ScreenedC3Engine {
     }
 
     /// Kept fraction of the (pair, aux shell) triples of a range — for the
-    /// screening report of callers.
+    /// screening report of callers. Reports the Schwartz level only (no row
+    /// map), so the fraction is comparable across configurations.
     pub fn kept_fraction(&self, aux_range: [usize; 2], log_thresh: f64) -> f64 {
         let n_pairs = self.pairs.pairs.len();
         let total = n_pairs * (aux_range[1] - aux_range[0]);
         if total == 0 {
             return 1.0;
         }
-        self.kept_tasks(aux_range, log_thresh).len() as f64 / total as f64
+        self.kept_tasks(aux_range, log_thresh, None).len() as f64 / total as f64
     }
 
     /// Output (data, shape) of the `s1` derivative tensor `int3c2e_ip1` →
@@ -272,7 +392,7 @@ impl ScreenedC3Engine {
         let nao = self.nao;
 
         let tasks: Vec<(usize, usize, bool)> = self
-            .kept_tasks(aux_range, log_thresh)
+            .kept_tasks(aux_range, log_thresh, None)
             .into_iter()
             .flat_map(|(task, psh)| [(task, psh, true), (task, psh, false)])
             .collect();

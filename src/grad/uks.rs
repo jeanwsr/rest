@@ -20,7 +20,7 @@ use crate::dft::xc_deriv::XCType;
 use crate::dft::num_int::{NumInt, XCData, BlockSettings};
 use crate::dft::num_int::{eval_rho5_batch, eval_rho5_dm_only_batch, eval_ao_batch};
 use crate::dft::libxc_itrf::{eval_xc_eff};
-use super::rks::{gga_grad_sum, tau_grad_dot, gather_rows_full, gather_submatrix_full, scatter_to_full};
+use super::rks::{gga_grad_sum, tau_grad_dot, gather_rows_full, gather_submatrix_full, scatter_add_to_full};
 use crate::utilities::{self, balancing};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
@@ -128,7 +128,22 @@ impl RIUHFGradient<'_> {
         // let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
         // 每线程每块的 XC 工作集预算，由 [ctrl] max_memory 推得，未设置时保持历史上的 16 MiB
         let xc_block_mb = utilities::memory_batch::xc_grad_block_mb(self.flags.max_memory, 16.0);
+        crate::dft::num_int::GRID_BLOCK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::dft::num_int::GRID_BLOCK_ACTIVE_SUM.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::dft::num_int::GRID_BLOCK_AO_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::dft::num_int::GRID_BLOCK_GTO_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let t_xc0 = std::time::Instant::now();
         let dao_vxc = get_vxc_rayon_new(&self, &xc_data, &grad_grids, mol, xc_block_mb as usize);
+        let t_xc = t_xc0.elapsed();
+        if self.scf_data.mol.ctrl.print_level >= 2 {
+            let nblk = crate::dft::num_int::GRID_BLOCK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let nbb = crate::dft::num_int::GRID_BLOCK_ACTIVE_SUM.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / (nblk.max(1) as f64);
+            let ao_s = crate::dft::num_int::GRID_BLOCK_AO_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e9;
+            let gto_s = crate::dft::num_int::GRID_BLOCK_GTO_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e9;
+            println!("[uks-grad] xc whole {:.1} s over {} blocks; avg active basis {:.0}/{}; ao_eval worker-sum {:.1} s (gto {:.1} s)",
+                t_xc.as_secs_f64(), nblk, nbb, mol.num_basis, ao_s, gto_s);
+        }
         utilities::memory_batch::mem_probe("calc_de_xc (uks): after get_vxc_rayon_new", mem_probe_on);
         // println!("Finished calculating dx vxc");
         
@@ -525,7 +540,15 @@ pub fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grid
     // grows like (ngrids / blksize) * nao^2 and dominates the memory of a large gradient.
     let mut vmat = gradient_method
         .par_block_loop(mol, grids, block_settings)
-        .map(|block| {
+        .with_min_len(64)
+        .fold(
+            || {
+                vec![
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                ]
+            },
+            |mut acc, block| {
             omp_set_num_threads_wrapper(1);
 
             let ng = block.weights.len();
@@ -605,12 +628,18 @@ pub fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grid
                 },
             }
             match idx_opt {
-                Some(idx) => loc_vmat
-                    .iter()
-                    .map(|vc| scatter_to_full(vc, idx, num_basis, device))
-                    .collect(),
-                None => loc_vmat,
+                Some(idx) => {
+                    for (acc_spin, vc) in acc.iter_mut().zip(loc_vmat.iter()) {
+                        scatter_add_to_full(acc_spin, vc, idx, num_basis);
+                    }
+                }
+                None => {
+                    for (acc_spin, vc) in acc.iter_mut().zip(loc_vmat.iter()) {
+                        *acc_spin += vc.view();
+                    }
+                }
             }
+            acc
         })
         .reduce(
             || {

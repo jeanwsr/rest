@@ -149,9 +149,29 @@ pub fn atom_reaches_block(center: &[f64; 3], radius: f64, lo: &[f64; 3], hi: &[f
 /// the indices of rows whose absolute value exceeds `cutoff` at some grid
 /// point. This is the same predicate the SCF sparse AO tabulation applies.
 pub fn screen_rows_by_value(vals: &MatrixFull<f64>, num_grids: usize, cutoff: f64) -> Vec<usize> {
+    // prototype (REST_XC_REL_CUT): a row survives when its largest tabulated
+    // magnitude in this batch exceeds max(cutoff, rel * batch_max). The absolute
+    // cutoff alone keeps all rows of a diffuse basis alive in every batch, which
+    // is what keeps the per-batch AO union near the full basis.
+    let rel: f64 = std::env::var("REST_XC_REL_CUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     let nbas = vals.size[0];
+    let mut thr = cutoff;
+    if rel > 0.0 {
+        let mut bmax = 0.0_f64;
+        for r in 0..nbas {
+            for g in 0..num_grids {
+                let a = vals[[r, g]].abs();
+                if a > bmax { bmax = a; }
+            }
+        }
+        let rt = rel * bmax;
+        if rt > thr { thr = rt; }
+    }
     (0..nbas)
-        .filter(|&r| (0..num_grids).any(|g| vals[[r, g]].abs() > cutoff))
+        .filter(|&r| (0..num_grids).any(|g| vals[[r, g]].abs() > thr))
         .collect()
 }
 
