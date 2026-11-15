@@ -23,9 +23,6 @@ use rayon::iter::IntoParallelRefMutIterator;
 use crate::mpi_io::{MPIOperator,MPIData};
 use crate::ri_gw;
 
-#[cfg(target_os = "linux")]
-use libc::seccomp_notif;
-
 pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>)->(MatrixFull<f64>,MatrixFull<f64>){
     println!("Starts generating rs hamiltonian!");
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');

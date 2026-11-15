@@ -433,7 +433,8 @@ pub fn compact_rimatr_rows(ri3fn: MatrixFull<f64>, kept: &[usize]) -> MatrixFull
 /// The tensor is the dominant allocation of the in-core path; after the in-place left shift the
 /// tail of the buffer is dead but still resident. Dropping it through the allocator would free
 /// and re-allocate (a second peak), so the pages are returned to the OS directly. Returns the
-/// number of bytes handed back.
+/// number of bytes handed back. Linux-only; returns 0 (nothing handed back) elsewhere.
+#[cfg(target_os = "linux")]
 fn release_tail_pages(base: usize, keep_len: usize, capacity: usize) -> usize {
     const PAGE: usize = 4096;
     const MADV_DONTNEED: i32 = 4;
@@ -456,6 +457,11 @@ fn release_tail_pages(base: usize, keep_len: usize, capacity: usize) -> usize {
         debug!("madvise(MADV_DONTNEED) on the rimatr tail failed with {}", rc);
         0
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_tail_pages(_base: usize, _keep_len: usize, _capacity: usize) -> usize {
+    0 // no madvise off Linux; nothing to hand back
 }
 
 /// A-priori keep list of a storage-level **pre-screen** of the AO-pair space.

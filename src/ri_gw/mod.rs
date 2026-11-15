@@ -43,9 +43,6 @@ pub mod gw_grad;
 pub mod tensor_ao;
 use crate::mpi_io::MPIOperator;
 
-#[cfg(target_os = "linux")]
-use libc::seccomp_notif;
-
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
     show_energy_levels(scf_data);
