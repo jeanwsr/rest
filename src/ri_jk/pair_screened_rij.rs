@@ -592,6 +592,9 @@ fn advise_huge_pages_scratch(buf: &mut [f64]) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages_scratch(_buf: &mut [f64]) {}
+
 pub mod k_stat {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static DENSIFY_NS: AtomicU64 = AtomicU64::new(0);
