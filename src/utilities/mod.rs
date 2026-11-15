@@ -1,3 +1,5 @@
+pub mod opt_flags;
+pub mod ovlp_probe;
 pub mod memory_batch;
 pub mod memory_monitor;
 pub mod rstsr_util;

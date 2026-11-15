@@ -3000,7 +3000,126 @@ impl Grids {
     /// compressed batches once, after the initial guess, instead of being carried through
     /// every SCF iteration.  The AOP block is row-aligned with the AO block, so both are
     /// filtered together.  Returns the number of dropped rows.
+    /// Parallel variant of `apply_density_row_mask`: the per-batch keep-list
+    /// computation and the strided rebuild both run on rayon, and the row maxima
+    /// are scanned column-major (contiguous) instead of by bounds-checked
+    /// `[[i, g]]` indexing.  The result (kept rows, order, dropped count) is
+    /// identical to the serial path.
+    pub fn apply_density_row_mask_par(&mut self, dm: &[MatrixFull<f64>], tau: f64) -> usize {
+        use rayon::prelude::*;
+        let nao = match &self.ao_compressed { Some(c) => c.nao_total, None => return 0 };
+        let mut drow = vec![0.0_f64; nao];
+        for dm_spin in dm.iter() {
+            let n = dm_spin.size[0].min(nao);
+            for mu in 0..n { drow[mu] += dm_spin[[mu, mu]]; }
+        }
+        for d in drow.iter_mut() { if *d < 0.0 { *d = 0.0; } }
+        let mut ao_c = self.ao_compressed.take().unwrap();
+        let mut aop_c = self.aop_compressed.take();
+        let nb = ao_c.batches.len();
+        let drow_ref = &drow;
+        let aop_ref = aop_c.as_ref();
+        let keeps: Vec<Option<Vec<u32>>> = (0..nb).into_par_iter().map(|ib| {
+            let ab = &ao_c.batches[ib];
+            let nact = ab.size[0];
+            let ncols = ab.size[1];
+            if nact == 0 || ncols == 0 { return None; }
+            let map = &ao_c.batch_ao_map[ib];
+            let mut nx = vec![0.0_f64; nact];
+            for g in 0..ncols {
+                let col = &ab.data[g * nact..g * nact + nact];
+                for i in 0..nact { let a = col[i].abs(); if a > nx[i] { nx[i] = a; } }
+            }
+            let mut ng = vec![0.0_f64; nact];
+            if let Some(ac) = aop_ref {
+                let ab3 = &ac.batches[ib];
+                for x in 0..3 {
+                    for g in 0..ncols {
+                        let col = &ab3[x].data[g * nact..g * nact + nact];
+                        for i in 0..nact { let a = col[i].abs(); if a > ng[i] { ng[i] = a; } }
+                    }
+                }
+            }
+            let mut keep: Vec<u32> = Vec::with_capacity(nact);
+            let mut ndrop = 0usize;
+            for (i, &mu) in map.iter().enumerate() {
+                let d = drow_ref.get(mu).copied().unwrap_or(0.0).max(0.0);
+                if d == 0.0 { ndrop += 1; continue; }
+                let dd = d.sqrt();
+                if nx[i] * dd >= tau || ng[i] * dd >= tau { keep.push(i as u32); } else { ndrop += 1; }
+            }
+            if ndrop == 0 || keep.is_empty() { None } else { Some(keep) }
+        }).collect();
+
+        let mut dropped = 0usize;
+        for (ib, k) in keeps.iter().enumerate() {
+            if let Some(kp) = k { dropped += ao_c.batches[ib].size[0] - kp.len(); }
+        }
+
+        ao_c.batches.par_iter_mut()
+            .zip(ao_c.batch_ao_map.par_iter_mut())
+            .zip(keeps.par_iter())
+            .for_each(|((b, m), k)| {
+                let keep = match k { Some(k) => k, None => return };
+                let ncols = b.size[1];
+                let nsrc = b.size[0];
+                let nk = keep.len();
+                let mut nb_ao = MatrixFull::new([nk, ncols], 0.0);
+                for (il, &ii) in keep.iter().enumerate() {
+                    let i = ii as usize;
+                    for g in 0..ncols { nb_ao.data[g * nk + il] = b.data[g * nsrc + i]; }
+                }
+                *b = nb_ao;
+                let old = std::mem::take(m);
+                *m = keep.iter().map(|&ii| old[ii as usize]).collect();
+            });
+
+        if let Some(ac) = aop_c.as_mut() {
+            ac.batches.par_iter_mut()
+                .zip(ac.batch_aop_map.par_iter_mut())
+                .zip(keeps.par_iter())
+                .for_each(|((b3, m), k)| {
+                    let keep = match k { Some(k) => k, None => return };
+                    let ncols = b3[0].size[1];
+                    let nsrc = b3[0].size[0];
+                    let nk = keep.len();
+                    let mut nb3: [MatrixFull<f64>; 3] = [
+                        MatrixFull::new([nk, ncols], 0.0),
+                        MatrixFull::new([nk, ncols], 0.0),
+                        MatrixFull::new([nk, ncols], 0.0),
+                    ];
+                    for (il, &ii) in keep.iter().enumerate() {
+                        let i = ii as usize;
+                        for x in 0..3 {
+                            for g in 0..ncols { nb3[x].data[g * nk + il] = b3[x].data[g * nsrc + i]; }
+                        }
+                    }
+                    *b3 = nb3;
+                    let old = std::mem::take(m);
+                    *m = keep.iter().map(|&ii| old[ii as usize]).collect();
+                });
+        }
+
+        if ao_c.group_size > 0 {
+            for (ib, k) in keeps.iter().enumerate() {
+                if let (Some(_), Some(gr)) = (k, ao_c.batch_group_rows.get_mut(ib)) { *gr = Vec::new(); }
+            }
+        }
+        self.ao_compressed = Some(ao_c);
+        self.aop_compressed = aop_c;
+        dropped
+    }
+
     pub fn apply_density_row_mask(&mut self, dm: &[MatrixFull<f64>], tau: f64) -> usize {
+        if std::env::var("REST_DMMASK_SERIAL").is_ok() {
+            return self.apply_density_row_mask_serial(dm, tau);
+        }
+        self.apply_density_row_mask_par(dm, tau)
+    }
+
+    /// Serial reference implementation (kept for A/B; select with
+    /// `REST_DMMASK_SERIAL=1`).
+    pub fn apply_density_row_mask_serial(&mut self, dm: &[MatrixFull<f64>], tau: f64) -> usize {
         let nao = match &self.ao_compressed { Some(c) => c.nao_total, None => return 0 };
         let mut drow = vec![0.0_f64; nao];
         for dm_spin in dm.iter() {

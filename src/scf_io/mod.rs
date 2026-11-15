@@ -603,10 +603,10 @@ impl SCF {
             // ranks, but the selection is geometry-only and rank-local, and the distributed
             // builder carries it into the metric solve while keeping the local block shape,
             // so no collective is added (see `Molecule::prepare_rimatr_for_ri_v_mpi_rayon`).
-            // The cut is deliberately loose (PRESCREEN_SAFETY below the pruning threshold) because
+            // The cut is deliberately loose (the safety factor below the pruning threshold) because
             // the Schwarz bound bounds the untransformed block while the pruning acts on the
             // metric-transformed row maximum.
-            const PRESCREEN_SAFETY: f64 = 10.0;
+            let prescreen_safety = crate::utilities::opt_flags::prescreen_safety();
             prescreen_keep = if self.mol.ctrl.ri_jk.pair_screen_threshold > 0.0 && ri3fn_symm {
                 let cint_mol = ri_jk::util::get_cint_mol(&self.mol);
                 let (basbas2baspar, _) = ri_jk::generate_baspar(self.mol.num_basis);
@@ -616,7 +616,7 @@ impl SCF {
                     nao,
                     &basbas2baspar,
                     self.mol.ctrl.ri_jk.schwartz_overlap_tol2,
-                    self.mol.ctrl.ri_jk.pair_screen_threshold / PRESCREEN_SAFETY,
+                    self.mol.ctrl.ri_jk.pair_screen_threshold / prescreen_safety,
                 );
                 info!(
                     "In-core RI pair pre-screen: {} of {} AO pairs kept for the build \
@@ -624,7 +624,7 @@ impl SCF {
                     keep.len(),
                     nao * (nao + 1) / 2,
                     self.mol.ctrl.ri_jk.pair_screen_threshold,
-                    PRESCREEN_SAFETY
+                    prescreen_safety
                 );
                 Some(keep)
             } else {
@@ -784,8 +784,32 @@ impl SCF {
             }
         }
 
-        // initial eigenvectors and eigenvalues
-        let (eigenvectors, eigenvalues,n_found)=self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
+        // Overlap-matrix conditioning probe.
+        //
+        // The previous code ran a *full* dense symmetric eigendecomposition of
+        // the overlap matrix (`dspevx` with jobz='V', range='A') here and used
+        // only `eigenvalues[0]` for a log message: the eigenvectors were
+        // dropped, and with range='A' the returned `n_found` is always
+        // `num_basis`.  That cost ~3.6 s for ts2 (1956^2, O(n^3)).
+        //
+        // A short Lanczos run on the same stored overlap matrix gives the
+        // lowest eigenvalue at O(m*n^2) with m=20, i.e. ~1 % of the cost.  The
+        // exact `n_found`/eigenvalue pair from the dense path is still
+        // computed when the probe finds the overlap to be (near-)singular, so
+        // the `n_found < num_basis` branch keeps its original semantics.
+        let (lowest_eig, n_found) = if crate::utilities::opt_flags::eig_legacy() {
+            let (_eigvec, eigval, nf) = self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
+            (eigval[0], nf)
+        } else {
+            let lam_min = crate::utilities::ovlp_probe::lowest_eigenvalue(&self.ovlp, self.mol.fdqc_bas.len());
+            if lam_min > 1.0e-8 {
+                (lam_min, self.mol.fdqc_bas.len() as i32)
+            } else {
+                let (_eigvec, eigval, nf) = self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
+                (eigval[0], nf)
+            }
+        };
+        let eigenvalues = [lowest_eig];
 
         if (n_found as usize) < self.mol.fdqc_bas.len() {
             info!("Overlap matrix is singular:");
