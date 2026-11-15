@@ -291,8 +291,15 @@ impl ScfTraceRecord {
             //
             let dt1 = time::Local::now();
 
+            let dt_hf = std::time::Instant::now();
             scf.generate_hf_hamiltonian(mpi_operator);
+            let t_hf = dt_hf.elapsed().as_secs_f64();
+            let dt_g = std::time::Instant::now();
             scf.grad_dm = scf.get_grad_dm();
+            let t_g = dt_g.elapsed().as_secs_f64();
+            if std::env::var("REST_XC_TIME").is_ok() {
+                eprintln!("[mix-time] hf {:.3}s | grad {:.3}s", t_hf, t_g);
+            }
 
             // Apply level_shift to the output fock matrix BEFORE DIIS target storage.
             // This ensures DIIS operates in the level-shifted subspace, so the DIIS

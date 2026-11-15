@@ -464,6 +464,13 @@ pub fn row_bounds(ri3fn: &MatrixFull<f64>) -> Vec<f64> {
     bounds
 }
 
+/// Minimum row fraction the storage-level compaction of a pre-screened tensor
+/// must save for the copy to be worth its cost
+/// ([`prune_rimatr_prescreened`]). Below it the copy is skipped: the saved
+/// memory would be small, the old+new buffer window of the copy is paid in
+/// full, and the runtime bounds criteria make the extra rows free in time.
+pub const COMPACT_MIN_GAIN: f64 = 0.10;
+
 /// Prune a tensor that already lives on the row space of a pre-screen.
 ///
 /// `outer` gives the full packed pair index of every stored row, ascending, i.e. the row map that
@@ -471,6 +478,14 @@ pub fn row_bounds(ri3fn: &MatrixFull<f64>) -> Vec<f64> {
 /// [`prune_rimatr`] (row bound above `tol` times the largest row bound), and the returned
 /// [`PairMap`] describes them in the **full** packed pair space, so every consumer of the map sees
 /// the layout it would have seen without the pre-screen.
+///
+/// When that selection keeps most of the pre-screen rows (it saves less than
+/// [`COMPACT_MIN_GAIN`] of them) the compaction copy is skipped: the tensor keeps the pre-screen
+/// row space and the map marks every stored row as kept. The rows this level would have dropped
+/// have bounds at or below the cut, so the runtime J/K contractions skip them dynamically through
+/// their relative bounds criteria — they cost memory (the pre-screen rows stay stored) but no
+/// time, while the old+new buffer window of the compaction copy and its tens of seconds per
+/// preparation disappear.
 pub fn prune_rimatr_prescreened(
     ri3fn: MatrixFull<f64>,
     bounds: &[f64],
@@ -492,6 +507,24 @@ pub fn prune_rimatr_prescreened(
     for (r, &p) in outer.iter().enumerate() {
         bounds_full[p] = bounds[r];
     }
+
+    // Skip the compaction copy when it would save less than a tenth of the
+    // stored rows (see the function docs): the runtime screening makes the
+    // dropped rows free in time, so only the copy cost — one full pass over
+    // the tensor plus the old+new peak window — would remain.
+    let saved_fraction = 1.0 - kept_local.len() as f64 / num_stored as f64;
+    if saved_fraction < COMPACT_MIN_GAIN {
+        debug!(
+            "Storage-level pruning keeps {} of {} pre-screen rows (saves {:.1}%): \
+             skipping the compaction copy, the pre-screen row space stays stored.",
+            kept_local.len(),
+            num_stored,
+            100.0 * saved_fraction
+        );
+        let map = PairMap::from_kept(num_baspar_full, outer, baspar2basbas, &bounds_full);
+        return PrunedRIMatr { ri3fn, map };
+    }
+
     let kept_full: Vec<usize> = kept_local.iter().map(|&r| outer[r]).collect();
     let compacted = compact_rimatr_rows(ri3fn, &kept_local);
     let map = PairMap::from_kept(num_baspar_full, &kept_full, baspar2basbas, &bounds_full);
@@ -852,9 +885,11 @@ pub fn get_vk_pair_screened(
         .collect();
     tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_saved);
 
-    let (d_s, b_s) = k_stat::take();
-    println!("[k-stat] screened K: nw={} n_active={} retained={} of {} wall_total(next line) densify={:.2}s blas={:.2}s (thread-s)",
-        nw, num_active, retained.len(), num_stored, d_s, b_s);
+    if std::env::var_os("REST_XC_KSTAT").is_some() {
+        let (d_s, b_s) = k_stat::take();
+        println!("[k-stat] screened K: nw={} n_active={} retained={} of {} wall_total(next line) densify={:.2}s blas={:.2}s (thread-s)",
+            nw, num_active, retained.len(), num_stored, d_s, b_s);
+    }
     // scatter the active block into the full symmetric matrix and pack it
     let mut k_full = MatrixFull::new([nao, nao], 0.0_f64);
     for accum in &partial {

@@ -1069,6 +1069,17 @@ fn de_xc_response_term(
     use rayon::prelude::*;
     let weights_full = ni.weights.clone();
     let d_r_ao_ref = d_r_ao;
+    // [1, nao*nao] per spin, hoisted out of the chunk loop (see the GEMM below).
+    let d_r_ao_flat_a: Tsr<f64> = d_r_ao_ref[0]
+        .view()
+        .into_contig(ColMajor)
+        .into_shape([1, nao * nao])
+        .into_owned();
+    let d_r_ao_flat_b: Tsr<f64> = d_r_ao_ref[1]
+        .view()
+        .into_contig(ColMajor)
+        .into_shape([1, nao * nao])
+        .into_owned();
     let dm0_owned = [dm0[0].clone(), dm0[1].clone()];
     let ni_ref = &*ni;
     let device_ref = &device;
@@ -1092,24 +1103,16 @@ fn de_xc_response_term(
             get_vmat_fxc_uks(xc_type, ao.view(), drho_a.view(), drho_b.view(), wf.view());
         let vmat_a = &vmat_fxc_a + &get_vmat_vxc(vmat_ip_a.view(), aoslices_ref);
         let vmat_b = &vmat_fxc_b + &get_vmat_vxc(vmat_ip_b.view(), aoslices_ref);
-        let mut de_chunk: Tsr = rt::zeros(([3, natm].f(), &device));
-        for atm in 0..natm {
-            for t in 0..3 {
-                let v0: f64 = rt::vecdot(
-                    &d_r_ao_ref[0].view().into_shape([nao * nao]),
-                    &vmat_a.i((.., .., t, atm)).into_shape([nao * nao]),
-                    -1,
-                )
-                .sum_all();
-                let v1: f64 = rt::vecdot(
-                    &d_r_ao_ref[1].view().into_shape([nao * nao]),
-                    &vmat_b.i((.., .., t, atm)).into_shape([nao * nao]),
-                    -1,
-                )
-                .sum_all();
-                de_chunk[[t, atm]] = v0 + v1;
-            }
-        }
+        // de[t, atm] = sum_s sum_{mu,nu} d_r_ao[s][mu,nu] * vmat_s[mu,nu,t,atm]:
+        // two GEMMs instead of 6*natm strided vecdots (see the restricted module).
+        let vmat_2d_a = vmat_a.into_contig(ColMajor).into_shape([nao * nao, 3 * natm]);
+        let vmat_2d_b = vmat_b.into_contig(ColMajor).into_shape([nao * nao, 3 * natm]);
+        let de_a = d_r_ao_flat_a.view() % vmat_2d_a;
+        let de_b = d_r_ao_flat_b.view() % vmat_2d_b;
+        let de_chunk: Tsr = (de_a + de_b)
+            .into_shape([3, natm])
+            .into_contig(ColMajor)
+            .into_owned();
         let _lock = guard.lock().unwrap();
         unsafe { *&mut de_resp.force_mut() += &de_chunk };
     });

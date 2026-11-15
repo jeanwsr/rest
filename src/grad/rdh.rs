@@ -728,6 +728,13 @@ fn de_xc_response_term(
     use rayon::prelude::*;
     let weights_full = ni.weights.clone();
     let d_r_ao_ref = &d_r_ao;
+    // [1, nao*nao] once, shared by every chunk: the per-chunk contract is a single GEMM
+    // below, so the stride-1 layout of this operand must be established only once.
+    let d_r_ao_flat: Tsr<f64> = d_r_ao_ref
+        .view()
+        .into_contig(ColMajor)
+        .into_shape([1, nao * nao])
+        .into_owned();
     let dm0_owned: Tsr<f64> = dm0.into_contig(ColMajor).into_owned();
     let ni_ref = &*ni;
     let device_ref = &device;
@@ -745,18 +752,14 @@ fn de_xc_response_term(
         let vmat_fxc = get_vmat_fxc(xc_type, ao.view(), drho.view(), wf.view());
         let vmat_vxc = get_vmat_vxc(vmat_ip.view(), aoslices_ref);
         let vmat = &vmat_fxc + &vmat_vxc;
-        let mut de_chunk: Tsr<f64> = rt::zeros(([3, natm].f(), &device));
-        for atm in 0..natm {
-            for t in 0..3 {
-                let v: f64 = rt::vecdot(
-                    &d_r_ao_ref.view().into_shape([nao * nao]),
-                    &vmat.i((.., .., t, atm)).into_shape([nao * nao]),
-                    -1,
-                )
-                .sum_all();
-                de_chunk[[t, atm]] = v;
-            }
-        }
+        // de[t, atm] = sum_{mu,nu} d_r_ao[mu,nu] * vmat[mu,nu,t,atm].
+        // The old loop did 3*natm vecdots, and each call materialised a [nao^2]
+        // temporary from a strided [.., .., t, atm] view and scanned it twice; here the
+        // same contraction is one GEMM against the [nao^2, 3*natm] flattening (the
+        // element order of `into_shape` matches the col-major (mu, nu, t, atm) layout).
+        let vmat_2d = vmat.into_contig(ColMajor).into_shape([nao * nao, 3 * natm]);
+        let de = d_r_ao_flat.view() % vmat_2d;
+        let de_chunk: Tsr<f64> = de.into_shape([3, natm]).into_contig(ColMajor).into_owned();
         let _lock = guard.lock().unwrap();
         unsafe { *&mut de_resp.force_mut() += &de_chunk };
     });
