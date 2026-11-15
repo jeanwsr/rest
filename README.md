@@ -108,6 +108,7 @@
 
 ## DFT积分格点相关关键词（Keyword）
 - `grid_generation_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
+- `grid_level_map`: 取值Table。逐原子覆盖格点精度等级：键为从1开始的原子序号（支持闭区间 `"i-j"`），值为0-9的等级；未列出的原子使用 `grid_generation_level`。例：`grid_level_map = { "56-555" = 0 }`（配合 `grid_generation_level = 3`）
 - `pruning`: 取值String。DFT方法或sap初猜所选用格点筛选。目前，REST支持nwchem，sg1以及none。其中none为不筛选。缺省为nwchem
 - `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持treutler，gc2nd， delley, becke, mura_knowles及lmg。缺省为treutler
 - `radii_adjust`: 取值String。Becke划分中原子的半径调整方案。`becke` 用Bragg半径本身（Becke 1988原文形式），`treutler` 用Bragg半径的平方根（Treutler-Ahlrichs 1995形式）。两者都满足权重和为1，差别随格点加密衰减。缺省为treutler（历史缺省 becke 可用输入卡显式指定）
@@ -147,6 +148,8 @@
 - `auxbas_path`: 取值String类型，指定辅助基组路径，仅当`eri_type=ri-v`时需要设置  
     缺省值：def2-universal-jkfit。（该基组较大，建议根据体系换用匹配的辅助基组）
 	设置方式与`basis_path`相同，程序搜索路径一致。
+- `basis_map`: 取值Table。为同一元素的不同原子指定不同基组：键为从1开始的原子序号（支持闭区间 `"i-j"`，顺序与 `[geom]` 一致，ghost 基组原子顺延编号），值为基组名称（解析规则与 `basis_path` 相同）；未列出的原子使用 `basis_path`。不能与 `basis_path = "chkfile"` 同时使用。例：`basis_map = { "1" = "def2-TZVP", "5-8" = "cc-pVTZ" }`
+- `auxbas_map`: 取值Table。逐原子覆盖辅助基组，语法与 `basis_map` 对称（键为原子序号，支持 `"i-j"`），未列出的原子使用 `auxbas_path`；`eri_type = "analytic"` 时不使用辅助基组，此项被忽略并给出警告
 
 ### 自定义基组使用方法
 REST 支持用户自定义或混合基组：
@@ -1467,11 +1470,14 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - **AIMD（纯 QM）**：体系只有 `[geom]` 的 QM 分子，每步先收敛 SCF 再移动原子核并取解析梯度；上一步的收敛波函数自动作为下一步初猜（内部设为 `initial_guess = "inherit"`，用户无需配置，显著减少迭代），SCF 用多线程（`num_threads`）并行。
 - **QM/MM**：`[geom]` 为 QM 区，MM 体系可用内嵌 OpenMM 提供（TIP3P 自动类型，或直接给完整的 OpenMM System XML），也可由 REST 从经典力场参数**内部生成** System XML（支持共价切断的 link-H）；QM–MM 之间为点电荷嵌入 + QM–MM LJ。
 - **纯 MM**：`pure_mm = true` 时整个体系交给 OpenMM（`mm_file` / `mm_system_xml`）。
-- **任务类型**：`ensemble = "nvt"`(Langevin) / `"nve"`(VelocityVerlet) / `"opt"`(几何优化) / `"sp"`(单点能量/受力)。
+- **任务类型**：`ensemble = "nvt"`(Langevin) / `"nve"`(VelocityVerlet) / `"npt"`(恒压) / `"opt"`(几何优化) / `"sp"`(单点能量/受力)。
+- **恒压（NPT）**：Langevin 恒温 + Metropolis 体积移动（每 `baro_interval` 步尝试一次，步长 `baro_scale` 按接受率自适应），只用能量判据，不依赖应力张量；`pressure` 单位 bar。旧 Berendsen 参数 `tau_p` / `compressibility` 已不再使用。
+- **水模型**：`qmmm_water_model = "tip3p"`(缺省) | `"opc3"`（OPC3 三点水参数；自动类型与内部生成的 System 均按所选模型）。
+- **初始速度**：`init_velocities = "file"` 读取 `velocities_file`（每行 `Sym vx vy vz`，Å/fs），可沿用经典 MD 平衡帧；`restart_input` 续跑同时读位置与速度。
 - **伞形采样（US）**：`umbrella_atoms` 存在即启用；CV 支持 `dihedral` / `distance` / `angle` / `distance_diff`（后者可叠加 `umbrella_sum_kappa` 的 ½ks(s−s0)² 约束），输出 `umbrella_timeseries.csv` 供 (2D) WHAM 后处理。
 - **续跑**：`restart_input` 从上次的 `md_restart` 同时读位置与速度，无需改写 `[geom]`。
-- **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`。
-- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。MD 的参考轨迹需要 `ase >= 3.25`（3.25 起 Langevin 的 `fixcm` 投影才与参考日志一致，更旧的版本同一个 seed 走出不同轨迹），启动时日志会打印内嵌解释器与 ASE 的实际版本。
+- **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`；可选 `dump.xtc`（`outputs` 含 `"xtc"`，`xtc_interval` 控制间隔）与 PDB 轨迹（`pdb_template`、`pdb_interval`、`pdb_skip_solvent`）。
+- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`），XTC 输出另需 `mdtraj`。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。MD 的参考轨迹需要 `ase >= 3.25`（3.25 起 Langevin 的 `fixcm` 投影才与参考日志一致，更旧的版本同一个 seed 走出不同轨迹），启动时日志会打印内嵌解释器与 ASE 的实际版本。
 
 纯 QM 的 AIMD 支持多进程 MPI（SCF 与积分沿 MPI 并行，所有 rank 同步积分、仅 root 落盘）。QM/MM 与纯 MM 目前只支持单进程：进程内用 OpenMP/Rayon 多线程（`num_threads`），多进程 MPI 会在启动时被拒绝。
 
