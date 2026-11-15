@@ -16,6 +16,7 @@ use super::Basis4Elem;
 use super::{
     cartesian_gto_1st_batch_v04, cartesian_gto_1st_cint_batch,
     cartesian_gto_1st_cint_batch_serial, cartesian_gto_1st_cint_batch_serial_v03,
+    cartesian_gto_1st_cint_batch_v03_accum, cartesian_gto_cint_batch_v04_accum,
     cartesian_gto_2nd_batch_v04, cartesian_gto_3rd_batch_v04, cartesian_gto_batch_v04,
     cartesian_gto_cint_batch, cartesian_gto_cint_batch_rayon,
     cartesian_gto_cint_batch_v04, cint_cartesian_gto_1st_cint_batch_serial_v03,
@@ -238,7 +239,11 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
         for coeff in ibas.coefficients.iter() {
             let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
             coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                tmp_cart += cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
+                if crate::utilities::opt_flags::gto_legacy() {
+                    tmp_cart += cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
+                } else {
+                    cartesian_gto_cint_batch_v04_accum(*iexp, iang, gto_center, r, *icoeff, &mut tmp_cart);
+                }
             });
 
             //time_records.count_start("1-2");
@@ -521,12 +526,14 @@ pub fn spheric_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basi
         for coeff in ibas.coefficients.iter() {
             let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
             coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
-                let mut tmp_cart_0 = cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
-
-                //tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
-                tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
-                    to.self_scaled_add(from, *icoeff);
-                });
+                if crate::utilities::opt_flags::gto_legacy() {
+                    let tmp_cart_0 = cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
+                    tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
+                        to.self_scaled_add(from, *icoeff);
+                    });
+                } else {
+                    cartesian_gto_1st_cint_batch_v03_accum(*iexp, iang, gto_center, r, *icoeff, &mut tmp_cart[..]);
+                }
             });
             //let mut tmp_spheric = MatrixFull::new([num_grids,s_len],0.0);
             //Stop here

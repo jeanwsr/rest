@@ -1198,3 +1198,90 @@ pub fn cint_cartesian_gto_1st_cint_batch_serial_v03(a: f64, l: usize, c:&[f64;3]
     });
     std_gto_1st
 }
+
+/// Fused primitive accumulation for the (spheric-chain) GTO value tabulation.
+///
+/// Equivalent to `cartesian_gto_cint_batch_v04(a,l,c,r) * coeff` added into
+/// `out`, but performed in a single pass over the grid points: no temporary
+/// matrix is allocated and the separate scale/add passes are gone.  `out` is
+/// `[num_bas, num_grids]` (column-major, one column per grid point).
+pub fn cartesian_gto_batch_v04_accum(
+    a: f64, l: usize, c: &[f64; 3], r: &[[f64; 3]], coeff: f64, out: &mut MatrixFull<f64>,
+) {
+    let num_grids = r.len();
+    let num_bas = (l + 1) * (l + 2) / 2;
+    let norm0 = (2.0 * a / PI).powf(0.75) * opowf((4.0 * a), (l as f64) / 2.0);
+    let binding = cartesian_gto_const(l);
+    let basinfo = &binding.to_matrixfullslice();
+    let scale = coeff * norm0;
+    debug_assert_eq!(out.size[0], num_bas);
+    debug_assert_eq!(out.size[1], num_grids);
+    let out_data = &mut out.data;
+    for (g, rp) in r.iter().enumerate() {
+        let (rr, rdot) = delta_r(rp, c);
+        let exp_part = scale * libm::exp(-a * rdot);
+        let base = g * num_bas;
+        for (ic, bas_i) in basinfo.iter_columns_full().enumerate() {
+            let fang = rr
+                .iter()
+                .zip(&bas_i[0..3])
+                .fold(1.0, |fang, (rr, lx)| fang * opowf(*rr, *lx));
+            unsafe {
+                *out_data.get_unchecked_mut(base + ic) += bas_i.get_unchecked(3) * fang * exp_part;
+            }
+        }
+    }
+}
+
+/// Fused primitive accumulation for the spheric-chain GTO *first derivative*
+/// tabulation (three matrices: d/dx, d/dy, d/dz).  Same one-pass fusion as
+/// `cartesian_gto_batch_v04_accum`.
+pub fn cartesian_gto_1st_batch_v03_accum(
+    a: f64, l: usize, c: &[f64; 3], r: &[[f64; 3]], coeff: f64, out: &mut [MatrixFull<f64>],
+) {
+    let num_grids = r.len();
+    let num_bas = (l + 1) * (l + 2) / 2;
+    let norm0 = (2.0 * a / PI).powf(0.75) * opowf((4.0 * a), (l as f64) / 2.0);
+    let binding = cartesian_gto_const(l);
+    let basinfo = &binding.to_matrixfullslice();
+    let scale = coeff * norm0;
+    debug_assert!(out.len() == 3);
+    debug_assert_eq!(out[0].size[0], num_bas);
+    debug_assert_eq!(out[0].size[1], num_grids);
+    for (g, rp) in r.iter().enumerate() {
+        let (rr, rdot) = delta_r(rp, c);
+        let exp_part = scale * libm::exp(-a * rdot);
+        let base = g * num_bas;
+        for (ic, bas_i) in basinfo.iter_columns_full().enumerate() {
+            let mut xyz = [0.0_f64; 3];
+            let mut pxyz = [0.0_f64; 3];
+            for k in 0..3 {
+                let lx = bas_i[k];
+                let rrx = rr[k];
+                xyz[k] = opowf(rrx, lx);
+                pxyz[k] = -2.0 * a * opowf(rrx, lx + 1.0)
+                    + if lx != 0.0 { lx * opowf(rrx, lx - 1.0) } else { 0.0 };
+            }
+            let [x, y, z] = xyz;
+            let [px, py, pz] = pxyz;
+            let f = bas_i[3] * exp_part;
+            unsafe {
+                *out[0].data.get_unchecked_mut(base + ic) += f * px * y * z;
+                *out[1].data.get_unchecked_mut(base + ic) += f * x * py * z;
+                *out[2].data.get_unchecked_mut(base + ic) += f * x * y * pz;
+            }
+        }
+    }
+}
+
+pub fn cartesian_gto_cint_batch_v04_accum(
+    a: f64, l: usize, c: &[f64; 3], r: &[[f64; 3]], coeff: f64, out: &mut MatrixFull<f64>,
+) {
+    cartesian_gto_batch_v04_accum(a, l, c, r, coeff * cint_norm_factor(l as i32, a), out);
+}
+
+pub fn cartesian_gto_1st_cint_batch_v03_accum(
+    a: f64, l: usize, c: &[f64; 3], r: &[[f64; 3]], coeff: f64, out: &mut [MatrixFull<f64>],
+) {
+    cartesian_gto_1st_batch_v03_accum(a, l, c, r, coeff * cint_norm_factor(l as i32, a), out);
+}
