@@ -603,10 +603,10 @@ impl SCF {
             // ranks, but the selection is geometry-only and rank-local, and the distributed
             // builder carries it into the metric solve while keeping the local block shape,
             // so no collective is added (see `Molecule::prepare_rimatr_for_ri_v_mpi_rayon`).
-            // The cut is deliberately loose (PRESCREEN_SAFETY below the pruning threshold) because
+            // The cut is deliberately loose (the safety factor below the pruning threshold) because
             // the Schwarz bound bounds the untransformed block while the pruning acts on the
             // metric-transformed row maximum.
-            const PRESCREEN_SAFETY: f64 = 10.0;
+            let prescreen_safety = crate::utilities::opt_flags::prescreen_safety();
             prescreen_keep = if self.mol.ctrl.ri_jk.pair_screen_threshold > 0.0 && ri3fn_symm {
                 let cint_mol = ri_jk::util::get_cint_mol(&self.mol);
                 let (basbas2baspar, _) = ri_jk::generate_baspar(self.mol.num_basis);
@@ -616,7 +616,7 @@ impl SCF {
                     nao,
                     &basbas2baspar,
                     self.mol.ctrl.ri_jk.schwartz_overlap_tol2,
-                    self.mol.ctrl.ri_jk.pair_screen_threshold / PRESCREEN_SAFETY,
+                    self.mol.ctrl.ri_jk.pair_screen_threshold / prescreen_safety,
                 );
                 info!(
                     "In-core RI pair pre-screen: {} of {} AO pairs kept for the build \
@@ -624,7 +624,7 @@ impl SCF {
                     keep.len(),
                     nao * (nao + 1) / 2,
                     self.mol.ctrl.ri_jk.pair_screen_threshold,
-                    PRESCREEN_SAFETY
+                    prescreen_safety
                 );
                 Some(keep)
             } else {

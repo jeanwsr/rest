@@ -350,7 +350,51 @@ pub fn compact_rimatr_rows(ri3fn: MatrixFull<f64>, kept: &[usize]) -> MatrixFull
     assert!(kept.last().map_or(true, |&p| p < num_baspar), "retained row out of range");
 
     let mut data = ri3fn.data;
-    if num_kept < num_baspar {
+    if num_kept < num_baspar && !crate::utilities::opt_flags::compact_copy() {
+        // Streaming in-place compaction. Row `slot` of aux column `c` lives at flat index
+        // `c * num_baspar + kept[slot]` and has to end up at `c * num_kept + slot`, i.e. every
+        // column moves left by `c * (num_baspar - num_kept)`. The mapping is monotone in the flat
+        // index and always moves data leftward, so the buffer can be rewritten in place: a group
+        // of columns may run in parallel as long as its destination range ends before the first
+        // source element of the group (`c0 * num_baspar`), because no write can then land on an
+        // element that is still to be read. The group grows geometrically once the freed gap is
+        // wider than one column, so the whole 45 GB move is a handful of parallel bursts and the
+        // peak stays at the tensor itself instead of tensor + compacted copy.
+        let rss_before = crate::utilities::opt_flags::rss_kib();
+        let base = data.as_mut_ptr() as usize;
+        let mut c0 = 0usize;
+        while c0 < num_auxbas {
+            let c1 = ((c0 * num_baspar) / num_kept)
+                .max(c0 + 1)
+                .min(num_auxbas);
+            (c0..c1).into_par_iter().for_each(|c| {
+                let p = base as *mut f64;
+                let src = c * num_baspar;
+                let dst = c * num_kept;
+                // ascending slots: dst + slot < src + kept[slot] holds throughout, so the
+                // forward walk never reads an element this column has already written.
+                for slot in 0..num_kept {
+                    unsafe {
+                        *p.add(dst + slot) = *p.add(src + *kept.get_unchecked(slot));
+                    }
+                }
+            });
+            c0 = c1;
+        }
+        let keep_len = num_kept * num_auxbas;
+        let cap = data.capacity();
+        data.truncate(keep_len);
+        let freed = release_tail_pages(data.as_ptr() as usize, keep_len, cap);
+        debug!(
+            "In-place rimatr compaction: {} -> {} rows, released {:.2} GiB of tail pages, \
+             RSS {} -> {} MiB",
+            num_baspar,
+            num_kept,
+            freed as f64 / 1073741824.0,
+            rss_before,
+            crate::utilities::opt_flags::rss_kib()
+        );
+    } else if num_kept < num_baspar {
         // Parallel compaction into a fresh output buffer. The in-place
         // left-shift variant (`kept` ascending ⇒ `dst+slot <= src+p`) is
         // serial-only: a column's writes start inside the read regions of
@@ -381,6 +425,37 @@ pub fn compact_rimatr_rows(ri3fn: MatrixFull<f64>, kept: &[usize]) -> MatrixFull
     }
 
     MatrixFull::from_vec([num_kept, num_auxbas], data).unwrap()
+}
+
+
+/// `MADV_DONTNEED` the pages past the kept rows of a truncated buffer.
+///
+/// The tensor is the dominant allocation of the in-core path; after the in-place left shift the
+/// tail of the buffer is dead but still resident. Dropping it through the allocator would free
+/// and re-allocate (a second peak), so the pages are returned to the OS directly. Returns the
+/// number of bytes handed back.
+fn release_tail_pages(base: usize, keep_len: usize, capacity: usize) -> usize {
+    const PAGE: usize = 4096;
+    const MADV_DONTNEED: i32 = 4;
+    // same signature as `advise_huge_pages_scratch` below, so both declarations agree
+    extern "C" {
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    if capacity <= keep_len {
+        return 0;
+    }
+    let start = (base + keep_len * core::mem::size_of::<f64>() + PAGE - 1) & !(PAGE - 1);
+    let end = (base + capacity * core::mem::size_of::<f64>()) & !(PAGE - 1);
+    if end <= start {
+        return 0;
+    }
+    let rc = unsafe { madvise(start as *mut u8, end - start, MADV_DONTNEED) };
+    if rc == 0 {
+        end - start
+    } else {
+        debug!("madvise(MADV_DONTNEED) on the rimatr tail failed with {}", rc);
+        0
+    }
 }
 
 /// A-priori keep list of a storage-level **pre-screen** of the AO-pair space.
@@ -465,10 +540,12 @@ pub fn row_bounds(ri3fn: &MatrixFull<f64>) -> Vec<f64> {
 }
 
 /// Minimum row fraction the storage-level compaction of a pre-screened tensor
-/// must save for the copy to be worth its cost
-/// ([`prune_rimatr_prescreened`]). Below it the copy is skipped: the saved
-/// memory would be small, the old+new buffer window of the copy is paid in
-/// full, and the runtime bounds criteria make the extra rows free in time.
+/// must save for a *copying* compaction to be worth its cost
+/// ([`prune_rimatr_prescreened`]). The default path compacts **in place** (no
+/// second buffer, no old+new window), so it always compacts and this bound only
+/// gates the copying baseline selected with `REST_COMPACT_COPY=1`: there the
+/// saved memory would be small, the copy window is paid in full, and the runtime
+/// bounds criteria make the extra rows free in time.
 pub const COMPACT_MIN_GAIN: f64 = 0.10;
 
 /// Prune a tensor that already lives on the row space of a pre-screen.
@@ -479,13 +556,12 @@ pub const COMPACT_MIN_GAIN: f64 = 0.10;
 /// [`PairMap`] describes them in the **full** packed pair space, so every consumer of the map sees
 /// the layout it would have seen without the pre-screen.
 ///
-/// When that selection keeps most of the pre-screen rows (it saves less than
-/// [`COMPACT_MIN_GAIN`] of them) the compaction copy is skipped: the tensor keeps the pre-screen
-/// row space and the map marks every stored row as kept. The rows this level would have dropped
-/// have bounds at or below the cut, so the runtime J/K contractions skip them dynamically through
-/// their relative bounds criteria — they cost memory (the pre-screen rows stay stored) but no
-/// time, while the old+new buffer window of the compaction copy and its tens of seconds per
-/// preparation disappear.
+/// The compaction is in place by default: it moves the kept rows inside the existing buffer and
+/// releases the tail pages, so it needs no second buffer and the peak is just the tensor itself.
+/// Only under `REST_COMPACT_COPY=1` — the A/B baseline — is a copy made, and there the compaction
+/// is skipped when it would save less than [`COMPACT_MIN_GAIN`] of the stored rows (the tensor
+/// then keeps the pre-screen row space and the map marks every stored row as kept, the dropped
+/// rows costing memory but no time through the runtime bounds criteria).
 pub fn prune_rimatr_prescreened(
     ri3fn: MatrixFull<f64>,
     bounds: &[f64],
@@ -513,10 +589,12 @@ pub fn prune_rimatr_prescreened(
     // dropped rows free in time, so only the copy cost — one full pass over
     // the tensor plus the old+new peak window — would remain.
     let saved_fraction = 1.0 - kept_local.len() as f64 / num_stored as f64;
-    if saved_fraction < COMPACT_MIN_GAIN {
+    // in-place compaction is the default and has no copy window, so only the copying baseline
+    // still trades the saved rows against the cost of the copy
+    if saved_fraction < COMPACT_MIN_GAIN && crate::utilities::opt_flags::compact_copy() {
         debug!(
             "Storage-level pruning keeps {} of {} pre-screen rows (saves {:.1}%): \
-             skipping the compaction copy, the pre-screen row space stays stored.",
+             skipping the compaction COPY (REST_COMPACT_COPY=1), the pre-screen row space stays stored.",
             kept_local.len(),
             num_stored,
             100.0 * saved_fraction
