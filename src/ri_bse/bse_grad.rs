@@ -47,7 +47,7 @@
 //!   integral slices, which turns the `O(3 natm * naux * nao^2 * nmo)` assembly
 //!   into `O(naux * nao^2 * nmo)` plus `O(3 natm * naux * nao^2)`.
 
-use crate::ri_gw::gw_grad::{GwGradEngine, QpCache};
+use crate::ri_gw::gw_grad::{CdQpCache, GwCdGradEngine, GwGradEngine, QpCache};
 use crate::scf_io::SCF;
 use rayon::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
@@ -2175,6 +2175,26 @@ pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
     }
 }
 
+/// Placeholder for an inactive full-CD QP row; never read by the pullback.
+pub(crate) fn empty_cd_qp_cache(target: usize) -> CdQpCache {
+    CdQpCache {
+        target,
+        omega: 0.0,
+        freq: 0.0,
+        z_factor: 1.0,
+        dsigma_domega: 0.0,
+        static_fallback: false,
+        linearized: false,
+        lin_shift: 0.0,
+        w_imag: Vec::new(),
+        y_imag: Vec::new(),
+        w0: Vec::new(),
+        y0_static: Vec::new(),
+        y0_metric: Vec::new(),
+        residues: Vec::new(),
+    }
+}
+
 /// Bytes of one fully built [`QpCache`] in the **compact** representation: the
 /// single metric intermediate `[naux, nmo]` the cache keeps (it does not depend
 /// on the quadrature frequency, so it is stored once), the `w_imag` table and
@@ -2262,6 +2282,10 @@ impl BseStability {
 /// The static-BSE analytic-gradient engine for one geometry.
 pub struct BseGradEngine<'a> {
     pub gw: &'a GwGradEngine<'a>,
+    /// Full-CD QP provider when `gw_variant = "cd"`/`"fscd"`; `None` for AC/WAC.
+    pub cd: Option<&'a GwCdGradEngine<'a>>,
+    /// Full-CD QP rows for the active orbitals (empty for AC/WAC).
+    pub cd_qp_caches: Vec<CdQpCache>,
     pub screen: BseScreening,
     pub kappa: f64,
     /// Solve (and differentiate) the **TDA** problem instead of the full
@@ -2319,7 +2343,7 @@ impl<'a> BseGradEngine<'a> {
         screening_energy: ScreeningEnergy,
     ) -> Self {
         Self::new_with_window(
-            scf, gw, multi, screening_energy, f64::INFINITY, f64::NEG_INFINITY,
+            scf, gw, None, multi, screening_energy, f64::INFINITY, f64::NEG_INFINITY,
         )
     }
 
@@ -2332,7 +2356,7 @@ impl<'a> BseGradEngine<'a> {
         screening_energy: ScreeningEnergy,
         vir_cutoff: f64,
     ) -> Self {
-        Self::new_with_window(scf, gw, multi, screening_energy, vir_cutoff, f64::NEG_INFINITY)
+        Self::new_with_window(scf, gw, None, multi, screening_energy, vir_cutoff, f64::NEG_INFINITY)
     }
 
     /// Build the engine with the BSE transition space restricted to virtual
@@ -2347,6 +2371,7 @@ impl<'a> BseGradEngine<'a> {
     pub fn new_with_window(
         scf: &'a SCF,
         gw: &'a GwGradEngine<'a>,
+        cd: Option<&'a GwCdGradEngine<'a>>,
         multi: char,
         screening_energy: ScreeningEnergy,
         vir_cutoff: f64,
@@ -2418,6 +2443,11 @@ impl<'a> BseGradEngine<'a> {
         // resident and the *peak* RSS of the build alone reaches several GB.
         let mut qp_energies = vec![0.0f64; gw.nmo];
         let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
+        let mut cd_qp_caches: Vec<CdQpCache> = if cd.is_some() {
+            (0..gw.nmo).map(empty_cd_qp_cache).collect()
+        } else {
+            Vec::new()
+        };
         // **This loop stays serial.**  It is the one large serial block of the
         // engine (vitamin C/def2-TZVP, EPYC 9654: 125.5 s of the 433.1 s
         // one-thread BSE gradient, 1.68x at 8 threads), and its whole cost is the
@@ -2464,9 +2494,15 @@ impl<'a> BseGradEngine<'a> {
         let mut n_qp_built = 0usize;
         for n in 0..gw.nmo {
             if needed(n) {
-                let c = gw.build_target_cache_compact(n);
-                qp_energies[n] = c.omega;
-                qp_caches[n] = c;
+                if let Some(cd_engine) = cd {
+                    let c = cd_engine.build_target_cache(n);
+                    qp_energies[n] = c.omega;
+                    cd_qp_caches[n] = c;
+                } else {
+                    let c = gw.build_target_cache_compact(n);
+                    qp_energies[n] = c.omega;
+                    qp_caches[n] = c;
+                }
                 n_qp_built += 1;
             }
             if n % 16 == 15 {
@@ -2497,7 +2533,8 @@ impl<'a> BseGradEngine<'a> {
             for n in 0..gw.nmo {
                 eprintln!(
                     "[bse_grad qp] n={n:3}  eps={:12.8}  qp={:12.8}  shift={:+.3e}  lin={}",
-                    eps[n], qp_energies[n], qp_energies[n] - eps[n], qp_caches[n].linearized
+                    eps[n], qp_energies[n], qp_energies[n] - eps[n],
+                    if cd.is_some() { cd_qp_caches[n].linearized } else { qp_caches[n].linearized }
                 );
             }
         }
@@ -2553,6 +2590,8 @@ impl<'a> BseGradEngine<'a> {
         }
         BseGradEngine {
             gw,
+            cd,
+            cd_qp_caches,
             screen,
             kappa,
             tda,
@@ -3008,75 +3047,98 @@ impl<'a> BseGradEngine<'a> {
         // `PULLBACK_BATCH_PAGES` and each batch is merged (and dropped) before
         // the next one starts.  The cost is a peak that grows from
         // ~5 GB to ~13 GB at vitamin C/def2-TZVP.
-        let per_cache = self.gw.qp_cache_estimate_bytes().max(1);
-        let per_page = (self.qp_page_budget() / per_cache).clamp(1, nmo);
-        //
-        // **Single scratch, serial pages.**  `qp_pullback_chunk` is parallel
-        // *inside* (its frequency axis and its orbital reduction run on the
-        // pool), so the page loop does not need to be parallel as well — and
-        // making it parallel cost one whole scratch per in-flight page
-        // (`nk * (naux^2*(nquad+2) + naux*nmo^2/2)` doubles, 1.1 GB at vitamin
-        // C/def2-TZVP), which is exactly what pushed the 8-core peak above the
-        // 1-core one.  One scratch here keeps the peak at the serial level.
-        //
-        // The caches a page needs are materialised before the loop: rebuilding
-        // one triggers the lazy low-rank builders, which mutate the engine's
-        // `RefCell` caches, so it must not happen from inside a parallel region.
-        let mut rebuilt_all: Vec<(usize, QpCache)> = Vec::new();
-        for n in 0..nmo {
-            let active = (0..nk).any(|k| weights[k][n] != 0.0);
-            let resident = &self.qp_caches[n];
-            if active && resident.y_imag.is_empty() && resident.m_imag.is_empty() {
-                rebuilt_all.push((n, self.gw.build_target_cache_compact(n)));
-            }
-        }
-        let rebuilt_of: std::collections::HashMap<usize, usize> = rebuilt_all
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| (*n, i))
-            .collect();
-        // Pair-covector band: the largest orbital that carries a QP weight, + 1.  Every writer
-        // of `bq` addresses pairs whose smaller index is one of those rows, so the rest of the
-        // packed pair space is identically zero and need not be stored.
-        let nrow_pair = weights
-            .iter()
-            .map(|w| w.iter().rposition(|&v| v != 0.0).map_or(0, |i| i + 1))
-            .max()
-            .unwrap_or(nmo)
-            .max(1)
-            // The packed pair covector must also cover the complete active
-            // window even when every amplitude weight happens to vanish at a
-            // particular (near-degenerate, single-configuration) geometry.
-            // Without this floor `add_into_packed` can address pairs outside
-            // the banded buffer.
-            .max(occ_start + nocc_act)
-            .max(vir_start + nvir)
-            .min(nmo);
-        let mut scr = self.gw.qp_pullback_scratch_banded(nk, nrow_pair);
-        let mut col0 = 0usize;
-        while col0 < nmo {
-            let end = (col0 + per_page).min(nmo);
-            let page: Vec<&QpCache> = (col0..end)
-                .map(|n| match rebuilt_of.get(&n) {
-                    Some(&ri) => &rebuilt_all[ri].1,
-                    None => &self.qp_caches[n],
-                })
+        let t_qp = Instant::now();
+        let (mut bq, mut bj, mut be, bb, nrow_pair) = if let Some(cd_engine) = self.cd {
+            // Full-CD QP pullback: no low-rank page loop.  The active weights
+            // are compacted to the orbitals whose full-CD cache was built; the
+            // returned pair covector is dense and is packed into the same
+            // lower-triangle layout the fold/adjoint code consumes.
+            let active: Vec<usize> = (0..nmo)
+                .filter(|&n| (0..nk).any(|k| weights[k][n] != 0.0))
                 .collect();
-            self.gw
-                .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
-            // Orbitals whose QP energy came from the linearized (one-step
-            // Newton) branch carry an extra omega-derivative channel
-            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  It is run on the same
-            // page immediately, while the caches are still resident, instead of
-            // keeping a second covector set or rebuilding the page.
-            if page.iter().any(|c| c.linearized) {
-                self.gw
-                    .qp_pullback_chunk_omega_public(&page, &flat_weights, col0, &mut scr);
+            let refs: Vec<&CdQpCache> = active.iter().map(|&n| &self.cd_qp_caches[n]).collect();
+            let w_sub: Vec<Vec<f64>> = weights
+                .iter()
+                .map(|w| active.iter().map(|&n| w[n]).collect())
+                .collect();
+            let (mut bq, bj, be, bb) = cd_engine.cd_qp_pullback(&refs, &w_sub);
+            for v in &mut bq {
+                crate::ri_gw::gw_grad::pack_pairs_in_place(v, nmo, naux);
             }
-            col0 = end;
-        }
-        drop(rebuilt_all);
-        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
+            self.cd_qp_caches.clear();
+            (bq, bj, be, bb, nmo)
+        } else {
+            let per_cache = self.gw.qp_cache_estimate_bytes().max(1);
+            let per_page = (self.qp_page_budget() / per_cache).clamp(1, nmo);
+            //
+            // **Single scratch, serial pages.**  `qp_pullback_chunk` is parallel
+            // *inside* (its frequency axis and its orbital reduction run on the
+            // pool), so the page loop does not need to be parallel as well — and
+            // making it parallel cost one whole scratch per in-flight page
+            // (`nk * (naux^2*(nquad+2) + naux*nmo^2/2)` doubles, 1.1 GB at vitamin
+            // C/def2-TZVP), which is exactly what pushed the 8-core peak above the
+            // 1-core one.  One scratch here keeps the peak at the serial level.
+            //
+            // The caches a page needs are materialised before the loop: rebuilding
+            // one triggers the lazy low-rank builders, which mutate the engine's
+            // `RefCell` caches, so it must not happen from inside a parallel region.
+            let mut rebuilt_all: Vec<(usize, QpCache)> = Vec::new();
+            for n in 0..nmo {
+                let active = (0..nk).any(|k| weights[k][n] != 0.0);
+                let resident = &self.qp_caches[n];
+                if active && resident.y_imag.is_empty() && resident.m_imag.is_empty() {
+                    rebuilt_all.push((n, self.gw.build_target_cache_compact(n)));
+                }
+            }
+            let rebuilt_of: std::collections::HashMap<usize, usize> = rebuilt_all
+                .iter()
+                .enumerate()
+                .map(|(i, (n, _))| (*n, i))
+                .collect();
+            // Pair-covector band: the largest orbital that carries a QP weight, + 1.  Every writer
+            // of `bq` addresses pairs whose smaller index is one of those rows, so the rest of the
+            // packed pair space is identically zero and need not be stored.
+            let nrow_pair = weights
+                .iter()
+                .map(|w| w.iter().rposition(|&v| v != 0.0).map_or(0, |i| i + 1))
+                .max()
+                .unwrap_or(nmo)
+                .max(1)
+                // The packed pair covector must also cover the complete active
+                // window even when every amplitude weight happens to vanish at a
+                // particular (near-degenerate, single-configuration) geometry.
+                // Without this floor `add_into_packed` can address pairs outside
+                // the banded buffer.
+                .max(occ_start + nocc_act)
+                .max(vir_start + nvir)
+                .min(nmo);
+            let mut scr = self.gw.qp_pullback_scratch_banded(nk, nrow_pair);
+            let mut col0 = 0usize;
+            while col0 < nmo {
+                let end = (col0 + per_page).min(nmo);
+                let page: Vec<&QpCache> = (col0..end)
+                    .map(|n| match rebuilt_of.get(&n) {
+                        Some(&ri) => &rebuilt_all[ri].1,
+                        None => &self.qp_caches[n],
+                    })
+                    .collect();
+                self.gw
+                    .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
+                // Orbitals whose QP energy came from the linearized (one-step
+                // Newton) branch carry an extra omega-derivative channel
+                // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  It is run on the same
+                // page immediately, while the caches are still resident, instead of
+                // keeping a second covector set or rebuilding the page.
+                if page.iter().any(|c| c.linearized) {
+                    self.gw
+                        .qp_pullback_chunk_omega_public(&page, &flat_weights, col0, &mut scr);
+                }
+                col0 = end;
+            }
+            drop(rebuilt_all);
+            let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
+            (bq, bj, be, bb, nrow_pair)
+        };
         crate::ri_gw::gw_grad::mem_probe("bse: after qp pullback (bq/bj/be/bb live)");
         let t_qp = t_qp.elapsed().as_secs_f64();
         // The low-rank screening factors are read only while a self-energy
@@ -3084,9 +3146,11 @@ impl<'a> BseGradEngine<'a> {
         // transformed blocks, released before it): return them before the fold
         // and the adjoint, whose `naux*nao^2` tensors set the peak.
         self.gw.evict_qt();
-        // the QP caches (one `[naux, nmo]` row table per active orbital) are
-        // consumed by the pullback; a later gradient rebuilds them on demand
-        self.qp_caches.clear();
+        // the low-rank QP caches are consumed by the pullback; a later
+        // gradient rebuilds them on demand
+        if self.cd.is_none() {
+            self.qp_caches.clear();
+        }
         crate::hessian::memory_monitor::trim_to_os(0);
         if grad_timing() {
             eprintln!("[bse_grad mem] qp pullback:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());

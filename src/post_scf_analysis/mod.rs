@@ -761,14 +761,37 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                  grad_group, geom_now, ao_mode_this_step,
                  used_occ_start, used_vir_end, active_nocc, active_nvir) = {
                 let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
-                let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+                let is_cd = !matches!(
+                    qp_ctrl.gw_variant,
+                    crate::ctrl_io::quasiparticle_methods::GwVariant::Ac | crate::ctrl_io::quasiparticle_methods::GwVariant::Wac
+                );
+                let mut vxc = Some(vxc);
+                let mut cd_engine = if is_cd {
+                    Some(ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(
+                        scf_data, cfg.clone(), vxc.take().unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                let mut gw_engine = if is_cd {
+                    None
+                } else {
+                    Some(ri_gw::gw_grad::GwGradEngine::new_with_vxc(
+                        scf_data, cfg, vxc.take().unwrap(),
+                    ))
+                };
                 // Hand the energy path's quasiparticle energies to the gradient
                 // engine: `gradient_qp_from_checkpoint` (default true) then builds
                 // every cache at the stored energy instead of re-solving the QP
                 // equation, so the BSE diagonal, the printed spectrum and the
                 // gradient share one solution per orbital.
                 if pin_qp {
-                    gw.pin_qp_energies(scf_data.gwqp.0.clone());
+                    if let Some(cd) = cd_engine.as_mut() {
+                        cd.base.pin_qp_energies(scf_data.gwqp.0.clone());
+                    }
+                    if let Some(gw) = gw_engine.as_mut() {
+                        gw.pin_qp_energies(scf_data.gwqp.0.clone());
+                    }
                 }
                 // `gradient_bse_window = 0` keeps the full virtual space, the
                 // historical behaviour; a positive value restricts the
@@ -784,8 +807,14 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 // `bse_cutoff_energy = x`: `x` Ha below the HOMO (occupied
                 // side) and `x` Ha above the LUMO (virtual side).
                 let (cutoff, occ_cutoff) = bse_gradient_cutoffs(scf_data, &qp_ctrl);
+                let gw_ref = cd_engine
+                    .as_ref()
+                    .map(|cd| &cd.base)
+                    .or(gw_engine.as_ref())
+                    .expect("BSE gradient: no GW engine");
                 let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_window(
-                    scf_data, &gw, multi, screen, cutoff, occ_cutoff);
+                    scf_data, gw_ref, cd_engine.as_ref(), multi, screen, cutoff, occ_cutoff,
+                );
                 println!(
                     "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
                     bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
@@ -1248,12 +1277,40 @@ fn sharc_step(
     // Solve the BSE and (optionally) differentiate every root.
     let (omegas, grads, x, y, occ_start, nocc_active, vir_start, nvir_active) = {
         let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
-        let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+        let is_cd = !matches!(
+            qp_ctrl.gw_variant,
+            crate::ctrl_io::quasiparticle_methods::GwVariant::Ac | crate::ctrl_io::quasiparticle_methods::GwVariant::Wac
+        );
+        let mut vxc = Some(vxc);
+        let mut cd_engine = if is_cd {
+            Some(ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(
+                scf_data, cfg.clone(), vxc.take().unwrap(),
+            ))
+        } else {
+            None
+        };
+        let mut gw_engine = if is_cd {
+            None
+        } else {
+            Some(ri_gw::gw_grad::GwGradEngine::new_with_vxc(
+                scf_data, cfg, vxc.take().unwrap(),
+            ))
+        };
         if pin_qp {
-            gw.pin_qp_energies(scf_data.gwqp.0.clone());
+            if let Some(cd) = cd_engine.as_mut() {
+                cd.base.pin_qp_energies(scf_data.gwqp.0.clone());
+            }
+            if let Some(gw) = gw_engine.as_mut() {
+                gw.pin_qp_energies(scf_data.gwqp.0.clone());
+            }
         }
+        let gw_ref = cd_engine
+            .as_ref()
+            .map(|cd| &cd.base)
+            .or(gw_engine.as_ref())
+            .expect("BSE gradient: no GW engine");
         let mut bse = BseGradEngine::new_with_window(
-            scf_data, &gw, multi, screen, cutoff, occ_cutoff);
+            scf_data, gw_ref, cd_engine.as_ref(), multi, screen, cutoff, occ_cutoff);
         println!(
             "SHARC step {}: BSE transition space {} occupied x {} of {} virtuals, spin channel '{multi}'",
             qp_ctrl.sharc_step_index, bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
