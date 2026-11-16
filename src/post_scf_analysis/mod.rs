@@ -348,8 +348,7 @@ fn announce_gw_skipped(scf_data: &SCF, output_type: &str) {
 /// ~1-3.5 GB; releasing them here is therefore free, and the release lands *before* the
 /// gradient's peak phase (which is well after the engine build).
 ///
-/// This is the *only* place the gradient driver gives them up; the escape hatch
-/// `REST_KEEP_GRID_AO=1` restores the historical behaviour for an A/B comparison.
+/// This is the *only* place the gradient driver gives them up.
 fn precompute_vxc_and_release_grid_ao(scf_data: &mut SCF) -> ri_gw::gw_grad::GwVxc {
     ri_gw::gw_grad::GwGradEngine::precompute_vxc(scf_data)
 }
@@ -1615,12 +1614,6 @@ fn bse_gradient_cutoffs(
         } else {
             f64::INFINITY
         };
-        if std::env::var("REST_BSE_PIN_DEBUG").is_ok() {
-            eprintln!(
-                "[bse pin] occ_start = {lo}, vir_end = {hi} -> occ_cutoff \
-                 {occ_cut:.6} Ha, vir_cutoff {vir_cut:.6} Ha"
-            );
-        }
         (vir_cut, occ_cut)
     } else {
     let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
