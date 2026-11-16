@@ -613,36 +613,6 @@ use_low_rank_contour = true
 - `gw_variant`: 取值String，GW 变体类型：
     - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
     - `"ac"`：解析延拓（Analytic Continuation）路径。配合 `gw_scheme = "extrapolated"` 使用。`ac` 路径暂不支持 `fourier_self_energy` 或 `hermite_self_energy`。
-    - `"fscd"`：频率采样轮廓变形（Frequency-Sampled Contour Deformation）路径。配合 `gw_scheme = "extrapolated"` 使用，是 `"cd"` 的近似加速版本，详见下一节。
-- `ac_num_samples`: 取值usize，Padé 虚轴采样点数。从 quadrature 频点中按 PySCF 风格的指数递减步长选取。缺省为 16。
-- `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
-- `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
-- `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
-
-### FSCD-GW（频率采样轮廓变形 GW 变体）
-
-`gw_variant = "fscd"` 是 `"cd"` 的频率采样加速版本，配合 `gw_scheme = "extrapolated"` 使用。它在残数频率上构造响应矩阵并插值，以减少重复的屏蔽矩阵构造。
-
-- `fscd_domega`: 取值f64，单位Hartree。频率合并的绝对阈值，缺省 `0.05`。
-- `fscd_rel_tol`: 取值f64。频率合并的相对阈值，缺省 `1e-3`。
-- `fscd_interp`: 取值String。采样点插值方式，`"linear"`（缺省）或 `"cubic"`。
-- `fscd_fallback_residual`: 取值f64，单位Hartree，缺省 `1e-3`。求根后残差超过该值时，该轨道回退到精确 CD 引擎。
-- FSCD 使用 MO 基组的 RI 张量，`gw_tensor_style = "ao"` 不生效。
-
-典型输入：
-
-```toml
-[quasiparticle_methods]
-gw_scheme = "extrapolated"
-gw_variant = "fscd"
-scgw = "g0w0"
-fscd_domega = 0.02
-fscd_interp = "cubic"
-gw_rootfinder = "newton"
-gw_extrapolate_occ_threshold = 30.0
-gw_extrapolate_vir_threshold = 30.0
-```
-
 ### GW结果导出
 
 - `save_qp`: 取值bool，设置为 `true` 将准粒子能量保存到文件。缺省为false。
@@ -704,7 +674,6 @@ davidson_target_excitations = 5
 cvs_nroots = 5
 ```
 
-输出包含每条 CVS 根的总激发能（Ha/eV）、振子强度和主导的 `#i -> #a` 芯层跃迁。
 
 ### GW输入卡示例
 
