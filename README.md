@@ -518,17 +518,11 @@ evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不
 
 REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
 
-- `evgw_solver`: 取值String，evGW/evGW0 外循环求解技巧。
-    - `"auto"`（缺省）：`scgw = "evgw"` 时使用 `"molgw"`；`scgw = "evgw0"` 时使用 `"z_update"`。evGW0 中芯层通常位于 GW 窗口内，单次求值或完整求根可能在价层轨道上跳到不同的自能根；Z 阻尼步更稳定。
-    - `"molgw"`：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
-      `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
-    - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
-    - `"z_update"`：Z 阻尼（线性化牛顿）单步更新，每个轨道每轮只走一步
-      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被截断到 [0, 1]（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。`evgw_diis = true` 时仍可在其上叠加 DIIS。
-
-evGW0 的默认 `evgw_solver = "auto"` 选择 `"z_update"`：在包含芯层的 GW 窗口中，单次求值或完整求根可能在价层轨道上跳到不同的自能根，而 Z 阻尼步能稳定收敛。实测（cc-pVDZ，scan，`evgw_conv_tol = 1e-5 Ha`，`evgw_diis = true`）：H2O 4 轮、CH4 4 轮、CO2 10 轮、NH3（芯层纳入窗口的 CVS 计算）12 轮。
-
-evGW0 也支持 `use_low_rank_contour = true` 的低秩轮廓变形 GW 框架。由于 W 固定，低秩 W 表示（虚轴 W_c 与实轴 `v*chi*v`）只在第一轮构建一次，后续轮次复用；实轴网格也固定用冻结的 W 能量来定尺寸，不会随 G 迭代移动。**注意**：当芯层进入 GW 窗口时 `de_max` 可达 ~16 Ha（约 434 eV），实轴网格需要足够密才能分辨芯层/价层极点。NH3/N 1s 的实测：`nomega_chi_real = 1024` 时低秩 evGW0 与完整（非低秩）evGW0 的芯层 QP 差约 0.07 mHa、价层 HOMO 差约 1.6 mHa；`nomega_chi_real = 256` 时价层误差可达 ~24 mHa。低秩 evGW0 的 CVS 最低激发在 n=1024 下与完整 evGW0 相差约 0.07 mHa。
+- `evgw_solver`: 取值String，evGW/evGW0 外循环更新方式。
+    - `"auto"`（缺省）：`scgw = "evgw"` 时使用 `"molgw"`；`scgw = "evgw0"` 时使用 `"z_update"`。
+    - `"molgw"`：每个轨道每轮做一次自能求值，不求解准粒子方程。
+    - `"diis"`：每轮完整求解准粒子方程，并对整条准粒子能量矢量做 Pulay/DIIS 外推。
+    - `"z_update"`：Z 阻尼（线性化牛顿）单步更新；`evgw_diis = true` 时可叠加 DIIS。
 
 - `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
     - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
@@ -627,15 +621,13 @@ use_low_rank_contour = true
 
 ### FSCD-GW（频率采样轮廓变形 GW 变体）
 
-`gw_variant = "fscd"` 在 `"cd"` 的残数求和框架上做频率采样加速。CD-GW 的残数项需要在每个极点频率 `|ω−ε_p|` 上计算屏蔽相互作用 `W_np`；求根过程会对每个试探 `ω` 重新计算一遍，深能级/大体系的极点很多时这是主要开销。FSCD 先收集这些精确残数频率，把相距很近的频率合并成一个采样点，只在采样点上构造响应矩阵和介电矩阵，其余频率用插值得到。因此响应矩阵的构造次数从“每个极点 × 每次求根试探”降为“采样频率数”。
+`gw_variant = "fscd"` 是 `"cd"` 的频率采样加速版本，配合 `gw_scheme = "extrapolated"` 使用。它在残数频率上构造响应矩阵并插值，以减少重复的屏蔽矩阵构造。
 
-- `fscd_domega`: 取值f64，单位Hartree。频率合并的绝对阈值；两个候选频率相差小于它时只保留一个。缺省 `0.05` Ha（1.361 eV，对应 TURBOMOLE 的 `thrs1`）。减小它可提高精度、增加采样点数。采样梯级最多 201 点（窗口为 `±max(gw_span_energy, 1.0)` Ha），因此 `fscd_domega` 小于约 `2*span/200`（默认约 0.01 Ha）后有效间距由该上限决定。
-- `fscd_rel_tol`: 取值f64。频率合并的相对阈值，缺省 `1e-3`（0.1%，对应 `thrs2`）。
-- `fscd_interp`: 取值String。采样点之间的插值方式，`"linear"`（缺省）或 `"cubic"`。`cubic` 对尖锐的屏蔽极点更准确，推荐在深能级/大体系中使用。
-- `fscd_fallback_residual`: 取值f64，单位Hartree。缺省 `1e-3`。FSCD 求根后，用**精确 CD** 自能在该根上算一次残差；若超过此阈值，说明近似自能把根移到了错误位置，该轨道自动回退到精确 CD 引擎。这个“一点校验”只花一次残数求和，比完整 CD 求根便宜得多，可避免在多根/极点附近选错根。
-- FSCD 使用 MO 基组的 RI 张量（`ri_ov`、`ri_row`），因此 `gw_tensor_style = "ao"` 对该变体不生效。
-- 本实现用采样点之间的线性/三次插值得到其余频率的 `W_np`（不是 `W` 的 Padé 解析延拓），并用上面的精确 CD 一点校验兜底。FSCD 需要为窗口内每个目标轨道保留一行 RI 三中心张量以及 `n_grid × n_pole` 的采样表；目标窗口很大时内存会增长。
-- FSCD 是近似方法：在屏蔽相互作用变化平缓的区域（价态、常规 HOMO/LUMO）精度很好；在自能极点附近，插值误差可能让求根跳到另一个根，此时 `fscd_fallback_residual` 校验会触发精确 CD 回退。若需要更高精度，优先减小 `fscd_domega` 并使用 `fscd_interp = "cubic"`。
+- `fscd_domega`: 取值f64，单位Hartree。频率合并的绝对阈值，缺省 `0.05`。
+- `fscd_rel_tol`: 取值f64。频率合并的相对阈值，缺省 `1e-3`。
+- `fscd_interp`: 取值String。采样点插值方式，`"linear"`（缺省）或 `"cubic"`。
+- `fscd_fallback_residual`: 取值f64，单位Hartree，缺省 `1e-3`。求根后残差超过该值时，该轨道回退到精确 CD 引擎。
+- FSCD 使用 MO 基组的 RI 张量，`gw_tensor_style = "ao"` 不生效。
 
 典型输入：
 
@@ -650,8 +642,6 @@ gw_rootfinder = "newton"
 gw_extrapolate_occ_threshold = 30.0
 gw_extrapolate_vir_threshold = 30.0
 ```
-
-在本仓库的 `tests/gw_bse/test_fscd.rs` 中给出了一组验证：H2O/STO-3G 全谱 QP 能量与 CD 的最大偏差约 `2.6e-7` Ha（`fscd_interp = "cubic"`；2 个轨道因一点校验触发精确 CD 回退），FSCD 采样表的响应矩阵构造次数从 792 降到 196（约 4 倍）；苯/STO-3G 的 36 个轨道中 35 个与 CD 在 5 meV 内一致，含校验/回退的总响应构造次数从 3900 降到 1017（约 3.8 倍），墙钟时间从 39.8 s 降到 13.3 s（约 3 倍）。
 
 ### GW结果导出
 
@@ -687,25 +677,18 @@ BSE计算在 `gw_or_bse = "bse"` 时进行，在GW准粒子能量（或从文件
 
 ### Core-Valence Separation（CVS）BSE：芯层激发
 
-`gw_or_bse = "cvs bse"` 触发 CVS-BSE。它与普通 BSE 的区别是：跃迁空间只保留**芯层占据轨道 → 虚轨道**的激发，丢弃芯层与价层激发之间的耦合；屏蔽相互作用 `W` 默认仍由**全部占据轨道**的极化率构建（与普通 BSE 完全一致），因此 CVS 引入的误差仅来自被丢弃的芯-价耦合，通常对最低芯层激发只有几 meV 到几十 meV。
+`gw_or_bse = "cvs bse"` 触发 CVS-BSE：跃迁空间只保留芯层占据轨道到虚轨道的激发，屏蔽相互作用默认仍由全部占据轨道构建。
 
-CVS 计算会自动做两件事：
+CVS 会自动扩展 GW 的占据窗口以包含所有芯层轨道，要求 `frozen_core_postscf = 0`；使用 `gw_scheme = "parse from file"` 时，`parse_qp_path` 必须包含芯层和虚轨道的完整 QP 能量。
 
-1. 在 GW 阶段把 `gw_scheme = "extrapolated"` 的占据窗口自动加宽到包含所有芯层轨道（否则芯层 QP 能量只会从价层窗口刚性外推）。芯层轨道必须位于 `start_mo = 0` 的窗口内，因此 CVS 要求 `frozen_core_postscf = 0`。
-2. 用芯层 QP 能量与虚轨道 QP 能量构造 CVS 的 `A`/`B` 矩阵，并按 `bse_tda` 选择 TDA 或完整 BSE 求解。
+- `cvs_ncore`: 取值usize，芯层占据轨道数；缺省 `0` 表示自动检测。
+- `cvs_core_energy_max`: 取值f64，单位Hartree。自动检测时判定芯层的能量上限，缺省 `-10.0`。
+- `cvs_screening`: 取值String，`"full"`（缺省）或 `"core"`。
+- `cvs_nroots`: 取值usize，报告的 CVS 根数；缺省 `0`。
+- `cvs_eigenvalue_min` / `cvs_eigenvalue_max`: 取值f64，单位Hartree。CVS 根的筛选窗口，缺省 `[0, 1e30]`。
+- `bse_spin`、`bse_tda`、`bse_davidson_solver`、`davidson_*`、`bse_cutoff_energy` 等与普通 BSE 共用。
 
-当使用 `gw_scheme = "parse from file"` 时，`parse_qp_path` 指向的文件必须同时包含芯层和虚轨道的准粒子能量（按 `scf_data.gwqp.0` 的完整轨道顺序）；否则 CVS 对角项会使用错误的芯层 QP 能量。
-
-CVS 专用关键词：
-
-- `cvs_ncore`: 取值usize，CVS 芯层占据轨道数（按能量从低到高，轨道 `0..cvs_ncore`）。缺省 `0` 表示自动检测。
-- `cvs_core_energy_max`: 取值f64，单位Hartree。`cvs_ncore = 0` 时，KS/RS 能量低于该值的占据轨道被判定为芯层。缺省 `-10.0`（可选中第一、二周期元素的 1s 芯层，排除 2s/2p 价层）。
-- `cvs_screening`: 取值String。`"full"`（缺省）用全部占据轨道构建屏蔽；`"core"` 只用芯层占据轨道构建屏蔽（诊断用，数值会与 `"full"` 有可见差别）。
-- `cvs_nroots`: 取值usize，报告的 CVS 根数。缺省 `0`：dense 求解报告全部根，Davidson 报告 `davidson_target_excitations` 个根。
-- `cvs_eigenvalue_min` / `cvs_eigenvalue_max`: 取值f64，单位Hartree。CVS 根的筛选窗口，缺省 `[0, 1e30]`。**注意**：芯层激发能量通常为几十到几百 eV（数 Hartree 到十几 Hartree），不要沿用普通 BSE 的 `[0, 0.5] Ha` 窗口。
-- `bse_spin`、`bse_tda`、`bse_davidson_solver`、`davidson_*`、`bse_cutoff_energy`、`save_bse_terms` 等关键词与普通 BSE 共用。`bse_spin = "none"` 在 CVS 中按单重态处理。
-
-CVS 输入卡示例（NH3 的 N 1s 芯层激发）：
+CVS 输入卡示例：
 
 ```toml
 [quasiparticle_methods]
@@ -721,11 +704,7 @@ davidson_target_excitations = 5
 cvs_nroots = 5
 ```
 
-输出中每条 CVS 根都会给出总激发能（Ha 与 eV）、振子强度，以及占主导的 `#i -> #a` 芯层跃迁（`#i` 为绝对轨道编号）。
-
-验证（NH3/cc-pVDZ，N 1s）：CVS dense 与 matrix-free Davidson 的根一致到 `~1e-13 Ha`；在相同的 QP 能量下，CVS 最低几个芯层根与包含全部占据轨道的普通 BSE 对应根相差 `~0.2–0.4 mHa`（约 5–11 meV），即 CVS 丢弃芯-价耦合所带来的误差。
-
-> **芯层 QP 与 static fallback**：芯层轨道的 `|E_KS|` 通常大于 `gw_switch_fallback_threshold`（缺省 1 Ha），因此 CVS 的芯层 QP 能量默认自动走 REST 已有的 on-shell static fallback（在 KS 能量处求值自能），而不是完整求解准粒子方程。对 NH3/N 1s 的观察：static fallback 给出 `E_core^QP = -14.981 Ha`，完整求根给出 `-14.649 Ha`，收敛的 evGW 给出 `-15.025 Ha`；对应的 CVS 最低激发能为 403.72 eV（static）、394.68 eV（完整求根）、404.93 eV（evGW）。static fallback 明显更接近 evGW。由于 CVS kernel 和激子束缚能不由芯层 QP 能量决定，这三种处理对 CVS 激发能的影响基本是芯层能级的整体平移（束缚能约 0.322 Ha，几乎不变）。把 `gw_switch_fallback_threshold` 调到大于芯层 `|E_KS|` 可关闭该 on-shell 处理，设为 0 则会强制所有轨道（含近 frontier 虚轨道）都走 static fallback。
+输出包含每条 CVS 根的总激发能（Ha/eV）、振子强度和主导的 `#i -> #a` 芯层跃迁。
 
 ### GW输入卡示例
 
@@ -1444,62 +1423,33 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 ## GW-BSE 激发态构型优化（`job_type = "excited_state_opt"`）
 
-该任务把 GW-BSE 解析梯度直接接到 geomeTRIC：每一步几何都执行与单点
-`gw_or_bse = "bse_gradient"` 完全相同的 SCF → GW → BSE → 解析梯度流程，
-但返回给优化器的是
+该任务把 GW-BSE 解析梯度接到 geomeTRIC，优化 `E_SCF(R) + Omega_S(R)`；`[quasiparticle_methods]` 中的 GW/BSE 设置与 `bse_gradient` 卡相同。
 
-```
-E(R)   = E_SCF(R) + Omega_S(R)
-dE/dR  = dE_SCF/dR + dOmega_S/dR
-```
-
-而不是基态能量/梯度。`[quasiparticle_methods]` 中的 GW/BSE 参数（`gw_variant`、
-`bse_tda`、`gradient_state`、`gradient_nroots`、活性空间等）与单点梯度卡完全相同。
-
-激发态专用行为（自动开启，也可由同名关键词显式控制）：
-
-- `gradient_pin_active_space`（默认对 `excited_state_opt` 为 true）：第一次 BSE
-  梯度实际使用的 `[occ_start, vir_end)` 会写回并固定下来，避免能量窗口随几何
-  漂移导致 `Omega(R)` 不连续。生产计算建议仍在卡里显式写出
-  `bse_active_occ_start` / `bse_active_vir_end`，这样作业重投时活性空间不变。
-- `gradient_follow_state`（默认对 `excited_state_opt` 为 true）：跟踪同一个电子态，
-  而不是死守根序号。`gradient_nroots` 需覆盖可能交换的根；未显式设置时至少求解
-  `gradient_state + 2` 个根，但只组装被跟踪根的梯度。
-- `gradient_track_mode`：跟踪判据。`"auto"`（缺省）对 `excited_state_opt` 使用
-  `"ao_transition"`，其他任务使用 `"amplitude"`。
-  - `"amplitude"`：历史上的 BSE 振幅重叠
-    `X_old^T X_new - Y_old^T Y_new`。便宜，但依赖 MO 规范。
-  - `"ao_transition"`：把每个根写成 AO 基跃迁密度
-    `T_{mu nu} = sum_ia (X_ia+Y_ia) C_{mu i} C_{nu a}`，用跨几何 AO 重叠
-    `S_{mu nu}(R0,R1)=<mu(R0)|nu(R1)>` 计算状态重叠。该量对占据-占据、虚-虚
-    的独立酉旋转严格不变；若目标根落入 BSE 简并流形，则把上一步状态投影到
-    整个新流形（子空间匹配），并对流形内所有根组装、平均梯度。
-
-最小示例（AC-GW、TDA、固定 27×46 活性空间）：
+- `gradient_pin_active_space`（默认开启）：固定第一次 BSE 梯度使用的活性空间，避免能量窗口随几何漂移。
+- `gradient_follow_state`（默认开启）：跟踪同一个电子态而不是根序号；`gradient_nroots` 需覆盖可能交换的根。
+- `gradient_track_mode`：`"auto"`（缺省，`excited_state_opt` 用 `"ao_transition"`）或 `"amplitude"`。
 
 ```toml
 [ctrl]
-    job_type =        "excited_state_opt"
-    opt_engine =      "geometric_pyo3"
-    xc =              "pbeh"
-    ...
+job_type = "excited_state_opt"
+opt_engine = "geometric_pyo3"
+xc = "pbeh"
+
 [quasiparticle_methods]
-    gw_or_bse =            "bse_gradient"
-    gw_variant =           "ac"
-    bse_tda =              true
-    gradient_state =       0
-    gradient_nroots =      3
-    bse_active_occ_start = 0
-    bse_active_vir_end =   73
-    gradient_exact_residue = true
-    ...
+gw_or_bse = "bse_gradient"
+gw_variant = "ac"
+bse_tda = true
+gradient_state = 0
+gradient_nroots = 3
+bse_active_occ_start = 0
+bse_active_vir_end = 73
+
 [geometric_pyo3]
-    maxiter = 25
-    convergence_grms = 1.0e-3
+maxiter = 25
+convergence_grms = 1.0e-3
 ```
 
-注意：`excited_state_opt` 只支持解析梯度（`numerical_force = false`），并且
-`analytic_hessian` 仍会构造基态 Hessian，因此该任务下不允许开启。
+`excited_state_opt` 只支持解析梯度，且不允许同时开启 `analytic_hessian`。
 
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
