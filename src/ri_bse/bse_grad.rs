@@ -48,6 +48,7 @@
 //!   into `O(naux * nao^2 * nmo)` plus `O(3 natm * naux * nao^2)`.
 
 use crate::ri_gw::gw_grad::{CdQpCache, GwCdGradEngine, GwGradEngine, QpCache};
+use crate::utilities::linalg::{gemm_nn, gemm_nt, to_mat};
 use crate::scf_io::SCF;
 use rayon::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
@@ -91,10 +92,6 @@ pub enum BseSolver {
 // ---------------------------------------------------------------------------
 // small dense helpers (flat col-major buffers, first index fastest)
 // ---------------------------------------------------------------------------
-
-fn to_mat(v: &[f64], r: usize, c: usize) -> MatrixFull<f64> {
-    MatrixFull::from_vec([r, c], v.to_vec()).unwrap()
-}
 
 /// Columns per task of a column-split gemm.
 ///
@@ -151,22 +148,6 @@ fn permute_aux_slowest(v: &[f64], n1: usize, n2: usize, naux: usize) -> Vec<f64>
         }
     }
     out
-}
-
-fn gemm_nn(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
-    let am = to_mat(a, ar, ac);
-    let bm = to_mat(b, br, bc);
-    let mut out = MatrixFull::new([ar, bc], 0.0);
-    _dgemm_full(&am, 'N', &bm, 'N', &mut out, 1.0, 0.0);
-    out.data
-}
-
-fn gemm_nt(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
-    let am = to_mat(a, ar, ac);
-    let bm = to_mat(b, br, bc);
-    let mut out = MatrixFull::new([ac, bc], 0.0);
-    _dgemm_full(&am, 'T', &bm, 'N', &mut out, 1.0, 0.0);
-    out.data
 }
 
 /// Solve `A X = B` for a symmetric positive-definite `A` (`naux x naux`) with

@@ -28,14 +28,6 @@
 // `canonical_response_batch`); range-separated hybrids are rejected.
 
 extern "C" {
-    fn zgetrf_(
-        m: *const i32,
-        n: *const i32,
-        a: *mut Complex<f64>,
-        lda: *const i32,
-        ipiv: *mut i32,
-        info: *mut i32,
-    );
     fn zgetrs_(
         trans: *const c_char,
         n: *const i32,
@@ -50,39 +42,34 @@ extern "C" {
 }
 
 #[inline]
-fn cinv(b: Complex<f64>) -> Complex<f64> {
-    let d = b.re * b.re + b.im * b.im;
-    Complex::new(b.re / d, -b.im / d)
-}
-
 /// PySCF-convention residue screening diagonal
 /// `2 [(z + delta + 2i eta)^-1 + (-z + delta)^-1]`, `delta = e_i - e_a`.
 fn residue_d(delta: f64, z: f64, eta: f64) -> Complex<f64> {
-    2.0 * (cinv(Complex::new(z + delta, 2.0 * eta)) + cinv(Complex::new(delta - z, 0.0)))
+    2.0 * (Complex::new(z + delta, 2.0 * eta).inv() + Complex::new(delta - z, 0.0).inv())
 }
 
 /// `d/dz` of the residue diagonal: `2 [-(z+delta+2i eta)^-2 + (z-delta)^-2]`.
 fn residue_dz(delta: f64, z: f64, eta: f64) -> Complex<f64> {
     let t2 = Complex::new(z + delta, 2.0 * eta);
-    2.0 * (-cinv(t2 * t2) + cinv(Complex::new((z - delta) * (z - delta), 0.0)))
+    2.0 * (-(t2 * t2).inv() + Complex::new((z - delta) * (z - delta), 0.0).inv())
 }
 
 /// `d/ddelta` of the residue diagonal:
 /// `2 [-(z+delta+2i eta)^-2 - (z-delta)^-2]`.
 fn residue_de(delta: f64, z: f64, eta: f64) -> Complex<f64> {
     let t2 = Complex::new(z + delta, 2.0 * eta);
-    2.0 * (-cinv(t2 * t2) - cinv(Complex::new((z - delta) * (z - delta), 0.0)))
+    2.0 * (-(t2 * t2).inv() - Complex::new((z - delta) * (z - delta), 0.0).inv())
 }
 
 /// Static (z = 0) screening diagonal `2 [(delta + 2i eta)^-1 + delta^-1]`.
 fn static_d0(delta: f64, eta: f64) -> Complex<f64> {
-    2.0 * (cinv(Complex::new(delta, 2.0 * eta)) + cinv(Complex::new(delta, 0.0)))
+    2.0 * (Complex::new(delta, 2.0 * eta).inv() + Complex::new(delta, 0.0).inv())
 }
 
 /// `d/ddelta` of [`static_d0`]: `2 [-(delta+2i eta)^-2 - delta^-2]`.
 fn static_d0e(delta: f64, eta: f64) -> Complex<f64> {
     let t2 = Complex::new(delta, 2.0 * eta);
-    2.0 * (-cinv(t2 * t2) - cinv(Complex::new(delta * delta, 0.0)))
+    2.0 * (-(t2 * t2).inv() - Complex::new(delta * delta, 0.0).inv())
 }
 
 /// Gram matrix `sum_k w_k q_k q_k^T` of the [naux, ncol] col-major buffer.
@@ -105,25 +92,19 @@ fn scaled_gram(qia: &[f64], naux: usize, ncol: usize, w: &[f64]) -> MatrixFull<f
 /// right-hand sides of one screening matrix.
 struct CdLuFactor {
     n: usize,
-    lu: Vec<Complex<f64>>,
+    lu: MatrixFull<Complex<f64>>,
     ipiv: Vec<i32>,
 }
 
 impl CdLuFactor {
     fn factor(a_re: &[f64], a_im: &[f64], n: usize) -> Self {
-        let mut lu: Vec<Complex<f64>> = a_re
+        let data: Vec<Complex<f64>> = a_re
             .iter()
             .zip(a_im.iter())
             .map(|(&r, &i)| Complex::new(r, i))
             .collect();
-        let mut ipiv = vec![0i32; n];
-        let mut info = 0i32;
-        let nn = n as i32;
-        unsafe { zgetrf_(&nn, &nn, lu.as_mut_ptr(), &nn, ipiv.as_mut_ptr(), &mut info) };
-        assert!(
-            info == 0,
-            "cd_gw_grad: complex screening factorisation failed (info={info})"
-        );
+        let mut lu = MatrixFull::from_vec([n, n], data).expect("CdLuFactor: shape");
+        let ipiv = lu.lapack_zgetrf();
         Self { n, lu, ipiv }
     }
 
@@ -134,7 +115,7 @@ impl CdLuFactor {
         let trans = b'N' as c_char;
         unsafe {
             zgetrs_(
-                &trans, &nn, &nc, self.lu.as_ptr(), &nn, self.ipiv.as_ptr(),
+                &trans, &nn, &nc, self.lu.data.as_ptr(), &nn, self.ipiv.as_ptr(),
                 b.as_mut_ptr(), &nn, &mut info,
             )
         };

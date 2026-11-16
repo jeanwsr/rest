@@ -36,6 +36,7 @@
 //! decomposition at `omega = e_m`, making the QP energy and its gradient well
 //! defined even when a QP energy coincides with a mean-field pole.
 use crate::ctrl_io::quasiparticle_methods::GwVariant;
+use crate::utilities::linalg::{gemm_nn, gemm_nt, to_mat};
 use crate::ri_gw::ac_grad::{pade_derivatives, pade_derivatives_greedy, pade_derivatives_nodes};
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre_grids};
