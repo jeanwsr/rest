@@ -4,7 +4,6 @@
 //! conventions in one place: `MatrixFull` is column-major, first index fastest,
 //! and the gemm wrappers borrow their operands instead of copying them.
 
-use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use tensors::{MatrixFull, MatrixFullSlice};
 
 /// Wrap a flat column-major buffer as a `MatrixFull` (copying it).
@@ -24,9 +23,7 @@ pub(crate) fn gemm_nn(
     let (sb, ib) = ([br, bc], [1usize, br.max(1)]);
     let am = MatrixFullSlice { size: &sa, indicing: &ia, data: a };
     let bm = MatrixFullSlice { size: &sb, indicing: &ib, data: b };
-    let mut out = MatrixFull::new([ar, bc], 0.0);
-    _dgemm_full(&am, 'N', &bm, 'N', &mut out, 1.0, 0.0);
-    out.data
+    am.ddot(&bm).expect("gemm_nn: shape mismatch").data
 }
 
 /// `A^T B` for flat column-major buffers `A [ar, ac]`, `B [br, bc]`, `ar == br`.
@@ -41,6 +38,6 @@ pub(crate) fn gemm_nt(
     let am = MatrixFullSlice { size: &sa, indicing: &ia, data: a };
     let bm = MatrixFullSlice { size: &sb, indicing: &ib, data: b };
     let mut out = MatrixFull::new([ac, bc], 0.0);
-    _dgemm_full(&am, 'T', &bm, 'N', &mut out, 1.0, 0.0);
+    out.to_matrixfullslicemut().lapack_dgemm(&am, &bm, 'T', 'N', 1.0, 0.0);
     out.data
 }
