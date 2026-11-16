@@ -16,9 +16,7 @@
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::scf;
 use std::env;
-use std::path::{Path, PathBuf};
-
-const BENCH_POOL: &str = "/home/igor/Documents/Package-Pool/rest_workspace/rest_regression/bench_pool";
+use std::path::PathBuf;
 
 const NH3_SVWN: &str = "NH3_SVWN";
 const NH3_SCAN: &str = "NH3_SCAN";
@@ -27,8 +25,48 @@ const H2X2: &str = "H2x2_B3LYP";
 
 const SELF_TOL: f64 = 1e-6;
 
-fn bench_dir(name: &str) -> PathBuf {
-    Path::new(BENCH_POOL).join(name)
+/// `env::set_current_dir` is process-global, so the cases below must not run in parallel with
+/// each other (the file's header note asks for `--test-threads=1`; this lock enforces the same
+/// ordering without depending on how the test binary is invoked).
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize a test body against the other cases of this file.
+fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+    CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Directory of a regression case of the sibling `rest_regression` repository.
+///
+/// Resolved from the crate root (`CARGO_MANIFEST_DIR`) so the test does not depend on a
+/// machine-specific location, and searched one level down because the cases live in
+/// `bench_pool/<category>/<name>`. `None` means the case is not in this checkout, which also
+/// covers a standalone `rest` checkout without the sibling repository.
+fn bench_dir(name: &str) -> Option<PathBuf> {
+    let pool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rest_regression/bench_pool");
+    let direct = pool.join(name);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(&pool).ok()?.flatten() {
+        let candidate = entry.path().join(name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The subset of `systems` that this checkout provides, so missing cases are skipped instead of
+/// failing the whole test.
+fn present<'a>(systems: &[&'a str]) -> Vec<&'a str> {
+    let found: Vec<&str> = systems.iter().copied().filter(|s| bench_dir(s).is_some()).collect();
+    if found.len() < systems.len() {
+        println!(
+            "skip {} case(s) not found under rest_regression/bench_pool/<category>/",
+            systems.len() - found.len()
+        );
+    }
+    found
 }
 
 fn run_scf_with_params(
@@ -38,7 +76,8 @@ fn run_scf_with_params(
     drop_dense_ao: bool,
     num_threads: usize,
 ) -> anyhow::Result<f64> {
-    let dir = bench_dir(system_name);
+    let dir = bench_dir(system_name)
+        .ok_or_else(|| anyhow::anyhow!("case {system_name} not found in this checkout"))?;
     let original_dir = env::current_dir().unwrap();
     env::set_current_dir(&dir).unwrap();
 
@@ -76,12 +115,17 @@ fn assert_within(energy: f64, reference: f64, tol: f64, sys: &str, desc: &str) {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_dense_baseline() {
+    let _guard = lock_cwd();
     for (sys, expected) in [
         (NH3_SVWN, -56.0659625063),
         (NH3_SCAN, -56.5245527233),
         (H2_TRIPLET, -0.9973483683),
         (H2X2, -2.3466127877),
     ] {
+        if bench_dir(sys).is_none() {
+            println!("skip {}: case not found in this checkout", sys);
+            continue;
+        }
         let energy = dense_energy(sys);
         assert_within(energy, expected, 1e-7, sys, "dense vs reference");
     }
@@ -92,7 +136,8 @@ fn test_dense_baseline() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_sparse_cutoff_1e10() {
-    for sys in &[NH3_SVWN, NH3_SCAN, H2X2] {
+    let _guard = lock_cwd();
+    for sys in present(&[NH3_SVWN, NH3_SCAN, H2X2]) {
         let e_dense = dense_energy(sys);
         let e_sparse = run_scf_with_params(sys, 1e-10, 0, false, 1).unwrap();
         assert_within(e_sparse, e_dense, SELF_TOL, sys, "sparse ao_cutoff=1e-10");
@@ -104,7 +149,8 @@ fn test_sparse_cutoff_1e10() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_sparse_cutoff_1e12() {
-    for sys in &[NH3_SVWN, NH3_SCAN, H2X2] {
+    let _guard = lock_cwd();
+    for sys in present(&[NH3_SVWN, NH3_SCAN, H2X2]) {
         let e_dense = dense_energy(sys);
         let e_sparse = run_scf_with_params(sys, 1e-12, 0, false, 1).unwrap();
         assert_within(e_sparse, e_dense, SELF_TOL, sys, "sparse ao_cutoff=1e-12");
@@ -116,7 +162,8 @@ fn test_sparse_cutoff_1e12() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_sparse_drop_dense_ao() {
-    for sys in &[NH3_SVWN, NH3_SCAN, H2X2] {
+    let _guard = lock_cwd();
+    for sys in present(&[NH3_SVWN, NH3_SCAN, H2X2]) {
         let e_dense = dense_energy(sys);
         let e_sparse = run_scf_with_params(sys, 1e-10, 128, true, 1).unwrap();
         assert_within(e_sparse, e_dense, SELF_TOL, sys, "sparse drop_dense_ao=true");
@@ -128,7 +175,8 @@ fn test_sparse_drop_dense_ao() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_sparse_blksize_values() {
-    for sys in &[NH3_SVWN, NH3_SCAN, H2X2] {
+    let _guard = lock_cwd();
+    for sys in present(&[NH3_SVWN, NH3_SCAN, H2X2]) {
         let e_dense = dense_energy(sys);
         for blk in [64, 128, 256] {
             let e_sparse = run_scf_with_params(sys, 1e-10, blk, false, 1).unwrap();
@@ -143,7 +191,8 @@ fn test_sparse_blksize_values() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_multithread_consistency() {
-    for sys in &[NH3_SVWN, NH3_SCAN, H2X2] {
+    let _guard = lock_cwd();
+    for sys in present(&[NH3_SVWN, NH3_SCAN, H2X2]) {
         let e1 = run_scf_with_params(sys, 1e-10, 128, false, 1).unwrap();
         let e4 = run_scf_with_params(sys, 1e-10, 128, false, 4).unwrap();
         let diff = (e1 - e4).abs();
@@ -160,6 +209,11 @@ fn test_multithread_consistency() {
 // ═════════════════════════════════════════════════════════════════════
 #[test]
 fn test_uhf_sparse() {
+    let _guard = lock_cwd();
+    if bench_dir(H2_TRIPLET).is_none() {
+        println!("skip {}: case not found in this checkout", H2_TRIPLET);
+        return;
+    }
     let e_dense = dense_energy(H2_TRIPLET);
     let e_sparse = run_scf_with_params(H2_TRIPLET, 1e-12, 128, false, 1).unwrap();
     assert_within(e_sparse, e_dense, SELF_TOL, H2_TRIPLET, "UHF sparse");

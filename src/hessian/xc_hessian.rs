@@ -15,10 +15,9 @@ use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::xc_deriv::XCType;
 use crate::molecule_io::Molecule;
 use crate::scf_io::SCF;
-use rest_tensors::{MatrixFull, MatrixFullSlice};
+use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
 use rayon::prelude::*;
-use std::time::Instant;
 
 // ── AO second-derivative index convention (matches PySCF) ──
 // ao_deriv=2 yields 10 components:
@@ -171,9 +170,6 @@ const YYZ: usize = 17;
 const YZZ: usize = 18;
 const ZZZ: usize = 19;
 
-/// Minimum sub-block size, for reasonable BLAS efficiency.
-const MIN_SUB_NB: usize = 256;
-
 /// Adaptive grid parallelism plan.
 ///
 /// Splits grid blocks into sub-blocks of a calculated size so that peak AO
@@ -181,10 +177,6 @@ const MIN_SUB_NB: usize = 256;
 /// rayon threads.
 ///
 /// Returns `(sub_blocks, concurrency, target_sub_block_size)`.
-///
-/// `concurrency` is an upper bound from the AO budget and the pool size; callers whose per-task
-/// accumulator is larger than the AO table should tighten it further (see
-/// `vxc_deriv1_streaming`) so that the byte cap really bounds the peak.
 pub fn plan_grid_split(
     block_ranges: &[std::ops::Range<usize>],
     nao: usize,
@@ -206,7 +198,7 @@ pub fn plan_grid_split(
     }
 
     // Minimum sub-block size for reasonable BLAS efficiency
-    let min_nb = MIN_SUB_NB;
+    let min_nb = 256usize;
 
     // Cap the in-flight AO memory: each grid point contributes
     // nderiv·nao·8 B (RIFull) plus an equal-sized owned ao_d copy (×2).
@@ -214,41 +206,14 @@ pub fn plan_grid_split(
     // system size, so large basis sets / high derivative orders do not blow
     // up the Hessian peak RSS. (2·max_orig_nb is kept as an upper limit so we
     // never sub-split more aggressively than the old behavior allowed.)
-    //
-    // `REST_VXC_AO_CAP_MB` (MiB, floor 16) overrides the cap.  The in-flight AO
-    // is a pure working set: a smaller cap splits the grid into more sub-blocks
-    // at the same total work and the same result (only the summation order of
-    // the per-block partials changes), so it is the cheapest knob with which a
-    // post-SCF calculation — whose resident set is already large — can trade a
-    // little BLAS efficiency for peak RSS.
-    let ao_mem_cap = match std::env::var("REST_VXC_AO_CAP_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-    {
-        Some(mb) => mb.max(16.0) * 1024.0 * 1024.0,
-        None => 1.5 * 1024.0 * 1024.0 * 1024.0, // 1.5 GiB
-    };
+    let ao_mem_cap = 1.5 * 1024.0 * 1024.0 * 1024.0; // 1.5 GiB
     let bytes_per_point = 2.0 * nderiv.max(1) as f64 * nao.max(1) as f64 * 8.0;
     let points_cap = (ao_mem_cap / bytes_per_point) as usize;
     let peak_budget = points_cap.max(min_nb).min(2 * max_orig_nb);
 
-    // Sub-block length: the finest the plan allows (down to `min_nb`), so the boundaries — and
-    // with them the summation order of the partials — are a property of the grid and the byte
-    // budget alone.  It used to be `peak_budget / rayon::current_num_threads()`, which moved every
-    // boundary with the core count and made one binary disagree with itself across thread counts.
-    //
-    // The pool then decides how many of the resulting sub-blocks run at once, capped so that the
-    // total in-flight AO stays inside `points_cap`.  That keeps full use of the pool: at the
-    // production `REST_VXC_AO_CAP_MB` the old formula already clamped `target_nb` to `min_nb`, so
-    // this is the *same* decomposition the tuned runs used — only now it is also the decomposition
-    // at every other thread count, instead of changing with the pool.
-    //
-    // (An intermediate version of this fix planned the sub-block length for a *fixed* design
-    // concurrency, `peak_budget / VXC_DESIGN_CONCURRENCY`.  That is thread-independent too, but it
-    // halves the number of sub-blocks whenever the pool is larger than that concurrency, and
-    // measured on polyene n=2 it took the `v_xc` sweep from 9.20 s to 16.85 s at 16 threads: fewer
-    // tasks than threads is not a neutral choice.)
-    let target_nb = min_nb.min(max_orig_nb);
+    // Target: use up to num_threads concurrent sub-blocks within the budget
+    let ideal_nb = (peak_budget as f64 / num_threads as f64).ceil() as usize;
+    let target_nb = ideal_nb.max(min_nb).min(max_orig_nb);
     let concurrency = (peak_budget / target_nb).max(1).min(num_threads);
 
     // Split original blocks into sub-blocks
@@ -277,8 +242,7 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
     let mol = &scf.mol;
     let nao = mol.num_basis;
     let grids = scf.grids.as_ref().expect("vxc_diag_streaming requires scf.grids");
-    let func_ids = &mol.xc_data.dfa_compnt_scf;
-    let func_factors = &mol.xc_data.dfa_paramr_scf;
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -317,7 +281,7 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, nb, 1);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 1);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc_diag: vxc required");
                 let vxc_raw = vxc_t.raw();
                 let vxc_off = vxc_t.offset();
@@ -414,8 +378,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let grids = scf.grids.as_ref().expect("vxc_deriv2_streaming requires scf.grids");
     let aoslices = build_aoslices(mol);
     let dm0 = &scf.density_matrix[0];
-    let func_ids = &mol.xc_data.dfa_compnt_scf;
-    let func_factors = &mol.xc_data.dfa_paramr_scf;
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -459,7 +422,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, nb, 2);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc_deriv2: vxc required");
                 let fxc_t = xc_tensors[2].as_ref().expect("vxc_deriv2: fxc required");
                 let vxc_raw = vxc_t.raw();
@@ -628,48 +591,8 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     acc_vmat
 }
 
-/// Stage counters for `vxc_deriv1_streaming` (nanoseconds, summed over all sub-blocks).
-/// Printed when `REST_VXC_TIMING=1`: the sweep is the single largest phase of the gradient
-/// card at large `nao`, and this says which part of a sub-block actually costs the time.
-///
-/// `CONTRACT` counts the per-block preparation pass (AO, rho, XC kernel, the per-atom
-/// contraction weights and the direct `v_ip` term); `GEMM` counts the *per-(atom,
-/// direction)* contraction pass that consumes it.  The split matters because the two
-/// passes have completely different parallel shapes.
-pub(crate) mod vxc_stage {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    pub static AO: AtomicU64 = AtomicU64::new(0);
-    pub static RHO: AtomicU64 = AtomicU64::new(0);
-    pub static XC: AtomicU64 = AtomicU64::new(0);
-    pub static CONTRACT: AtomicU64 = AtomicU64::new(0);
-    pub static GEMM: AtomicU64 = AtomicU64::new(0);
-    pub static REDUCE: AtomicU64 = AtomicU64::new(0);
-    pub fn add(c: &AtomicU64, t: std::time::Instant) {
-        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-}
-
-/// Everything one grid sub-block has to hand to the per-atom contraction pass.
-///
-/// Sized by the *block*, not by the atom count: this is what lets the v_xc sweep run at
-/// full pool width without the peak RSS following the core count.  The old shape kept a
-/// dense `natm x [3*nao, nao]` accumulator per in-flight sub-block (322 MB at polyene
-/// n=7), so 40 concurrent sub-blocks needed 12.9 GB where 16 needed 5.2 GB.
-struct VxcBlockPrep {
-    /// grid points in this sub-block
-    nb: usize,
-    /// `ao_d[y]`, `y = 0..nvar`, flat column-major `[nao, nb]`.  `ao_d[0]` is the right
-    /// operand of the contraction product; the whole `0..nvar` range builds the AOW.
-    ao_d: Vec<Vec<f64>>,
-    /// Per-atom contraction weights, `3*nvar*nb` doubles each, indexed
-    /// `wv[s + y*3 + g*3*nvar]`.
-    wv: Vec<Vec<f64>>,
-    /// The direct (not per-atom) XC potential contribution, one `[nao, nao]` per
-    /// Cartesian direction.  `natm` orders of magnitude cheaper than the per-atom
-    /// part, so it stays a per-block partial and is reduced in block order.
-    v_ip: [MatrixFull<f64>; 3],
-}
-
+/// Streaming variant of `vxc_deriv1`: evaluates AO (deriv=2) + ρ₀ + XC kernel
+/// per block in small concurrent batches with bounded peak memory.
 pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> {
     let mol = &scf.mol;
     let nao = mol.num_basis;
@@ -677,8 +600,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let grids = scf.grids.as_ref().expect("vxc_deriv1_streaming requires scf.grids");
     let aoslices = build_aoslices(mol);
     let dm0 = &scf.density_matrix[0];
-    let func_ids = &mol.xc_data.dfa_compnt_scf;
-    let func_factors = &mol.xc_data.dfa_paramr_scf;
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -687,44 +609,16 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
-    let (sub_blocks, _concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
-    let nb_max = sub_blocks.iter().map(|r| r.end - r.start).max().unwrap_or(0);
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
 
-    // Blocks whose per-block data is kept alive together.  This is *deliberately* not a
-    // function of `rayon::current_num_threads()`: the retained set is what the phase adds
-    // to the peak, so a pool-dependent batch would make the 40-core peak follow the core
-    // count.  A fixed batch keeps the retained set identical at 16 and 40 threads; the
-    // pool only decides how many of the batch's blocks and atoms are worked on at once.
-    //
-    // Memory per block: `nvar*nao*nb` (the AO components the AOW build reads) +
-    // `natm*3*nvar*nb` (the per-atom weights) + `3*nao^2` (the direct term).  At polyene
-    // n=7 (nao 658, nb 256, natm 30, nvar 4) that is 5.4 + 0.74 + 10.4 = 16.5 MB.
-    //
-    // The batch is the *smaller* of a fixed maximum and a fixed byte budget, so the
-    // retained set is a constant of the geometry rather than of the core count — and it
-    // still shrinks on systems whose `nao`/`natm` would make 96 blocks several GB.
-    const VXC_BCHUNK_MAX: usize = 96;
-    const VXC_CACHE_BUDGET_BYTES: usize = 1600 * 1024 * 1024;
-    let per_block_bytes =
-        (nvar * nao * nb_max + natm * 3 * nvar * nb_max + 3 * nao * nao) * 8;
-    let vxc_bchunk = (VXC_CACHE_BUDGET_BYTES / per_block_bytes.max(1))
-        .clamp(1, VXC_BCHUNK_MAX);
-
-    // Accumulators.  `acc_vmat[ia]` is the same `[3*nao, nao]` layout the grid contraction
-    // used to produce directly; it is now assembled from the per-(atom, direction) tiles
-    // in a fixed order, so the summation order over sub-blocks is unchanged.
+    // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =
         (0..natm).map(|_| MatrixFull::new([3 * nao, nao], 0.0)).collect();
     let mut acc_vip: Vec<MatrixFull<f64>> =
         (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
-    for chunk in sub_blocks.chunks(vxc_bchunk) {
-        let t_stage_chunk = Instant::now();
-
-        // ── Pass 1: one task per grid sub-block ──────────────────────────────────────
-        // AO + rho + libxc kernel + the per-atom contraction weights.  Output is sized
-        // by the block (16.5 MB), not by `natm * nao^2` (322 MB).
-        let preps: Vec<VxcBlockPrep> = chunk
+    for chunk in sub_blocks.chunks(concurrency) {
+        let partials: Vec<(Vec<MatrixFull<f64>>, Vec<MatrixFull<f64>>)> = chunk
             .par_iter()
             .filter_map(|range| {
                 omp_set_num_threads_wrapper(1);
@@ -733,7 +627,6 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                 let weights_block = &grids.weights[range.start..range.end];
                 let coords_block = &grids.coordinates[range.start..range.end];
 
-                let t_stage = Instant::now();
                 let ao = eval_ao_batch(mol, coords_block, ao_deriv, nb);
                 let ao_d: Vec<MatrixFull<f64>> = (0..nderiv_max)
                     .map(|d| {
@@ -743,8 +636,6 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     .collect();
                 let ao_d_refs: Vec<&MatrixFull<f64>> = ao_d.iter().collect();
 
-                vxc_stage::add(&vxc_stage::AO, t_stage);
-                let t_stage = Instant::now();
                 let rho_tensor = eval_rho5_batch(&ao, xc_type, &mo_vec, &occ_vec, 1, nb);
                 let rho_array: Vec<f64> = {
                     let raw = rho_tensor.raw();
@@ -752,9 +643,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                vxc_stage::add(&vxc_stage::RHO, t_stage);
-                let t_stage = Instant::now();
-                let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, nb, 2);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc required");
                 let fxc_t = xc_tensors[2].as_ref().expect("fxc required");
                 let vxc_raw = vxc_t.raw();
@@ -762,14 +651,12 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                 let fxc_raw = fxc_t.raw();
                 let fxc_off = fxc_t.offset();
 
-                let mut v_ip: [MatrixFull<f64>; 3] = [
-                    MatrixFull::new([nao, nao], 0.0),
-                    MatrixFull::new([nao, nao], 0.0),
-                    MatrixFull::new([nao, nao], 0.0),
-                ];
-                vxc_stage::add(&vxc_stage::XC, t_stage);
-                let t_stage = Instant::now();
-                let wv_all: Vec<Vec<f64>> = match xc_type {
+                let mut vmat: Vec<MatrixFull<f64>> =
+                    (0..natm).map(|_| MatrixFull::new([3 * nao, nao], 0.0)).collect();
+                let mut v_ip: Vec<MatrixFull<f64>> =
+                    (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
+
+                match xc_type {
                     XCType::LDA => {
                         let mut aow = MatrixFull::new([nao, nb], 0.0);
                         for g in 0..nb {
@@ -783,7 +670,6 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                         let wf_factor: Vec<f64> = (0..nb)
                             .map(|g| weights_block[g] * fxc_raw[fxc_off + g])
                             .collect();
-                        let mut wv_all: Vec<Vec<f64>> = Vec::with_capacity(natm);
                         for ia in 0..natm {
                             let (p0, p1) = aoslices[ia];
                             let mut wv = vec![0.0; 3 * nb];
@@ -796,9 +682,23 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     wv[alpha + 3 * g] = wf_factor[g] * rho1;
                                 }
                             }
-                            wv_all.push(wv);
+                            for alpha in 0..3 {
+                                let mut aow_alpha = MatrixFull::new([nao, nb], 0.0);
+                                for g in 0..nb {
+                                    let w = wv[alpha + 3 * g];
+                                    for mu in 0..nao { aow_alpha[[mu, g]] = ao_d[0][[mu, g]] * w; }
+                                }
+                                let row0 = alpha * nao;
+                                let mut vmat_alpha = MatrixFull::new([nao, nao], 0.0);
+                                for j in 0..nao { for i in 0..nao {
+                                    vmat_alpha[[i, j]] = vmat[ia][[row0 + i, j]];
+                                }}
+                                _dgemm_full(&aow_alpha, 'N', &ao_d[0], 'T', &mut vmat_alpha, 1.0, 1.0);
+                                for j in 0..nao { for i in 0..nao {
+                                    vmat[ia][[row0 + i, j]] = vmat_alpha[[i, j]];
+                                }}
+                            }
                         }
-                        wv_all
                     }
                     XCType::GGA => {
                         let mut wv0 = vec![0.0; nb];
@@ -834,7 +734,6 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                             _dgemm_full(&aow_1b, 'N', &ao_d[0], 'T', &mut v_ip[alpha], 1.0, 1.0);
                         }
                         let ao_dm0 = compute_ao_dm0(dm0, &ao_d_refs[..nvar], nvar, nao, nb);
-                        let mut wv_all: Vec<Vec<f64>> = Vec::with_capacity(natm);
                         for ia in 0..natm {
                             let (p0, p1) = aoslices[ia];
                             let dR_rho1 = make_dR_rho1(&ao_d_refs, &ao_dm0, p0, p1, xc_type, nb);
@@ -855,103 +754,37 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     }
                                 }
                             }
-                            wv_all.push(wv);
+                            for s in 0..3 {
+                                let mut aow_s = MatrixFull::new([nao, nb], 0.0);
+                                for mu in 0..nao { for g in 0..nb {
+                                    let mut v = 0.0;
+                                    for y in 0..nvar {
+                                        v += ao_d[y][[mu, g]] * wv[s + y * 3 + g * 3 * nvar];
+                                    }
+                                    aow_s[[mu, g]] = v;
+                                }}
+                                let row0 = s * nao;
+                                let mut vmat_s = MatrixFull::new([nao, nao], 0.0);
+                                for j in 0..nao { for i in 0..nao {
+                                    vmat_s[[i, j]] = vmat[ia][[row0 + i, j]];
+                                }}
+                                _dgemm_full(&aow_s, 'N', &ao_d[0], 'T', &mut vmat_s, 1.0, 1.0);
+                                for j in 0..nao { for i in 0..nao {
+                                    vmat[ia][[row0 + i, j]] = vmat_s[[i, j]];
+                                }}
+                            }
                         }
-                        wv_all
                     }
                     _ => unreachable!(),
-                };
-                vxc_stage::add(&vxc_stage::CONTRACT, t_stage);
-
-                // Keep only the `nvar` AO derivative components the contraction pass needs
-                // (`ao_d[0]` is the right operand, `ao_d[0..nvar]` build the AOW); the rest
-                // of the nderiv block is dropped with the rest of `ao_d`.
-                let mut ao_d_keep: Vec<Vec<f64>> = Vec::with_capacity(nvar);
-                for m in ao_d.into_iter().take(nvar) {
-                    ao_d_keep.push(m.data);
                 }
-                Some(VxcBlockPrep { nb, ao_d: ao_d_keep, wv: wv_all, v_ip })
+                Some((vmat, v_ip))
             })
             .collect();
 
-        // The direct term: every block contributes to the same `acc_vip`, and the blocks
-        // arrive in grid order from `collect`, so reducing in that order keeps the
-        // summation order of the previous (per-block partial) implementation.
-        acc_vip.par_iter_mut().enumerate().for_each(|(alpha, acc)| {
-            for prep in preps.iter() {
-                acc.data
-                    .iter_mut()
-                    .zip(prep.v_ip[alpha].data.iter())
-                    .for_each(|(a, b)| *a += b);
-            }
-        });
-
-        // ── Pass 2: one task per (atom, Cartesian direction) ─────────────────────────
-        // The old shape gave every in-flight sub-block a private `natm x [3*nao, nao]`
-        // accumulator (concurrency -> peak RSS) and then shuffled each `[nao, nao]`
-        // direction block through a scratch buffer twice per atom (two thirds of the
-        // phase's DRAM traffic).  Here each tile owns a private `[nao, nao]` result whose
-        // total over the `3*natm` tiles is exactly the size of one old per-block
-        // accumulator (322 MB at polyene n=7), independent of how many tiles run at once.
-        let t_gemm = Instant::now();
-        let tiles: Vec<MatrixFull<f64>> = (0..3 * natm)
-            .into_par_iter()
-            .map(|t| {
-                omp_set_num_threads_wrapper(1);
-                let ia = t / 3;
-                let s = t % 3;
-                let mut acc = MatrixFull::new([nao, nao], 0.0);
-                let mut aow_buf: Vec<f64> = vec![0.0; nao * nb_max];
-                for prep in preps.iter() {
-                    let nb = prep.nb;
-                    if nb == 0 { continue; }
-                    let aow = &mut aow_buf[..nao * nb];
-                    let wv = &prep.wv[ia];
-                    for g in 0..nb {
-                        let gb = g * nao;
-                        let wo = g * 3 * nvar;
-                        for mu in 0..nao {
-                            let mut v = 0.0;
-                            for y in 0..nvar {
-                                v += prep.ao_d[y][gb + mu] * wv[s + y * 3 + wo];
-                            }
-                            aow[gb + mu] = v;
-                        }
-                    }
-                    let sz = [nao, nb];
-                    let ind = [1usize, nao];
-                    let rhs = MatrixFullSlice { size: &sz, indicing: &ind, data: &aow[..] };
-                    let lhs = MatrixFullSlice { size: &sz, indicing: &ind, data: &prep.ao_d[0][..] };
-                    _dgemm_full(&rhs, 'N', &lhs, 'T', &mut acc, 1.0, 1.0);
-                }
-                acc
-            })
-            .collect();
-        vxc_stage::add(&vxc_stage::GEMM, t_gemm);
-
-        // Reduce the tiles into `acc_vmat` (fixed order: atom, then direction).
-        for (t, tile) in tiles.into_iter().enumerate() {
-            let ia = t / 3;
-            let row0 = (t % 3) * nao;
-            for j in 0..nao {
-                let lo = j * 3 * nao + row0;
-                let dst = &mut acc_vmat[ia].data[lo..lo + nao];
-                let src = &tile.data[j * nao..(j + 1) * nao];
-                for (a, b) in dst.iter_mut().zip(src.iter()) { *a += b; }
-            }
+        for (vmat_p, vip_p) in partials {
+            for k in 0..natm { acc_vmat[k] += vmat_p[k].clone(); }
+            for k in 0..3 { acc_vip[k] += vip_p[k].clone(); }
         }
-        vxc_stage::add(&vxc_stage::REDUCE, t_stage_chunk);
-    }
-
-    if std::env::var("REST_VXC_TIMING").is_ok() {
-        use std::sync::atomic::Ordering;
-        let ms = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
-        println!(
-            "[vxc timing] sub-blocks={} chunk={} | AO {:.1} ms | rho {:.1} ms | xc {:.1} ms | weights {:.1} ms | gemm-p2 {:.1} ms | reduce {:.1} ms (summed over tasks)",
-            sub_blocks.len(), vxc_bchunk,
-            ms(&vxc_stage::AO), ms(&vxc_stage::RHO), ms(&vxc_stage::XC),
-            ms(&vxc_stage::CONTRACT), ms(&vxc_stage::GEMM), ms(&vxc_stage::REDUCE)
-        );
     }
 
     // Final: vmat[ia, :, p0:p1, :] += v_ip[:, p0:p1, :]

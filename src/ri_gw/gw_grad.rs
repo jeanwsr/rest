@@ -119,7 +119,7 @@ use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre
 use crate::scf_io::SCF;
 use rest_libcint::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::{
-    _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dsyevd_inplace, _dtrtrs,
+    _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dsyevd, _dtrtrs,
 };
 use tensors::{MathMatrix, MatrixFull, MatrixFullSlice};
 use num_complex::Complex;
@@ -608,7 +608,6 @@ pub struct GwGradConfig {
     /// folded covector `B_ao` (`naux*nao^2` doubles) is also alive*, which sets the gradient's peak.
     /// 256 MiB keeps the half-transforms (the per-call win) and drops the big tier, costing about
     /// 0.5 s on the Z solve; raise it on a memory-rich machine.
-    pub resp_cache_budget_mib: f64,
     /// Krylov tolerance of the CP-HF/CP-KS response solve (`cpscf_tol`, default
     /// `1e-9`) and the inflation factor of its intermediate iterations
     /// (`cpscf_tol_inflation`, default `1000`).
@@ -624,12 +623,6 @@ pub struct GwGradConfig {
     /// Inflation of [`Self::cpscf_tol`] for the intermediate Krylov iterations.
     pub cpscf_tol_inflation: f64,
     /// Cache the bra-independent intermediates of the RI-JK response kernel
-    /// (`analdrv`'s `cpscf_cache_kernel`).  The CP-HF route applies that kernel
-    /// to a single right-hand side per Krylov iteration, so it rebuilds the
-    /// unpacked 3c-ERI and its occupied half-transforms (an `O(nao^2 naux)`
-    /// pass) on every iteration unless they are cached.  This only affects
-    /// speed and memory, not the numbers.
-    pub resp_cache_kernel: bool,
     /// Evaluate the adjoint CP-HF channel without the per-perturbation skeleton
     /// right-hand side tensor: `rhs_d` is linear in the derivative integrals,
     /// so `sum_d <Z, rhs_d>` is folded into direction-independent AO-basis
@@ -738,8 +731,6 @@ impl Default for GwGradConfig {
             adjoint_cphf_dft: std::env::var("REST_ADJOINT_DFT").map_or(true, |v| v != "0"),
             local_di: true,
             keep_adjoint_pieces: false,
-            resp_cache_kernel: true,
-            resp_cache_budget_mib: 256.0,
             cpscf_tol: 1.0e-9,
             cpscf_tol_inflation: 1000.0,
             fold_cphf_rhs: true,
@@ -1586,9 +1577,8 @@ fn metric_transform_blocked(s_metric: &[f64], q: &[f64], naux: usize, ncol: usiz
 
 /// Symmetric eigendecomposition, ascending eigenvalues, column eigenvectors.
 ///
-/// NOTE: the LAPACK bindings of this build leave `info = n` even on trivial
-/// input while returning correct results (REST's production code therefore
-/// ignores `info` as well); we validate the eigenvalues instead.
+/// The eigensolver's third tuple element is the matrix dimension, not the
+/// LAPACK `info`; the eigenvalues are validated explicitly instead.
 ///
 /// Driver choice: `dsyevd` (divide and conquer), not `dsyev`.  The chi0
 /// factorisation in [`build_lr_factor`] is called once per (orbital, frequency
@@ -1599,7 +1589,7 @@ fn metric_transform_blocked(s_metric: &[f64], q: &[f64], naux: usize, ncol: usiz
 /// 0.50 s / 0.20 s -- an order of magnitude, and it uses the pool.
 fn eigh_symmetric(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     let mat = to_mat(a, n, n);
-    let (vecs, vals, _info) = _dsyevd_inplace(mat, 'V');
+    let (vecs, vals, _info) = _dsyevd(&mat, 'V');
     let vals = vals;
     assert!(
         vals.iter().all(|v| v.is_finite()),
@@ -2673,7 +2663,7 @@ impl<'a> GwGradEngine<'a> {
         let nmo = scf.mol.num_state;
         let c_mo = &scf.eigenvectors[0];
         let nn = crate::ri_gw::vxc_ao2mo(scf);
-        let mo: Vec<f64> = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        let mo: Vec<f64> = if !scf.mol.dfadef.is_dfa_scf() {
             Vec::new()
         } else {
             let vxc_ao = scf
@@ -2700,7 +2690,7 @@ impl<'a> GwGradEngine<'a> {
         assert_eq!(scf.mol.spin_channel, 1, "gw_grad: restricted closed-shell only");
         assert_eq!(scf.mol.start_mo, 0, "gw_grad: no frozen orbitals supported");
         assert!(
-            scf.mol.xc_data.omega().is_none(),
+            scf.mol.dfadef.omega().is_none(),
             "gw_grad: range-separated hybrid references are not supported yet"
         );
         if config.num_freq == 0 {
@@ -2891,7 +2881,7 @@ impl<'a> GwGradEngine<'a> {
         };
 
         // ---- reference static-term data and low-rank factors (LR-only) ----
-        let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
+        let hybrid = scf.mol.dfadef.dfa_hybrid_scf;
         // a plain HF reference counts as a hybrid with alpha = 1: its orbital
         // energies already carry the exact exchange (see `ri_gw::exchange_fraction`)
         let fock_hyb = crate::ri_gw::exchange_fraction(scf);
@@ -8089,12 +8079,12 @@ impl GwGradEngine<'_> {
         // v_xc pieces must also enter the CP-KS right-hand side and the
         // first-order Fock of the Roothaan restoration, so that `U`, `eps1`
         // are the KS response of the actual reference.
-        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !self.scf.mol.dfadef.is_dfa_scf();
         let vxc_d1_atoms: Option<Vec<Vec<f64>>> = if is_hf {
             None
         } else {
             assert!(
-                self.scf.mol.xc_data.omega().is_none(),
+                self.scf.mol.dfadef.omega().is_none(),
                 "gw_grad: range-separated hybrid references are not supported"
             );
             let t0 = Instant::now();
@@ -8141,8 +8131,6 @@ impl GwGradEngine<'_> {
             RHessRIJK::new_with_cderi(&mol, &aux, 1.0, self.fock_hyb, cderi, j2c_decomp);
 
         let mut config = AnalDrvConfig::default();
-        config.resp.cache_kernel = self.config.resp_cache_kernel;
-        config.resp.cache_budget = self.config.resp_cache_budget_mib;
         // The adjoint route's accuracy is set by the Z solve, so the Krylov
         // tolerances are part of the gradient configuration (and can be
         // tightened; see `GwGradConfig::cpscf_tol`).
@@ -8210,7 +8198,6 @@ impl GwGradEngine<'_> {
         // the batched Krylov solve was the last user of the CP-KS response object; release the
         // whole-grid AO tables it retained (a pure cache) before the per-perturbation assembly
         if !is_hf {
-            resp.release_ao_cache();
         }
 
         // ---- canonical-orbital assembly per perturbation ----
@@ -10791,13 +10778,13 @@ impl GwGradEngine<'_> {
     /// return: if that function ever declines for another reason, callers that
     /// rely on it must be revisited too.
     pub fn supports_cphf_adjoint(&self) -> bool {
-        if self.scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        if !self.scf.mol.dfadef.is_dfa_scf() {
             return true;                       // plain HF (the validated route)
         }
         // DFT / global-hybrid (CP-KS): requires the kernel terms of
         // `build_cphf_adjoint`, which are opt-in; range-separated hybrids are
         // rejected by the energy path already.
-        self.config.adjoint_cphf_dft && self.scf.mol.xc_data.omega().is_none()
+        self.config.adjoint_cphf_dft && self.scf.mol.dfadef.omega().is_none()
     }
 
     /// Per-atom explicit grid derivative of `v_xc` (`d v_xc/dR` at frozen
@@ -10805,7 +10792,7 @@ impl GwGradEngine<'_> {
     /// reference.  One grid sweep; shared by the canonical route's CP-KS
     /// right-hand side and by the adjoint route's `b_x` covector.
     pub fn vxc_grid_derivative_atoms(&self) -> Option<Vec<Vec<f64>>> {
-        if self.scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        if !self.scf.mol.dfadef.is_dfa_scf() {
             return None;
         }
         let t0 = Instant::now();
@@ -10873,7 +10860,7 @@ impl GwGradEngine<'_> {
         // DFT / hybrid references carry the XC-kernel terms (bits of
         // `REST_ADJOINT_DFT_MASK`); an HF reference is the validated route and
         // never enters them.
-        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !self.scf.mol.dfadef.is_dfa_scf();
         let dft_mask = dft_debug_mask();
 
         // Timer for the whole covector assembly, sections (a)/(a2)/(b).  It must
@@ -11073,8 +11060,6 @@ impl GwGradEngine<'_> {
             crate::ri_jk::get_j2c_decomp(&aux, &device, self.scf.mol.ctrl.j2c_decomp.clone());
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
         let mut config = AnalDrvConfig::default();
-        config.resp.cache_kernel = self.config.resp_cache_kernel;
-        config.resp.cache_budget = self.config.resp_cache_budget_mib;
         // The adjoint route's accuracy is set by the Z solve, so the Krylov
         // tolerances are part of the gradient configuration (and can be
         // tightened; see `GwGradConfig::cpscf_tol`).
@@ -11192,7 +11177,6 @@ impl GwGradEngine<'_> {
         // AO tables it retained (a pure cache, recomputed on demand) so that they do not sit
         // under the remaining gradient phases
         if !is_hf {
-            resp.release_ao_cache();
         }
         mem_probe("  adjoint: after Z solve");
         if std::env::var("REST_GWGRAD_ZDBG").is_ok() {

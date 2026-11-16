@@ -121,6 +121,19 @@ pub fn save_chkfile(scf_data: &SCF) {
     let num_elec_json = serde_json::to_string(&scf_data.mol.num_elec[0]).unwrap();
     write_string_scalar(&file, "molecule/num_elec", &num_elec_json);
 
+    // ROKS: the `e_tot` written above is the mixed-determinant SCF energy.
+    // Replace it with the spin-purified open-shell singlet energy and store
+    // the components alongside (E_T is the same-orbital triplet, HF-level).
+    // The keys are filled by `store_oss_energies` right after the SCF loop;
+    // fall back to the mixed-determinant energy if they are somehow absent.
+    if scf_data.mol.ctrl.oss_roks {
+        let get_e = |key: &str| scf_data.energies.get(key).map(|v| v[0]).unwrap_or(scf_data.scf_energy);
+        write_scf_attribute(&scf, "oss_e_mix", &[get_e("oss_e_mix")]);
+        write_scf_attribute(&scf, "oss_k_ab", &[get_e("oss_k_ab")]);
+        write_scf_attribute(&scf, "oss_e_triplet", &[get_e("oss_e_triplet")]);
+        write_scf_attribute(&scf, "e_tot", &[get_e("oss_e_singlet")]);
+    }
+
     file.close();
 }
 

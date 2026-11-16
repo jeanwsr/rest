@@ -58,6 +58,8 @@ jobs:
           GITEE_URL="git@gitee.com:${GITEE_REPO}.git"
           PRS_FILE="${RUNNER_TEMP}/open_prs.jsonl"
           : > "$PRS_FILE"
+          CONFLICT_REPORT="${RUNNER_TEMP}/conflict_report.md"
+          : > "$CONFLICT_REPORT"
 
           # fetch_retry: retries only transient errors (network flakiness / throttling);
           # permanent errors (branch or repo missing, unauthorized SSH key) return immediately.
@@ -159,6 +161,10 @@ jobs:
               echo "::warning::PR #${pr_number} conflicts with ${base_ref}:"
               sed -n '2,$p' <<<"$merge_out" | sed 's/^/    /'
               conflicted+=("${pr_number}")
+              conflict_files_md=$(sed -n '2,$p' <<<"$merge_out" | awk '{if ($0 == "") exit} {gsub(/`/, "\\`"); printf "%s`%s`", (NR == 1 ? "" : "<br>"), $0}')
+              printf '| [#%s](https://gitee.com/%s/pulls/%s) | `%s` | `%s` | %s |\n' \
+                "${pr_number}" "${GITEE_REPO}" "${pr_number}" "${head_ref}" "${base_ref}" \
+                "${conflict_files_md:-(none listed)}" >> "$CONFLICT_REPORT"
               continue
             elif [ "$merge_rc" -ne 0 ]; then
               echo "::error::PR #${pr_number}: git merge-tree failed (rc=${merge_rc})"
@@ -184,9 +190,20 @@ jobs:
             fi
           done < "$PRS_FILE"
 
-          # ---------- 4. Conflict summary: fail explicitly ----------
+          # ---------- 4. Conflict report: job stays green, findings go to the run summary ----------
           if [ "${#conflicted[@]}" -gt 0 ]; then
-            echo "::error::${#conflicted[@]} PR(s) conflict with their base branch: ${conflicted[*]}"
-            exit 1
+            echo "::warning::${#conflicted[@]} PR(s) conflict with their base branch - merged previews skipped (see job summary)"
+            {
+              echo "## PRs with merge conflicts (${#conflicted[@]})"
+              echo
+              echo "Head mirrors (sync/pr-N) were still pushed and CI runs on them;"
+              echo "merged previews (sync/pr-N-merged) are skipped until the conflict is resolved."
+              echo
+              echo "| PR | Head | Base | Conflicted files |"
+              echo "|----|------|------|------------------|"
+              cat "$CONFLICT_REPORT"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Sync completed with ${#conflicted[@]} conflicted PR(s) - see the job summary."
+          else
+            echo "All PR(s) synced."
           fi
-          echo "All PR(s) synced."

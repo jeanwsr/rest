@@ -60,7 +60,7 @@ impl HessNucAPI for HessDFTD {
         let atm_list = atm_list.unwrap_or_else(|| (0..natm_orig).collect_vec());
         let natm = atm_list.len();
 
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         let mut hess: Tsr = rt::zeros(([3, 3, natm, natm], &device));
         let step = self.step;
 

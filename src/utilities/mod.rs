@@ -1,10 +1,11 @@
 pub mod memory_batch;
+pub mod memory_monitor;
 pub mod rstsr_util;
 pub mod buffer_pool;
 pub mod log;
+pub mod basic_math;
 
 use clap::{Command, Arg, ArgMatches};
-use rayon::prelude::*;
 use rayon::ThreadPoolBuildError;
 use time::{DateTime,Local};
 use std::{time::Instant, collections::HashMap, ops::Range};
@@ -198,35 +199,10 @@ pub fn balancing(num_tasks:usize, num_threads: usize) -> Vec<Range<usize>> {
     distribute_vec
 }
 
-/// Number of round-robin buckets used by [`apply_round_robin_permutation`].
-///
-/// Eight is the interleave the decomposition was tuned at.  The bucket count is deliberately
-/// **not** `rayon::current_num_threads()`: with one bucket per thread the permutation — and
-/// therefore the grid order, the AO prescreening mask (`non0tab`), the work per block and the
-/// accumulation order — became a function of the pool size.  Measured on one binary at polyene
-/// n=4: `non0tab` sparsity 64.3% at 16 threads against 69.4% at 40 threads, i.e. the 40-thread run
-/// did 7.8% more integral work for no reason, and the SCF energy differed in its last digits.
-/// A *fixed* bucket count keeps the mix — a contiguous range of `n/T` points still samples every
-/// bucket, hence every spatial region, for any `T` — while making the order a property of the
-/// problem alone.  `REST_ROUND_ROBIN_BUCKETS` overrides it.
-const ROUND_ROBIN_BUCKETS: usize = 8;
-
-/// Bucket count of the grid permutation, from `REST_ROUND_ROBIN_BUCKETS`.
-fn round_robin_buckets() -> usize {
-    std::env::var("REST_ROUND_ROBIN_BUCKETS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(ROUND_ROBIN_BUCKETS)
-        .max(1)
-}
-
 /// Apply round-robin permutation to grid data, so that contiguous ranges
 /// in `parallel_balancing` give each thread a uniform mix of grid points
 /// from all spatial regions. All per-grid arrays must be permuted together.
 /// Call before ao/aop tabulation.
-///
-/// The permutation is a property of the grid and of [`ROUND_ROBIN_BUCKETS`] alone, never of
-/// `rayon::current_num_threads()` — see [`ROUND_ROBIN_BUCKETS`] for what the pool dependence cost.
 pub fn apply_round_robin_permutation(
     coordinates: &mut Vec<[f64; 3]>,
     weights: &mut Vec<f64>,
@@ -234,9 +210,7 @@ pub fn apply_round_robin_permutation(
     quadrature_weights: &mut Vec<f64>,
 ) {
     let n = coordinates.len();
-    // `num_threads` is the bucket count here; the algorithm is unchanged, so a bucket count
-    // equal to the pool size reproduces the historical permutation exactly.
-    let num_threads = round_robin_buckets();
+    let num_threads = rayon::current_num_threads();
     if num_threads <= 1 {
         return;
     }
@@ -335,11 +309,19 @@ pub fn create_pool(num_threads: usize) -> Result<rayon::ThreadPool,ThreadPoolBui
     }
  }
 
+/// Pattern behind [`convert_scientific_notation_to_fortran_format`].
+///
+/// Compiled once instead of on every call: the original rebuilt the regex
+/// inside the function body, which is invisible for a handful of values but
+/// pathological in a per-value loop (the fchk writer used to call this once per
+/// number written, i.e. millions of times per job).
+static FORTRAN_FORMAT_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?P<num> *-?\d.\d*)[E|e](?P<exp>-?\d{1,2})").unwrap());
+
 pub fn convert_scientific_notation_to_fortran_format(n: &String) -> String {
-    let re = Regex::new(r"(?P<num> *-?\d.\d*)[E|e](?P<exp>-?\d{1,2})").unwrap();
     let o_len = n.len();
 
-    if let Some(cap) = re.captures(n) {
+    if let Some(cap) = FORTRAN_FORMAT_RE.captures(n) {
         let main_part = cap["num"].to_string();
         let exp_part = cap["exp"].to_string();
         let exp: i32 = exp_part.parse().unwrap();
@@ -371,57 +353,4 @@ fn test_scientific_number() {
     println!("{}", &sdd);
     println!("{}", convert_scientific_notation_to_fortran_format(&sdd));
 
-}
-
-// ---------------------------------------------------------------------------
-// deterministic parallel reductions
-// ---------------------------------------------------------------------------
-
-/// Deterministic parallel sum of a slice.
-///
-/// `rayon`'s `sum()` / `fold(..).sum()` combine partial results in an order that
-/// depends on how the work happened to be split, and accumulating through a
-/// `channel` sums in **arrival** order; both make the floating-point total
-/// depend on the number of worker threads (and, with work stealing, on the run
-/// itself).  This partitions the slice into **fixed-size blocks** -- the
-/// partition does not depend on the thread count -- sums every block serially
-/// and adds the block sums in index order, so the result is bit-identical for
-/// every `num_threads`.
-pub fn par_sum(xs: &[f64]) -> f64 {
-    const BLK: usize = 8192;
-    if xs.len() <= BLK {
-        return xs.iter().sum();
-    }
-    xs.par_chunks(BLK)
-        .map(|c| c.iter().sum::<f64>())
-        .collect::<Vec<f64>>()
-        .iter()
-        .sum()
-}
-
-/// [`par_sum`] of the elementwise product `xs[i] * ys[i]`.
-pub fn par_dot(xs: &[f64], ys: &[f64]) -> f64 {
-    debug_assert_eq!(xs.len(), ys.len(), "par_dot: length mismatch");
-    const BLK: usize = 8192;
-    if xs.len() <= BLK {
-        return xs.iter().zip(ys.iter()).map(|(a, b)| a * b).sum();
-    }
-    xs.par_chunks(BLK)
-        .zip(ys.par_chunks(BLK))
-        .map(|(ca, cb)| ca.iter().zip(cb.iter()).map(|(a, b)| a * b).sum::<f64>())
-        .collect::<Vec<f64>>()
-        .iter()
-        .sum()
-}
-
-/// Deterministic sum of a parallel map: `sum_i f(item_i)`, evaluated in index
-/// order.  Replaces the `par_iter().for_each_with(sender, ..)` + channel +
-/// `receiver.into_iter().sum()` idiom, whose total follows arrival order.
-pub fn par_map_sum<T, F>(xs: &[T], f: F) -> f64
-where
-    T: Sync,
-    F: Fn(&T) -> f64 + Sync + Send,
-{
-    let partials: Vec<f64> = xs.par_iter().map(|x| f(x)).collect();
-    partials.iter().sum()
 }

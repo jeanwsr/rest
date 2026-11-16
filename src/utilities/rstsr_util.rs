@@ -10,70 +10,27 @@ pub type TsrView<'a, T = f64> = TensorView<'a, T, DeviceBLAS, IxD>;
 pub type TsrMut<'a, T = f64> = TensorMut<'a, T, DeviceBLAS, IxD>;
 pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 
-/// The process-wide RSTSR device.  Use this instead of `DeviceBLAS::default()`.
-///
-/// `DeviceBLAS::default()` is **not** free.  rstsr's `DeviceCpuRayon::generate_pool` builds a
-/// brand-new rayon `ThreadPool` and spawns `rayon::current_num_threads()` workers on *every*
-/// call, so it costs `O(pool)` thread creations and keeps their stacks and TLS alive for as
-/// long as the device is.  REST called it per grid sub-block (`eval_xc_eff`, 1400 times per
-/// v_xc sweep on polyene n=7), per AO evaluation (`NIMatmul::prepare_ao`), per Krylov matvec
-/// conversion (`to_rstsr`) and about forty other places -- thousands of times per gradient
-/// card.  With 40 rayon workers each holding a 40-thread device pool alive at once that is
-/// ~1600 threads in the process.  Measured on the n=7 gradient card, the `[vxc timing] xc`
-/// figure -- which is exactly `eval_xc_eff` -- grew from **19.6 s of CPU at 16 threads to
-/// 371.1 s at 40**, and 10.2 s after this became a single shared instance.
-///
-/// The device is only an `Arc<ThreadPool>` plus a layout flag, and rstsr's `same_device`
-/// compares the pool's *current* thread count and the default order, not the identity, so one
-/// lazily created instance is equivalent and interoperates with anything built from
-/// `DeviceBLAS::default()`.
-///
-/// The pool size is `min(rayon::current_num_threads(), 16)`, and
-/// `REST_RSTSR_DEVICE_THREADS` overrides it (0 = the raw rayon pool size).  The size matters
-/// twice:
-///
-/// * rstsr runs its *broadcasted* contractions on this pool, and `with_num_threads` also asks
-///   OpenBLAS for that many threads around every `%` issued from a serial stretch;
-/// * `rstsr-openblas/src/matmul.rs` chooses between two **different algorithms** with
-///   `if n_task >= 4 * nthreads`: below the threshold it parallelises the outer broadcast and
-///   does each small product with one BLAS thread, above it it walks the broadcast serially
-///   and dispatches every small product to the whole pool.  With `n_task = nprop = 90` (the
-///   Z-vector solve) that threshold sits at `nthreads = 22`, so the 16-thread run takes the
-///   cheap branch and the 40-thread run takes the expensive one -- a pool-dependent *algorithm
-///   switch*, not just a pool-dependent amount of parallelism.
-///
-/// Every other device construction must go through this function: a second device whose
-/// thread count differs trips rstsr's `DeviceMismatch` check in `op_binary_arithmetic`
-/// wherever the two tensors meet.
+/// Compatibility shim for the GW/BSE code that was written against a
+/// process-wide device.  It deliberately returns the same thing as
+/// `DeviceBLAS::default()`: the remote `rest` behaviour is one device/pool per
+/// call, and the GW-BSE changes must not alter how every other module builds
+/// its device.
 pub fn device() -> DeviceBLAS {
-    static DEV: std::sync::OnceLock<DeviceBLAS> = std::sync::OnceLock::new();
-    DEV.get_or_init(|| {
-        let n = match std::env::var("REST_RSTSR_DEVICE_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            Some(0) => rayon::current_num_threads().max(1),
-            Some(k) => k,
-            None => rayon::current_num_threads().min(DEVICE_THREADS_MAX).max(1),
-        };
-        DeviceBLAS::new(n)
-    })
-    .clone()
+    DeviceBLAS::default()
 }
 
-/// Largest pool this device will build, regardless of the rayon pool size.
-///
-/// `rstsr-openblas/src/matmul.rs` picks between two *different algorithms* with
-/// `if n_task >= 4 * nthreads`: below the threshold it parallelises the outer broadcast and
-/// does each small product with one BLAS thread; above it, it walks the broadcast serially and
-/// dispatches every small product to the whole pool.  The Z-vector solve's broadcast has
-/// `n_task = nprop = 3*natm = 90`, so the threshold is `nthreads = 22`: at 40 threads the
-/// default device (pool = 40) took the *expensive* branch, and bounding it to 16 put it back on
-/// the cheap one.  Measured on the polyene-n=7 gradient card at 40 threads, the Z-vector solve
-/// went from **137.9 s to 82.9 s** and the whole card from 1058 s to 1000 s, while 16 threads
-/// are unaffected (its pool is already <= 16).  16 also keeps the OpenBLAS request rstsr makes
-/// around each serial `%` in the range that helps rather than a 40-wide barrier per product.
-const DEVICE_THREADS_MAX: usize = 16;
+/// Current process-wide BLAS thread count, used only to save/restore the
+/// phase-local BLAS policy inside the BSE gradient.
+pub fn blas_get_num_threads() -> usize {
+    #[cfg(not(feature = "intel-mkl"))]
+    unsafe {
+        rest_tensors::matrix_blas_lapack::openblas_get_num_threads() as usize
+    }
+    #[cfg(feature = "intel-mkl")]
+    {
+        rest_tensors::matrix_blas_lapack::omp_get_num_threads_wrapper()
+    }
+}
 
 /* #region interchange between rstsr and rest_tensor */
 
@@ -116,7 +73,7 @@ where
 
         let data_ref = self.data_ref().unwrap();
         let vec = data_ref[..upper_bound].to_vec();
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         rt::asarray((vec, layout, &device))
     }
 }
@@ -140,6 +97,17 @@ where
         let layout = layout_from_rest_tensor_matrix(self);
         let data_ref_mut = self.data_ref_mut().unwrap();
         rt::asarray((data_ref_mut, layout, device))
+    }
+}
+
+impl<T> RestTensorIntoRstsrTsrAPI<T> for MatrixFull<T>
+where
+    T: Clone,
+{
+    fn into_rstsr(self, device: &DeviceBLAS) -> Tsr<T> {
+        let layout = layout_from_rest_tensor_matrix(&self);
+        let data = self.data;
+        rt::asarray((data, layout, device))
     }
 }
 

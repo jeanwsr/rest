@@ -251,6 +251,8 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
         aop_compressed: None,
         atm_idx: atm_idx_r,
         quadrature_weights: quad_r,
+        ao_atm: Vec::new(),
+        atm_coords: Vec::new(),
     }
     
 }

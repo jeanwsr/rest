@@ -908,17 +908,7 @@ impl NlepOperator for GwNlepOperator<'_> {
         }
     }
 
-    fn solve_shifted_block(
-        &self,
-        node_index: usize,
-        _z: Complex<f64>,
-        rhs: &MatrixFull<f64>,
-    ) -> Option<MatrixFull<Complex<f64>>> {
-        match &self.shift {
-            ShiftSolver::Direct(d) => Some(d.solve_block(node_index, rhs)),
-            ShiftSolver::Gmres { .. } => None,
-        }
-    }
+
 }
 
 // ============================================================================
@@ -1364,22 +1354,7 @@ pub fn feast_gw_main(
     );
 
     println!("\n  NLFEAST iterations: {}", result.iterations);
-    let ft = result.timings;
-    let pct = |x: f64| if ft.total > 0.0 { 100.0 * x / ft.total } else { 0.0 };
-    let accounted = ft.projected_solve + ft.residual + ft.contour + ft.qr;
-    println!(
-        "  FEAST phase timings (s): projected={:.3} ({:.1}%), residual={:.3} ({:.1}%), contour={:.3} ({:.1}%), qr={:.3} ({:.1}%), other={:.3}, total={:.3}",
-        ft.projected_solve,
-        pct(ft.projected_solve),
-        ft.residual,
-        pct(ft.residual),
-        ft.contour,
-        pct(ft.contour),
-        ft.qr,
-        pct(ft.qr),
-        (ft.total - accounted).max(0.0),
-        ft.total
-    );
+
     if result.n_found == 0 {
         println!("  No quasiparticle eigenvalues found inside the contour.");
         return;

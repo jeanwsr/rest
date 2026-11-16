@@ -1426,8 +1426,56 @@ fn exact4c_scalar_def2_tzvpp_pfff_matches_libcint() {
     let ao_bfs = crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
         .expect("failed to expand AO rint shells");
 
+    // Compare IDENTICAL functions on both sides. `eri_ao_4c_r` contracts with
+    // `BasisFunction::coefficients` verbatim, so overwrite the lib_rint
+    // normalization with the `BasCell::coefficients` column produced by
+    // `basis_normalization` (the same coefficients the libcint molecule
+    // consumes). The loader's own shell-shared normalization differs from
+    // the production radial anchor by a per-shell scalar
+    // (2*sqrt(pi)/sqrt(2l+1)); comparing the raw loader output would encode
+    // that convention instead of the kernel (AO_AOP_NORM_AUDIT.md §4–§5C).
+    let rest_bfs: Vec<crate::lib_rint::basis::BasisFunction> = ao_bfs
+        .iter()
+        .map(|bf| {
+            let mut bf = bf.clone();
+            let l = bf.lx + bf.ly + bf.lz;
+            let elem = &mol.basis4elem[bf.atom_idx];
+            let mut matched = false;
+            for shell in &elem.electron_shells {
+                if shell.angular_momentum[0] as u32 != l {
+                    continue;
+                }
+                if shell.exponents.len() != bf.exponents.len()
+                    || shell.exponents != bf.exponents
+                {
+                    continue;
+                }
+                assert!(
+                    shell.coefficients.len() == 1,
+                    "expected a single contraction column, got {}",
+                    shell.coefficients.len()
+                );
+                // libcint applies CINTcommon_fac_sp(l) internally to s/p
+                // shells in its own contraction loops, so its effective
+                // primitive function is fac_sp(l)*d*monomial. `eri_ao_4c_r`
+                // is a raw cartesian kernel without that factor: fold it
+                // into the coefficients to compare identical functions.
+                let fac_sp = match l {
+                    0 => 0.5 / std::f64::consts::PI.sqrt(),
+                    1 => (3.0 / (4.0 * std::f64::consts::PI)).sqrt(),
+                    _ => 1.0,
+                };
+                bf.coefficients = shell.coefficients[0].iter().map(|c| c * fac_sp).collect();
+                matched = true;
+                break;
+            }
+            assert!(matched, "no BasCell shell matches bf atom={} l={l}", bf.atom_idx);
+            bf
+        })
+        .collect();
+
     let indices = [41_usize, 26_usize, 26_usize, 26_usize];
-    let got = eri_ao_4c_r(&ao_bfs, indices[0], indices[1], indices[2], indices[3]);
+    let got = eri_ao_4c_r(&rest_bfs, indices[0], indices[1], indices[2], indices[3]);
     let eri4_libcint = mol.int_ijkl_erifull();
     let expect = *eri4_libcint
         .get(&[indices[0], indices[1], indices[2], indices[3]])

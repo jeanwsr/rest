@@ -91,7 +91,7 @@ fn rsh_static_term_matches_full_hf_fock_diagonal() {
     for xc in ["cam-b3lyp", "wb97x", "hse06", "lc-blyp"] {
         let mut scf = run_scf(xc);
         assert!(
-            scf.mol.xc_data.is_rsh(),
+            scf.mol.dfadef.is_rsh(),
             "{xc}: expected an RSH reference"
         );
         assert!(

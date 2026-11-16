@@ -64,7 +64,7 @@ impl ExtField<f64> {
         use rest_libcint_wrapper::*;
 
         let nao = mol.num_basis;
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         let mut cint = mol.initialize_cint(false);
         let mut result: Tsr<f64> = rt::zeros(([nao, nao, 3], &device));
 
@@ -127,7 +127,7 @@ impl<'a> ExtFieldGrad<'a> {
     }
 
     pub fn calc(&mut self) -> MatrixFull<f64> {
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         let natm = self.mol.geom.elem.len();
         let nao = self.mol.num_basis;
 

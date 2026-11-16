@@ -4,7 +4,9 @@
 //! Port of the validated PySCF implementation
 //! `pyscf/gw/bse_grad_optimized.py` to REST.  The reference definition is
 //!
+//! ```text
 //!     d Omega_S / dR = sum_p c_p^(S) dE_p/dR + d Omega_kernel^(S)/dR
+//! ```
 //!
 //! where `c_p` are the BSE amplitude weights (X^2 + Y^2 over the occupied and
 //! virtual blocks) times the quasiparticle renormalisation factors Z_p, and
@@ -1015,9 +1017,8 @@ pub fn solve_bse_tda_dense(
         }
     }
     let (vecs, vals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyevd(&m, 'V');
-    // A positive `info` is a known false positive of this build's LAPACK bindings
-    // (`_dsyevd_inplace` documents it: `info = n` even for trivial inputs, with
-    // correct results), so validate the eigenvalues instead of trusting it.
+    // The third tuple element of `_dsyevd` is the matrix dimension, not the
+    // LAPACK `info`; validate the eigenvalues instead of trusting it.
     let vecs = vecs.expect("bse_grad: dsyevd returned no eigenvectors");
     assert!(
         vals.iter().all(|v| v.is_finite()),
@@ -2452,7 +2453,7 @@ impl<'a> BseGradEngine<'a> {
         // minutes.  Restore whatever the caller had on the way out so the
         // phase-local policy of the surrounding code is preserved.
         let blas_threads_saved =
-            rest_tensors::matrix_blas_lapack::blas_get_num_threads_wrapper();
+            crate::utilities::rstsr_util::blas_get_num_threads();
         let blas_threads_want = scf
             .mol
             .ctrl

@@ -18,7 +18,7 @@ where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
 {
-    let device = crate::utilities::rstsr_util::device();
+    let device = DeviceBLAS::default();
 
     let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
     let mo_occupation = (&scf_data.occupation[0]).to_rstsr(&device);
@@ -84,7 +84,7 @@ where
     const A: usize = 0;
     const B: usize = 1;
 
-    let device = crate::utilities::rstsr_util::device();
+    let device = DeviceBLAS::default();
 
     let mo_energy = scf_data.eigenvalues.as_slice().to_rstsr(&device);
     let mo_occupation = scf_data.occupation.as_slice().to_rstsr(&device);
@@ -106,12 +106,6 @@ where
             .map(|x| x.to_vec())
             .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
     });
-
-    if occ_lists[A].is_empty() || occ_lists[B].is_empty()
-        || vir_lists[A].is_empty() || vir_lists[B].is_empty()
-    {
-        return [0.0, 0.0, 0.0];
-    }
 
     // slice each spin channel to 1D then index_select
     let occ_energy = [

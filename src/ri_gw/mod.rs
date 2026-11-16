@@ -33,7 +33,7 @@ use rest_tensors::{RIFull};
 use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
-use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyevd_inplace};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyevd};
 use crate::tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use rest_tensors::MatrixUpper;
 use crate::ri_bse;
@@ -315,10 +315,10 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
 /// disagree with `GwGradEngine` (whose `fock_hyb` has always made this
 /// distinction).  Mirrors `dft::response` (`is_hf = dfa_compnt_scf.is_empty()`).
 pub fn exchange_fraction(scf_data:&SCF)->f64{
-    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+    if !scf_data.mol.dfadef.is_dfa_scf() {
         1.0
     } else {
-        scf_data.mol.xc_data.dfa_hybrid_scf
+        scf_data.mol.dfadef.dfa_hybrid_scf
     }
 }
 
@@ -329,7 +329,7 @@ pub fn exchange_fraction(scf_data:&SCF)->f64{
 /// fraction: [`exchange_matrix_from_scf`] returns the already assembled
 /// `K_full - K_ref`, so the factor is one (encoded here as `1 - 0`).
 pub fn static_exchange_fraction(scf_data:&SCF)->f64{
-    if scf_data.mol.xc_data.is_rsh() {
+    if scf_data.mol.dfadef.is_rsh() {
         0.0
     } else {
         exchange_fraction(scf_data)
@@ -970,6 +970,15 @@ pub fn calculate_imag_spin(
     }).sum()
 }
 
+/// Deterministic sum of a parallel map, used by the GW energy path.
+fn par_map_sum<T, F>(xs: &[T], f: F) -> f64
+where
+    T: Sync,
+    F: Fn(&T) -> f64 + Sync + Send,
+{
+    xs.par_iter().map(f).collect::<Vec<f64>>().iter().sum()
+}
+
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
     // Deterministic reduction.  `par_iter().map(..)` over a slice is an *indexed*
@@ -978,7 +987,7 @@ pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usi
     // `for_each_with(sender, ..)` + `receiver.into_iter().sum()` accumulated in
     // **arrival** order, which made the GW self-energy -- and every quantity
     // built on it -- depend on the thread count and on the scheduler.
-    let imag_n = crate::utilities::par_map_sum(w_c_at_freqs, |t| {
+    let imag_n = par_map_sum(w_c_at_freqs, |t| {
         let (omega_1, weight, w_c) = t;
         let imag_n_omega = quasiparticle_energies_g
             .iter()
@@ -1436,7 +1445,7 @@ pub fn v_matrix_sr_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64>
 /// returned by [`static_exchange_fraction`] then supplies the usual
 /// `(1 - alpha)`.
 pub fn exchange_completion_coefficients(scf_data: &SCF) -> (f64, f64) {
-    if let Some((_omega, c_lr, c_sr)) = scf_data.mol.xc_data.rsh_params() {
+    if let Some((_omega, c_lr, c_sr)) = scf_data.mol.dfadef.rsh_params_scf() {
         (1.0 - c_lr, c_lr - c_sr)
     } else {
         (1.0 - exchange_fraction(scf_data), 0.0)
@@ -1451,7 +1460,7 @@ pub fn exchange_completion_coefficients(scf_data: &SCF) -> (f64, f64) {
 /// [`static_exchange_fraction`] is zero in that case.
 pub fn exchange_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     let mut v_matrix = v_matrix_from_scf(scf_data);
-    if !scf_data.mol.xc_data.is_rsh() {
+    if !scf_data.mol.dfadef.is_rsh() {
         return v_matrix;
     }
     let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
@@ -1476,7 +1485,7 @@ pub fn exchange_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
 /// Spin-resolved counterpart of [`exchange_matrix_from_scf`].
 pub fn exchange_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
     let mut v_matrix = v_matrix_from_scf_spin(scf_data, spin);
-    if !scf_data.mol.xc_data.is_rsh() {
+    if !scf_data.mol.dfadef.is_rsh() {
         return v_matrix;
     }
     let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
@@ -1682,7 +1691,7 @@ impl GwContext {
         // static term of a range-separated hybrid needs the short-range
         // `rimatr_sr` matrix as well, which the AO plan does not own, so keep
         // the MO-basis route for RSH references.
-        if scf_data.mol.xc_data.is_rsh() {
+        if scf_data.mol.dfadef.is_rsh() {
             println!(
                 "gw_tensor_style = \"ao\": range-separated hybrid references use the \
                  MO-basis GW tensors (the AO route has no short-range exchange matrix)."
@@ -2636,14 +2645,15 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     quasiparticle_energies_g
 }
 pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
+    // The pure exchange/correlation part of `name`, decomposed natively from the parsed
+    // definition via the libxc functional kind (no curated x/c tables). `None` (e.g. a
+    // combined exchange-correlation functional) evaluates to a zero potential.
+    let spin_channel=scf_data.mol.spin_channel;
+    let kind=if choice=='X'{libxc::prelude::LibXCFunctionalKind::Exchange}else if choice=='C'{libxc::prelude::LibXCFunctionalKind::Correlation}else{panic!("invalid choice for pure x/c!")};
+    let part=crate::dft::parse_xc::xc_part_of_name(name,spin_channel,kind);
     let eigenvecs=scf_data.eigenvectors.clone();
-    let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
-    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
-    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
-    let mut new_paramr=vec![0.0,0.0,0.0];
-    new_paramr[x_or_c]=1.0;
-    scf_data.mol.xc_data.dfa_compnt_scf=DFA4REST::libxc_code_fdqc(name).to_vec();
-    scf_data.mol.xc_data.dfa_paramr_scf=new_paramr;
+    let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
+    scf_data.mol.dfadef.xc_scf=part.map(|def| def.xc_scf).unwrap_or(None);
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     let dimensions=v_x_or_c_ao.size[0];
     let mut v_x_or_c_nn=vec![0.0;dimensions];
@@ -2657,22 +2667,17 @@ pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
         }
         v_x_or_c_nn[i]=element;
     }
-    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
-    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+    scf_data.mol.dfadef.xc_scf=xc_scf_save;
     v_x_or_c_nn
 }
 pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
+    let spin_channel=scf_data.mol.spin_channel;
+    let kind=if choice=='X'{libxc::prelude::LibXCFunctionalKind::Exchange}else if choice=='C'{libxc::prelude::LibXCFunctionalKind::Correlation}else{panic!("invalid choice for pure x/c!")};
+    let part=crate::dft::parse_xc::xc_part_of_name(name,spin_channel,kind);
     let eigenvecs=scf_data.eigenvectors.clone();
-    let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
-    //println!("About to save DFA4REST");
-    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
-    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
-    //println!("About to obtain xc_code and change DFA4REST");
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![DFA4REST::libxc_code_fdqc(name)[x_or_c]];
-    //println!("xc_code has been obtained");
-    scf_data.mol.xc_data.dfa_paramr_scf=vec![1.0];
-    //println!("About to generate vxc");
+    let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
+    scf_data.mol.dfadef.xc_scf=part.map(|def| def.xc_scf).unwrap_or(None);
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     //println!("vxc has been generated");
     let dimensions=v_x_or_c_ao.size[0];
@@ -2683,8 +2688,7 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
         }
     }
     //println!("About to recover DFA4REST");
-    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
-    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+    scf_data.mol.dfadef.xc_scf=xc_scf_save;
     //println!("DFA4REST has been recovered");
     element
 }
@@ -3024,15 +3028,15 @@ pub fn low_rank_vchi_vsqrt(
         col_start = col_end;
     }
 
-    // Step 3: Diagonalize chi0 in place (the driver overwrites the input with the
-    // eigenvectors, so chi0's buffer is reused — no n² copy).
+    // Step 3: Diagonalize chi0.  `_dsyevd` copies the matrix into its LAPACK
+    // workspace; the returned eigenvectors are the only n² object kept.
     //
     // `dsyevd`, not `dsyev`.  This call is the *entire* cost of the real-axis low-rank grid
     // (400 points), and `dsyev` is dominated by its serial tridiagonal QR iteration: measured on
     // xc03n02, `dsyev(408)` takes 131 ms at one thread and 100 ms at 40 -- it does not scale at
     // all -- while `dsyevd(408)` takes 20 ms.  The same note already exists on
     // `gw_grad::eigh_symmetric`, which is why that path uses `dsyevd`; this one did not.
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd_inplace(chi0, 'V');
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd(&chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt: dsyev failed");
 
     // _dsyev returns eigenvalues in ascending order, but we want descending by
@@ -3115,10 +3119,10 @@ pub fn low_rank_vchi_vsqrt_total(
         chi0.self_multiple(2.0);
     }
 
-    // Diagonalize chi0 in place and form the RPA low-rank representation.
+    // Diagonalize chi0 and form the RPA low-rank representation.
     // `dsyevd` for the same reason as in `low_rank_vchi_vsqrt`: this loop runs once per
     // real-axis grid point and `dsyev` is a serial-QR-bound 5x slower there.
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd_inplace(chi0, 'V');
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd(&chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt_total: dsyev failed");
 
     let mut idx_eig: Vec<(usize, f64)> = eigvals_raw.iter().enumerate()

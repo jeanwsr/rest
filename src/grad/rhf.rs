@@ -118,11 +118,11 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     flags.ext_field_dipole(scf_data.mol.geom.ext_field.dipole);
 
     // set hybrid factor
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     let factor_k = if is_hf {
         Some(1.0)
     } else {
-        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        let fac = scf_data.mol.dfadef.dfa_hybrid_scf;
         if fac == 0.0 {
             None
         } else {
@@ -131,13 +131,84 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     };
     flags.factor_k(factor_k);
 
-    // set rsh factor
-    if let Some((omega, alpha, _beta)) = scf_data.mol.xc_data.dfa_rsh_scf {
+    // set rsh factor: read the stored RSH field of the definition
+    if let Some((omega, alpha, _c_sr)) = scf_data.mol.dfadef.rsh_params_scf() {
         flags.omega(Some(omega));
         flags.factor_alpha(Some(alpha));
     }
 
     flags.build().unwrap()
+}
+
+/// Row space of a storage-level pruned in-core RI tensor, as seen by the derivative code.
+///
+/// When `[ctrl.ri_jk] pair_screen_threshold` is positive, `rimatr` stores the retained AO-pair
+/// rows only and `SCF::rimatr_pair_map` describes them. The pruned energy is the energy of a tensor
+/// whose dropped rows are zero at *every* geometry, because the row set is decided once per
+/// geometry and then frozen, so its derivative never contracts a dropped row. Three projections
+/// express that:
+///
+/// - [`RIMatrRowSpace::project_packed`] keeps the stored rows of a packed quantity, for the
+///   contractions against the compacted tensor itself (`get_itm_j`).
+/// - [`RIMatrRowSpace::mask_packed`] zeroes the dropped rows of a full-length packed quantity, for
+///   the contractions against a full-space derivative integral (`int3c2e_ip2`).
+/// - [`RIMatrRowSpace::mask_ao`] zeroes the dropped pairs of an AO matrix, for the contractions
+///   that run over the square AO-pair space (`int3c2e_ip1`) and for the exchange intermediate
+///   that weights them.
+///
+/// Without a map (the default, `pair_screen_threshold = 0`) none of this is built and the
+/// full-space code path is untouched.
+pub struct RIMatrRowSpace {
+    /// full packed pair indices of the stored rows, ascending
+    kept: Vec<usize>,
+    /// full packed pair space, 1.0 on a stored row and 0.0 on a dropped one
+    pub packed_mask: Tsr<f64>,
+    /// `[nao, nao]`, 1.0 on a stored pair (both triangles) and 0.0 on a dropped one
+    pub ao_mask: Tsr<f64>,
+}
+
+impl RIMatrRowSpace {
+    pub fn new(nao: usize, map: &ri_jk::PairMap, device: &DeviceBLAS) -> Self {
+        let kept = map.kept_indices();
+        let num_baspar = map.num_baspar_full();
+        let mut packed = vec![0.0_f64; num_baspar];
+        for &p in kept.iter() {
+            packed[p] = 1.0;
+        }
+        let mut ao = vec![0.0_f64; nao * nao];
+        for &[mu, nu] in map.rows.iter() {
+            let (i, j) = (mu as usize, nu as usize);
+            ao[i * nao + j] = 1.0;
+            ao[j * nao + i] = 1.0;
+        }
+        RIMatrRowSpace {
+            kept,
+            packed_mask: rt::asarray((packed, [num_baspar], device)),
+            ao_mask: rt::asarray((ao, [nao, nao], device)),
+        }
+    }
+
+    /// Number of stored rows.
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    /// Packed quantity restricted to the stored rows, in stored-row order.
+    pub fn project_packed(&self, packed_full: &Tsr<f64>) -> Tsr<f64> {
+        let data = packed_full.clone().into_raw();
+        let projected = self.kept.iter().map(|&p| data[p]).collect::<Vec<f64>>();
+        rt::asarray((projected, [self.kept.len()], self.packed_mask.device()))
+    }
+
+    /// Full-length packed quantity with the dropped rows zeroed.
+    pub fn mask_packed(&self, packed_full: &Tsr<f64>) -> Tsr<f64> {
+        packed_full * &self.packed_mask
+    }
+
+    /// AO matrix with the dropped pairs zeroed.
+    pub fn mask_ao(&self, dm: TsrView<f64>) -> Tsr<f64> {
+        dm * &self.ao_mask
+    }
 }
 
 impl RIRHFGradient<'_> {
@@ -165,7 +236,7 @@ impl RIRHFGradient<'_> {
         // preparation
         let mol_obj = &self.scf_data.mol;
         let mol = ri_jk::util::get_cint_mol(mol_obj);
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
 
         // orbital informations
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
@@ -201,7 +272,7 @@ impl RIRHFGradient<'_> {
     pub fn calc_de_hcore(&mut self) -> &mut Self {
         let mol = &self.scf_data.mol;
         let natm = mol.geom.elem.len();
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
 
         let dm = get_dm(self.scf_data, &device);
         let mut de_hcore: Tsr<f64> = rt::zeros(([3, natm], &device));
@@ -232,13 +303,43 @@ impl RIRHFGradient<'_> {
         time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
         time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
+        // peak-attribution probe of the analytic gradient (REST_MEM_PROBE=1 or print_level >= 3)
+        let mem_probe_on = mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        mem_probe("calc_de_jk: enter", mem_probe_on);
+
         time_records.count_start("de-jk prepr 1");
 
         let mol_obj = &self.scf_data.mol;
         let natm = mol_obj.geom.elem.len();
         let mol = ri_jk::util::get_cint_mol(mol_obj);
         let aux = ri_jk::util::get_cint_aux(mol_obj);
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
+
+        // Integral-level Schwartz screening of the derivative batches: the
+        // engine evaluates only the (shell pair, aux shell) triples whose
+        // exact Schwarz bound can contribute above
+        // `ri_jk.c3_screen_threshold / DERIV_AMP`, filling the rest of the
+        // batch tensors with zeros (same shape and layout as the unscreened
+        // driver). `c3_screen_threshold <= 0` (default) keeps the exact unscreened path.
+        let deriv_screen = if mol_obj.ctrl.ri_jk.c3_screen_threshold > 0.0 {
+            let engine = ri_jk::schwartz_c3::ScreenedC3Engine::build(
+                &mol,
+                &aux,
+                mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
+            );
+            let log_thresh =
+                (mol_obj.ctrl.ri_jk.c3_screen_threshold / ri_jk::schwartz_c3::DERIV_AMP).ln();
+            if mol_obj.ctrl.print_level >= 2 {
+                println!(
+                    "de-jk Schwartz screen: keeping {:.1}% of (pair, aux shell) triples at threshold {:.1e}.",
+                    engine.kept_fraction([0, aux.nbas()], log_thresh) * 100.0,
+                    mol_obj.ctrl.ri_jk.c3_screen_threshold
+                );
+            }
+            Some((engine, log_thresh))
+        } else {
+            None
+        };
 
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);
@@ -248,8 +349,24 @@ impl RIRHFGradient<'_> {
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
         let mo_occ = get_mo_occ(self.scf_data, &device);
         let nao = dm.shape()[0];
-        let nocc = mo_occ.iter().map(|&x| if x > 0.0 { 1 } else { 0 }).sum::<usize>();
-        let weighted_occ_coeff = mo_coeff.i((.., 0..nocc)) * mo_occ.mapv(f64::sqrt).i((None, 0..nocc));
+        // Occupied manifold of the exchange derivative: the orbitals that are
+        // actually occupied, weighted by sqrt(occupation). A MOM hole is not at
+        // the HOMO, so the legacy `mo_coeff[:, 0..nocc]` block is not the
+        // occupied manifold for a Delta-SCF (force_state_occupation) state; see
+        // `occupied_coeff_block`. For an Aufbau occupation this reproduces the
+        // legacy columns and weights exactly.
+        let weighted_occ_coeff = occupied_coeff_block(mo_coeff.view(), mo_occ.view());
+        let nocc = weighted_occ_coeff.shape()[1];
+        // Diagnostic + version marker of the exchange-occupation fix: a MOM
+        // (Delta-SCF) determinant makes the gradient contract the *actually*
+        // occupied orbitals instead of the leading 0..nocc block. Seeing this
+        // line in a force log proves the fix is active in the binary.
+        if self.flags.print_level >= 1 && !occupation_is_aufbau(&self.scf_data.occupation[0]) {
+            println!(
+                "gradient (exchange): non-Aufbau occupation in spin channel 0: {}; contracting K with the actually occupied orbitals",
+                occupation_summary(&self.scf_data.occupation[0])
+            );
+        }
 
         // eigen-decomposed ERI
         let ederi_utp = {
@@ -257,7 +374,42 @@ impl RIRHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[1];
+        // The auxiliary dimension of the *global* RI tensor. Under MPI the stored tensor holds
+        // only the column block of this rank (see `local_aux_function_range`), so the shape of
+        // `ederi_utp` is the local column count and must not be used as the auxiliary dimension.
+        let naux = mol_obj.num_auxbas;
+
+        // Storage-level AO-pair pruning: the stored tensor holds the retained rows only, and every
+        // contraction of the derivative runs over exactly those rows. The row set of the energy is
+        // the row set of its derivative, because the dropped rows are zero at every geometry.
+        let pair_map = self.scf_data.rimatr_pair_map.as_ref();
+        if let Some(map) = pair_map {
+            assert_eq!(
+                map.len(),
+                ederi_utp.shape()[0],
+                "the stored RI tensor and its pair map disagree on the number of stored rows"
+            );
+        }
+        let row_space = pair_map.map(|map| RIMatrRowSpace::new(nao, map, &device));
+        // packed density on the stored rows, for the contractions against the compacted tensor
+        let dm_tp_row = match &row_space {
+            Some(rows) => rows.project_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // packed density on the full pair space of the derivative integrals, dropped rows zeroed
+        let dm_tp_masked = match &row_space {
+            Some(rows) => rows.mask_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // AO density on the square pair space of int3c2e_ip1, dropped pairs zeroed
+        let dm_ao = match &row_space {
+            Some(rows) => rows.mask_ao(dm.view()),
+            None => dm.clone(),
+        };
+        let (ao_pair_mask, packed_pair_mask) = match &row_space {
+            Some(rows) => (Some(&rows.ao_mask), Some(&rows.packed_mask)),
+            None => (None, None),
+        };
 
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -274,8 +426,18 @@ impl RIRHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
-        let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
-        let aux_batch_size = aux_batch_size.min(216);
+        let aux_batch_raw = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
+        // `calc_batch_size` 在预算耗尽时下限是 1，会让下面的循环退化成「每个辅助壳一批」
+        // （上千次小积分）。这里保底 MIN_AUX_BATCH_FUNCS 个函数并给出告警：预算不足时
+        // 允许内存稍微超一点，而不是让墙钟爆掉。
+        const MIN_AUX_BATCH_FUNCS: usize = 16;
+        let aux_batch_size = aux_batch_raw.clamp(MIN_AUX_BATCH_FUNCS, 216);
+        if aux_batch_raw < MIN_AUX_BATCH_FUNCS && self.flags.print_level >= 1 {
+            println!(
+                "[WARN] the memory budget allows only {} auxiliary basis functions per derivative batch, raised to {} (nao = {}). Raise [ctrl] max_memory or expect a higher peak.",
+                aux_batch_raw, aux_batch_size, nao
+            );
+        }
 
         // ── MPI: restrict the 3c-2e integral batches to this rank's local
         // slice of the auxiliary basis (same deterministic distribution as
@@ -284,9 +446,10 @@ impl RIRHFGradient<'_> {
         // restriction every rank would redundantly redo the full auxiliary
         // loop, so the force calculation gets *slower* as the number of MPI
         // processes grows. The prepr quantities (j2c decomposition, `itm_j`,
-        // `itm_k_occtp`, the full 2c-2e `daux_*` seeds) still work on the
-        // complete matrix gathered by `eval_force`; the per-rank local
-        // contributions are combined afterwards with MPI reductions.
+        // `itm_k_occtp`, the full 2c-2e `daux_*` seeds) are built from this rank
+        // column block and all-gathered as small intermediate arrays, so the stored RI
+        // tensor itself stays distributed; the per-rank local contributions are combined
+        // afterwards with MPI reductions.
         let (aux_fn0, aux_fn1) = local_aux_function_range(naux, self.mpi_operator);
         let (aux_shl0, aux_shl1) = aux_function_range_to_shell_range(&aux_loc, aux_fn0, aux_fn1);
         let local_aux_partition = if aux_shl0 < aux_shl1 {
@@ -308,6 +471,7 @@ impl RIRHFGradient<'_> {
         let (aux_span0, aux_span1) = (aux_loc[aux_shl0], aux_loc[aux_shl1]);
 
         time_records.count("de-jk prepr 1");
+        mem_probe("de-jk prepr 1 done (rimatr, j2c, int2c2e_ip1)", mem_probe_on);
 
         // basic setup finished
         // begin hybrid computation
@@ -319,7 +483,16 @@ impl RIRHFGradient<'_> {
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
+            // the compacted tensor is contracted with the density on its own row space
+            itm_j = get_itm_j_columns(
+                &j2c_decomp,
+                ederi_utp.view(),
+                dm_tp_row.view(),
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -330,7 +503,16 @@ impl RIRHFGradient<'_> {
         let mut dao_k = rt::full(([], f64::NAN, &device));
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
-            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view());
+            itm_k_occtp = get_itm_k_occtp_columns(
+                &j2c_decomp,
+                ederi_utp.view(),
+                weighted_occ_coeff.view(),
+                pair_map,
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_k = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
@@ -339,15 +521,31 @@ impl RIRHFGradient<'_> {
         }
 
         time_records.count("de-jk prepr 2");
+        mem_probe("de-jk prepr 2 done (itm_j, itm_k_occtp, daux seeds)", mem_probe_on);
+
+        let mut batch_probe_left = 2usize;
+        // mol+aux concatenation shared by every batch of this gradient: with
+        // the instance-level optimizer cache of rest_libcint, the per-batch
+        // `integrate` calls stop rebuilding the O(nbas^2) libcint optimizer
+        // that `CInt::integrate_cross` would rebuild on every call (it
+        // concatenates a fresh molecule each time).
+        let merged_ijk = &mol + &aux;
+        let nbas_mol = mol.nbas();
 
         for [shl0, shl1] in local_aux_partition.clone() {
-            let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+            let shl_slices_merged =
+                [[0, nbas_mol], [0, nbas_mol], [nbas_mol + shl0, nbas_mol + shl1]];
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
             time_records.count_start("de-jk batch int");
             // int3c2e_ip1
             let tsr_int3c2e_ip1 = {
-                let (out, shape) = CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
+                    Some((engine, thr)) => engine.evaluate_s1_ip1([shl0, shl1], *thr),
+                    None => merged_ijk
+                        .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
+                        .into(),
+                };
                 rt::asarray((out, shape, &device))
             };
 
@@ -355,22 +553,35 @@ impl RIRHFGradient<'_> {
             let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
             if self.flags.auxbasis_response {
                 tsr_int3c2e_ip2 = {
-                    let (out, shape) =
-                        CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                    let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
+                        Some((engine, thr)) => {
+                            engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr)
+                        }
+                        None => merged_ijk
+                            .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                            .into(),
+                    };
                     rt::asarray((out, shape, &device))
                 };
             }
             time_records.count("de-jk batch int");
+            if batch_probe_left > 0 {
+                mem_probe(
+                    &format!("int3c2e_ip1/ip2 built for aux shells {}..{}", shl0, shl1),
+                    mem_probe_on,
+                );
+                batch_probe_left -= 1;
+            }
 
             if self.flags.factor_j.is_some() {
                 time_records.count_start("de-jk batch 1");
-                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm.view(), itm_j.i(p0..p1));
+                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm_ao.view(), itm_j.i(p0..p1));
                 time_records.count("de-jk batch 1");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
                     *&mut daux_j.i_mut(p0..p1) +=
-                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
+                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp_masked.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
             }
@@ -381,12 +592,17 @@ impl RIRHFGradient<'_> {
                 time_records.count("de-jk batch 3");
 
                 time_records.count_start("de-jk batch 4");
-                *&mut dao_k += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view());
+                *&mut dao_k +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 4");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_k_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 5");
                 }
             }
@@ -434,6 +650,15 @@ impl RIRHFGradient<'_> {
                 let tsr = ederi_utp_rimatr_sr;
                 rt::asarray((&tsr.0.data, tsr.0.size, &device))
             };
+            // the short-range tensor of a range-separated hybrid shares the row space of the
+            // full-range one, which is the map the SCF compacted both onto
+            if let Some(map) = pair_map {
+                assert_eq!(
+                    map.len(),
+                    ederi_utp_sr.shape()[0],
+                    "the stored short-range RI tensor and the pair map of the full-range one disagree"
+                );
+            }
 
             // regenerate essential cheap integrals
             let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -447,22 +672,37 @@ impl RIRHFGradient<'_> {
             time_records.count_start("de-jk prepr 3");
 
             // temporaries for de_sraux
-            let mut itm_r_occtp = get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view());
+            let mut itm_r_occtp = get_itm_k_occtp_columns(
+                &j2c_decomp_sr,
+                ederi_utp_sr.view(),
+                weighted_occ_coeff.view(),
+                pair_map,
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_sr = rt::zeros(([nao, 3], &device));
             let itm_sr_aux = get_itm_k_aux(itm_r_occtp.view_mut());
             daux_sr = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_sr_aux.view());
 
             time_records.count("de-jk prepr 3");
 
+            // SR 分支同样共享合并分子（见上方 LR 注释；mol/aux 此处已带 omega）
+            let merged_ijk_sr = &mol + &aux;
+            let nbas_mol_sr = mol.nbas();
+
             for [shl0, shl1] in local_aux_partition.clone() {
-                let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+                let shl_slices_merged =
+                    [[0, nbas_mol_sr], [0, nbas_mol_sr], [nbas_mol_sr + shl0, nbas_mol_sr + shl1]];
                 let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
                 time_records.count_start("de-jk batch int 2");
                 // int3c2e_ip1
                 let tsr_int3c2e_ip1 = {
-                    let (out, shape) =
-                        CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                    let (out, shape) = merged_ijk_sr
+                        .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
+                        .into();
                     rt::asarray((out, shape, &device))
                 };
 
@@ -470,8 +710,9 @@ impl RIRHFGradient<'_> {
                 let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
                 if self.flags.auxbasis_response {
                     tsr_int3c2e_ip2 = {
-                        let (out, shape) =
-                            CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                        let (out, shape) = merged_ijk_sr
+                            .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                            .into();
                         rt::asarray((out, shape, &device))
                     };
                 }
@@ -482,12 +723,17 @@ impl RIRHFGradient<'_> {
                 time_records.count("de-jk batch 6");
 
                 time_records.count_start("de-jk batch 7");
-                *&mut dao_sr += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view());
+                *&mut dao_sr +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 7");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 8");
-                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_r_ao.view());
+                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_r_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 8");
                 }
 
@@ -524,7 +770,7 @@ impl RIRHFGradient<'_> {
         let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
         for atm in 0..natm {
-            let [_, _, p0, p1] = ao_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = ao_slice[atm];
             if self.flags.factor_j.is_some() {
                 *&mut de_j.i_mut((.., atm)).assign(dao_j.i(p0..p1).sum_axes(0));
             }
@@ -539,7 +785,7 @@ impl RIRHFGradient<'_> {
             // the rank that owns the corresponding auxiliary rows, so every
             // rank must restrict its aux-atom summation to its local rows; the
             // partial [3, natm] results are summed over ranks below.
-            let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = aux_slice[atm];
             let (q0, q1) = (p0.max(aux_span0), p1.min(aux_span1));
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
                 if q0 < q1 {
@@ -623,6 +869,7 @@ impl RIRHFGradient<'_> {
             flag.then(|| self.result.insert(key.into(), de_part));
         }
 
+        mem_probe("calc_de_jk: done", mem_probe_on);
         return self;
     }
 
@@ -811,10 +1058,13 @@ impl RIRHFGradient<'_> {
 pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<f64> + 'a {
     let mut mol_obj = scf_data.mol.clone();
     let mol = ri_jk::util::get_cint_mol(&mol_obj);
-    let device = crate::utilities::rstsr_util::device();
+    let device = DeviceBLAS::default();
 
     let necp_by_atom = {
-        let basis4elem = Molecule::collect_basis(&scf_data.mol.ctrl, &mut scf_data.mol.geom.clone()).0;
+        // take the basis already loaded into the molecule (from `basis_path`
+        // files, or reconstructed from the chkfile when `basis_path = "chkfile"`):
+        // re-collecting from disk here would break force jobs with chkbasis
+        let basis4elem = &scf_data.mol.basis4elem;
         basis4elem.iter().map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp } else { 0 }).collect::<Vec<usize>>()
     };
     let has_ecp = necp_by_atom.iter().any(|&x| x > 0);
@@ -915,12 +1165,70 @@ fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
     return rt::asarray((&dm.data, dm.size, device)).to_owned();
 }
 
+/// Occupied manifold of one spin channel, as the column block the exchange
+/// derivative has to be contracted with: the orbitals that are *actually*
+/// occupied (mask `occ > 0`), each column scaled by `sqrt(occupation)`.
+///
+/// `mo_coeff` is `[nao, nmo]`; the returned tensor is `[nao, n_active]`.
+///
+/// The assemblers used to take the leading `0..nocc` columns of `mo_coeff`
+/// (`mo_coeff[:, 0..nocc]`), which is the occupied manifold only for an
+/// **Aufbau** occupation. A MOM / `force_state_occupation` determinant (the
+/// Delta-SCF route to an excited state) can leave a hole *below* the HOMO and
+/// push an occupied orbital *above* it, and the leading block then holds the
+/// empty orbital (contracted with full weight in the UHF assembler, which
+/// assumes unit occupations) while dropping the occupied one: the exchange
+/// derivative silently used the wrong orbital set, so every force / geometry
+/// optimization of a MOM state was wrong as soon as the functional carried
+/// exact exchange (pure GGA/LDA was unaffected because `factor_k` is `None`
+/// and the K block is skipped).
+///
+/// The mask-based selection below is the same construction the SCF's own
+/// exchange build uses (`ri_jk::pure_incore::generate_vk_ri_incore_coeff_with_rstsr`,
+/// `ri_jk::pure_direct`), so the energy and its gradient see one manifold.
+/// For an Aufbau occupation the selected columns and their `sqrt(occ)` weights
+/// are exactly the legacy ones (unit occupations give a weight of exactly 1.0),
+/// so existing results stay bit-for-bit unchanged.
+pub(crate) fn occupied_coeff_block(mo_coeff: TsrView<f64>, mo_occ: TsrView<f64>) -> Tsr<f64> {
+    // `rt::gt` consumes its first operand, and `mo_occ` is needed again below
+    // for the sqrt(occupation) weights, so the comparison borrows it (the same
+    // form `ri_jk::pure_incore` uses: `rt::lt(&mo_occ, 0.0)`).
+    let occ_mask = rt::gt(&mo_occ, f64::EPSILON).into_vec();
+    let occ_coeff = mo_coeff.bool_select(-1, &occ_mask);
+    let occ = mo_occ.bool_select(-1, &occ_mask).sqrt();
+    // `into_contig(ColMajor)` keeps the column-major layout the downstream
+    // contractions assert on (`TsrView::f_prefer`), which the legacy
+    // `mo_coeff[:, 0..nocc]` view satisfied by construction.
+    (occ_coeff * occ.i((None, ..))).into_contig(ColMajor)
+}
+
+/// True when the occupied orbitals of one spin channel are exactly the leading
+/// block `0..nocc` (an index-contiguous / Aufbau occupation).
+///
+/// Used by the guards that have to refuse a non-Aufbau occupation outright
+/// (the double-hybrid gradients build their occupied / virtual pair spaces
+/// from the contiguous `0..nocc` / `nocc..nmo` split) and by the diagnostics.
+pub(crate) fn occupation_is_aufbau(occ: &[f64]) -> bool {
+    let nocc = occ.iter().filter(|&&o| o > f64::EPSILON).count();
+    (0..nocc).all(|i| occ[i] > f64::EPSILON)
+        && (nocc..occ.len()).all(|i| occ[i] <= f64::EPSILON)
+}
+
+/// Describe the occupation pattern for a diagnostic / panic message.
+pub(crate) fn occupation_summary(occ: &[f64]) -> String {
+    let occupied = occ.iter().enumerate()
+        .filter(|(_, o)| **o > f64::EPSILON)
+        .map(|(i, _)| i.to_string())
+        .collect::<Vec<String>>();
+    format!("occupied = [{}] of {} orbitals", occupied.join(", "), occ.len())
+}
+
 /* #endregion */
 
 /* #region Matrix Algorithms in RI-RHF code */
 
 pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
-    let device = crate::utilities::rstsr_util::device();
+    let device = DeviceBLAS::default();
 
     let natm = mol.natm_real;
     let coords = (0..natm).map(|i| mol.geom.get_coord(i)).flatten().collect::<Vec<f64>>();
@@ -996,9 +1304,95 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
     return 2.0 * (tsr_int1e_ipovlp * dme0.i((.., .., None))).sum_axes(1);
 }
 
+/// Index, inside `ederi_utp`, of the first auxiliary column this rank owns.
+///
+/// The stored RI tensor comes in two forms. The distributed form left behind by the SCF carries
+/// only the column block of this rank, so its first column *is* the first column of the block. The
+/// gathered form, which the RI-TDDFT response path still requests, carries every auxiliary column
+/// and the block starts at `c0`. Both forms are accepted so that one code path serves both,
+/// and any other column count is a programming error rather than something to guess about.
+fn local_aux_offset(n_cols: usize, c0: usize, c1: usize, naux_total: usize) -> usize {
+    if n_cols == naux_total {
+        c0
+    } else if n_cols == c1 - c0 {
+        0
+    } else {
+        panic!(
+            "the stored RI tensor has {n_cols} auxiliary columns, which is neither the complete \
+             basis ({naux_total} columns) nor the local block of this rank ({} columns); cannot \
+             locate the local auxiliary slice",
+            c1 - c0
+        )
+    }
+}
+
+/// All-gather the auxiliary-column contribution of a matrix that is distributed over the MPI
+/// ranks by columns, following the same `average_distribution` split as the stored RI tensor.
+///
+/// `local` holds the columns `c0..c1` of the global `[n_row, naux_total]` matrix, in one
+/// column-major block. Without MPI, or on a single process, the block already is the whole matrix
+/// and is returned unchanged. Otherwise the block is all-gathered with the same variable-count
+/// all-gather that the SCF uses for the complete RI tensor, so the column order of the result is
+/// the global one and every entry keeps the value the full contraction produced.
+fn allgather_aux_columns(
+    local: Tsr<f64>,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Tsr<f64> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        if mpi_op.size > 1 {
+            let n_row = local.shape()[0];
+            let n_col = local.shape()[1];
+            let device = local.device().clone();
+            let data = local.into_shape(-1).into_raw();
+            let local_matrix = MatrixFull::from_vec([n_row, n_col], data)
+                .expect("the local column block holds n_row * n_col elements");
+            let full = crate::mpi_io::mpi_allgather_matrixfull_columns(
+                &mpi_op.world,
+                &local_matrix,
+                naux_total,
+            );
+            return rt::asarray((full.data, full.size, &device));
+        }
+    }
+    let _ = naux_total;
+    local
+}
+
+/// `dm_tp` is the packed density on the row space of `ederi_utp`: the full pair space of an
+/// unpruned tensor, the stored rows of a storage-level pruned one (see [`RIMatrRowSpace`]).
 pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
+    let naux = ederi_utp.shape()[1];
+    get_itm_j_columns(j2c_decomp, ederi_utp, dm_tp, 0, naux, naux, &None)
+}
+
+/// Column-restricted `get_itm_j` for an RI tensor that is distributed over the MPI ranks.
+///
+/// Only the columns `c0..c1` of `ederi_utp` (the auxiliary block this rank owns) enter the
+/// contraction with the density. The partial vector is all-gathered before the auxiliary-basis
+/// transformation, so the returned `[naux_total]` vector is the one the full contraction produces,
+/// while the auxiliary transformation stays a shared operation on `[naux_total]`.
+pub fn get_itm_j_columns(
+    j2c_decomp: &J2CDecompose,
+    ederi_utp: TsrView<f64>,
+    dm_tp: TsrView<f64>,
+    c0: usize,
+    c1: usize,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Tsr<f64> {
     // see module level documentation for details
-    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp, true);
+    assert_eq!(
+        dm_tp.shape()[0],
+        ederi_utp.shape()[0],
+        "the density and the decomposed ERI must live on the same AO-pair row space"
+    );
+    let off = local_aux_offset(ederi_utp.shape()[1], c0, c1, naux_total);
+    let v_local =
+        (dm_tp % ederi_utp.i((.., off..off + (c1 - c0)))).into_shape([1, c1 - c0]);
+    let v = allgather_aux_columns(v_local, naux_total, mpi_operator).into_shape([naux_total]);
+    get_solved_j3c(v, j2c_decomp, true)
 }
 
 pub fn get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
@@ -1046,23 +1440,66 @@ pub fn get_itm_k_occtp(
     j2c_decomp: &J2CDecompose,
     ederi_utp: TsrView<f64>,
     weighted_occ_coeff: TsrView<f64>,
+    map: Option<&ri_jk::PairMap>,
+) -> Tsr<f64> {
+    let naux = ederi_utp.shape()[1];
+    get_itm_k_occtp_columns(j2c_decomp, ederi_utp, weighted_occ_coeff, map, 0, naux, naux, &None)
+}
+
+/// Column-restricted `get_itm_k_occtp` for an RI tensor that is distributed over the MPI ranks.
+///
+/// Assembling the intermediate is a per-auxiliary-function operation, so each rank fills only its
+/// own columns `c0..c1` of the `[nocc_tp, naux_total]` array and the columns are all-gathered
+/// before the auxiliary-basis transformation. The transformation itself still acts on the complete
+/// `[nocc_tp, naux_total]` array, which is small next to the `[nbaspar, naux]` RI tensor (about
+/// 307 MB against 6.56 GiB for (H2O)30), so the result is the one the serial path produces while the
+/// large tensor never leaves its distributed form.
+pub fn get_itm_k_occtp_columns(
+    j2c_decomp: &J2CDecompose,
+    ederi_utp: TsrView<f64>,
+    weighted_occ_coeff: TsrView<f64>,
+    map: Option<&ri_jk::PairMap>,
+    c0: usize,
+    c1: usize,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
 ) -> Tsr<f64> {
     // see module level documentation for details
     assert!(ederi_utp.f_prefer());
     assert!(weighted_occ_coeff.f_prefer());
 
+    let nao = weighted_occ_coeff.shape()[0];
     let nocc = weighted_occ_coeff.shape()[1];
-    let naux = ederi_utp.shape()[1];
     let nocc_tp = nocc * (nocc + 1) / 2;
     let device = ederi_utp.device().clone();
-    let tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
-    (0..naux).into_par_iter().for_each(|p| {
-        let ederi_bb = ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy);
+    let tmp_local: Tsr<f64> = unsafe { rt::empty(([nocc_tp, c1 - c0], &device)) };
+    // the stored tensor may already hold only the local block, so index it in its own frame
+    let off = local_aux_offset(ederi_utp.shape()[1], c0, c1, naux_total);
+    (c0..c1).into_par_iter().enumerate().for_each(|(p_loc, _)| {
+        let p = off + p_loc;
+        let ederi_bb = match map {
+            // the packed column of an unpruned tensor zips straight onto the upper triangle
+            None => ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy),
+            // a storage-level pruned tensor stores the retained rows only. The map carries their
+            // (mu, nu) and the dropped pairs stay zero, which is exactly the truncation that the
+            // energy contraction applies, so the derivative and the energy see one tensor.
+            Some(map) => {
+                let mut ederi_bb: Tsr<f64> = rt::zeros(([nao, nao], &device));
+                for (row, &[mu, nu]) in map.rows.iter().enumerate() {
+                    let (i, j) = (mu as usize, nu as usize);
+                    let value = ederi_utp[[row, p]];
+                    ederi_bb[[i, j]] = value;
+                    ederi_bb[[j, i]] = value;
+                }
+                ederi_bb
+            },
+        };
         let ederi_oo = weighted_occ_coeff.t() % ederi_bb % &weighted_occ_coeff;
 
-        let mut tmp = unsafe { tmp.force_mut() };
-        tmp.i_mut((.., p)).assign(ederi_oo.pack_triu());
+        let mut tmp_local = unsafe { tmp_local.force_mut() };
+        tmp_local.i_mut((.., p_loc)).assign(ederi_oo.pack_triu());
     });
+    let tmp = allgather_aux_columns(tmp_local, naux_total, mpi_operator);
     get_solved_j3c(tmp, j2c_decomp, true)
 }
 
@@ -1117,7 +1554,13 @@ pub fn get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_k_aux: Tsr
     return (tsr_int2c2e_ip1 * itm_k_aux.i((.., .., None))).sum_axes(1);
 }
 
-pub fn get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, itm_k_ao: TsrView<f64>) -> Tsr<f64> {
+/// `pair_mask` is the symmetric AO-pair mask of a storage-level pruned RI tensor: the derivative
+/// of the pruned energy never contracts a dropped pair, so the mask zeroes it out of the sum.
+pub fn get_grad_dao_k_int3c2e_ip1(
+    tsr_int3c2e_ip1: TsrView<f64>,
+    itm_k_ao: TsrView<f64>,
+    pair_mask: Option<&Tsr<f64>>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int3c2e_ip1.f_prefer());
     assert!(itm_k_ao.f_prefer());
@@ -1130,14 +1573,25 @@ pub fn get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, itm_k_ao: TsrVi
     (0..naux).into_par_iter().for_each(|p| {
         let mut tmp = unsafe { tmp.force_mut() };
         for t in 0..3 {
-            tmp.i_mut((.., t, p))
-                .assign(-2.0 * (tsr_int3c2e_ip1.i((.., .., p, t)) * itm_k_ao.i((.., .., p))).sum_axes(1));
+            let prod = tsr_int3c2e_ip1.i((.., .., p, t)) * itm_k_ao.i((.., .., p));
+            // the derivative of a storage-level pruned tensor never contracts a dropped pair
+            let prod = match pair_mask {
+                Some(mask) => prod * mask,
+                None => prod,
+            };
+            tmp.i_mut((.., t, p)).assign(-2.0 * prod.sum_axes(1));
         }
     });
     return tmp.sum_axes(-1);
 }
 
-pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrView<f64>) -> Tsr<f64> {
+/// `packed_mask` is the packed AO-pair mask of a storage-level pruned RI tensor, in the same row
+/// order as the packed column of the derivative integral.
+pub fn get_grad_daux_k_int3c2e_ip2(
+    tsr_int3c2e_ip2: TsrView<f64>,
+    itm_k_ao: TsrView<f64>,
+    packed_mask: Option<&Tsr<f64>>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int3c2e_ip2.f_prefer());
     assert!(itm_k_ao.f_prefer());
@@ -1154,6 +1608,11 @@ pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrV
             let idx = (u + 2) * (u + 1) / 2 - 1;
             itm_k_ao_p[[idx]] *= 0.5;
         }
+        // the derivative of a storage-level pruned tensor never contracts a dropped pair
+        let itm_k_ao_p = match packed_mask {
+            Some(mask) => itm_k_ao_p * mask,
+            None => itm_k_ao_p,
+        };
         let tmp = -2.0 * (itm_k_ao_p % tsr_int3c2e_ip2.i((.., p)));
 
         let mut daux_k_int3c2e_ip2 = unsafe { daux_k_int3c2e_ip2.force_mut() };

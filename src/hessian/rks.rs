@@ -68,7 +68,7 @@ pub fn add_vxc_h_partial(
     let nao_xc = mol_rks.num_basis;
     let natm_xc = mol_rks.geom.nfree;
     let n3_xc = natm_xc * 3;
-    let xc_type = if mol_rks.xc_data.use_density_gradient() {
+    let xc_type = if mol_rks.dfadef.use_density_gradient() {
         crate::dft::xc_deriv::XCType::GGA
     } else {
         crate::dft::xc_deriv::XCType::LDA
@@ -162,7 +162,7 @@ pub fn add_vxc_h_partial(
 /// involved.
 pub fn compute_vxc_h1ao(scf: &SCF) -> Vec<Vec<f64>> {
     let mol = &scf.mol;
-    let xct = if mol.xc_data.use_density_gradient() {
+    let xct = if mol.dfadef.use_density_gradient() {
         crate::dft::xc_deriv::XCType::GGA
     } else {
         crate::dft::xc_deriv::XCType::LDA
@@ -209,7 +209,7 @@ use tensors::MatrixFull;
 /// fxc work is attributed correctly.
 pub fn prepare_fxc_cache(scf: &SCF) -> Option<FxcHessianCache> {
     reset_fxc_timing();
-    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf.mol.dfadef.is_dfa_scf();
     if is_hf {
         None
     } else {

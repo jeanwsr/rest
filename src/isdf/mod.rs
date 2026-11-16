@@ -698,7 +698,7 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
     let mut atom_grids: Vec<dftgrids> = vec![];
 
     alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-        let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+        let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
             value.0.clone(),
             value.1.clone(),
             radial_precision,
@@ -711,6 +711,8 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             pruning.clone(),
             rad_grid_method.clone(),
             grid_gen_level,
+            gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust),
+            true,
         );
 
         let threshold = 1.0e-15;
@@ -748,6 +750,8 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             ao_compressed: None,
             aop_compressed: None,
             atm_idx: vec![center_index; ngrids],
+            ao_atm: Vec::new(),
+            atm_coords: Vec::new(),
             quadrature_weights: quad_r,
         };
         atom_grids.push(ao_grid)
@@ -1627,7 +1631,7 @@ pub fn prepare_m_isdf_dm_v2(k_mu: usize, mol: &mut Molecule, grids: &mut Option<
 
     // generate ao and aop again here (if needed)
     // copy from prepare_density_grids
-    if mol.xc_data.is_dfa_scf() || mol.ctrl.initial_guess == "vsap" {
+    if mol.dfadef.is_dfa_scf() || mol.ctrl.initial_guess == "vsap" {
         if let Some(dftgrids) = grids {
             dftgrids.ao_cutoff = mol.ctrl.ao_cutoff;
             if dftgrids.ao_cutoff > 0.0 {

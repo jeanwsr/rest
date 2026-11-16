@@ -53,9 +53,9 @@ impl CPHFSolverPySCF {
             if cutoff < 1.0e5 {
                 println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
             }
-            if start_mo > scf.mol.start_mo {
-                println!("  TDDFT frozen core: -2.00 Ha threshold, {} orbitals frozen (MO 0..{})",
-                    start_mo - scf.mol.start_mo, start_mo);
+            if start_mo > 0 {
+                println!("  TDDFT frozen core: {} orbitals frozen (MO 0..{})",
+                    start_mo, start_mo);
             }
         }
 
@@ -505,8 +505,8 @@ impl CPHFSolverPySCF {
         // naphthalene/def2-svp-rifit).  The matvec's K branch is already
         // guarded by `k_scaling != 0.0`, so nothing else changes.
         let _t_kl = std::time::Instant::now();
-        let is_hf_k = scf.mol.xc_data.dfa_compnt_scf.is_empty();
-        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+        let is_hf_k = !scf.mol.dfadef.is_dfa_scf();
+        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.dfadef.dfa_hybrid_scf };
         let k_lowrank = if hyb_k != 0.0 {
             KLowRankPrecompute::new(scf, &self.ws)
         } else {

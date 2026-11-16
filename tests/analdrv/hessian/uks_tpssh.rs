@@ -1,5 +1,6 @@
 use pyrest::analdrv::config::AnalDrvConfig;
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::response::uresp_interface::uscf_resp_interface;
 
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
@@ -41,7 +42,8 @@ fn test_nh3() {
     scf_without_build(&mut scf_data, &None);
 
     let config = AnalDrvConfig::default();
-    let (de, vib, _th) = uscf_hess_interface(&mut scf_data, &config.nucgrad, &config.resp);
+    let mut resp_obj = uscf_resp_interface(&scf_data, &config);
+    let (de, vib, _th) = uscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_obj);
 
     let natm = 4;
     let de = rt::asarray((&de, [3, 3, natm, natm]));

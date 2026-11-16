@@ -29,7 +29,7 @@ use crate::initial_guess::sap::*;
 use anyhow;
 //use crate::isdf::error_isdf;
 use crate::dft::DFA4REST;
-use crate::post_scf_analysis::mulliken::mulliken_pop;
+use crate::post_scf_analysis::mulliken::{mulliken_pop, mulliken_spin_pop};
 use crate::post_scf_analysis::spin_correction::apply_yamaguchi_spin_correction;
 
 //use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile};
@@ -64,7 +64,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
 
     // VERY IMPORTANCE: introduce mpi_operator:
-    let (mpi_operator , mut mpi_data)= MPIData::initialization();
+    let (mut mpi_operator , mut mpi_data)= MPIData::initialization();
 
     // Under MPI, every rank executes the same code, so an ungated print would appear once
     // per process in the merged output. The `print_level` gating in `Molecule::build`
@@ -96,12 +96,82 @@ pub fn main_driver() -> anyhow::Result<()> {
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
+    if crate::md::is_pure_mm_run(&ctrl_file) {
+        crate::md::run_pure_mm(&ctrl_file, &mpi_operator)?;
+        return Ok(());
+    }
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
     mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
+
+    // Storage-level AO-pair pruning ([ctrl.ri_jk] pair_screen_threshold > 0) rewrites the row
+    // space of the in-core RI tensor `rimatr`, and every consumer of that tensor has to address
+    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1), for
+    // the AO-to-MO transform that feeds the post-SCF correlation energy: the `ri3mo` route and the
+    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2), and
+    // for the analytic gradient of a hybrid functional (`grad/rhf.rs`, `grad/uhf.rs`, S3c). The
+    // response, Hessian, TDDFT and quasiparticle paths still index the tensor with the full-space
+    // pair tables, and would silently read the wrong rows instead of failing, so they stay
+    // refused here, and the entry points that were reachable from two of them now fail closed on
+    // their own (`ri_jk::require_unpruned_rimatr`).
+    if mol.ctrl.ri_jk.pair_screen_threshold > 0.0 {
+        let mut unsupported: Vec<&str> = Vec::new();
+        if !mol.ctrl.analdrv_tasks.is_empty() {
+            unsupported.push("analytical derivative tasks (analdrv_tasks)");
+        }
+        match mol.ctrl.job_type {
+            // The analytic gradient contracts `rimatr` through its pair map, and it shares the
+            // row set of the energy of the very same geometry, so a single point, a force
+            // calculation and a geometry optimization driven by that force are all consistent.
+            JobType::SinglePoint | JobType::Force | JobType::GeomOpt => {},
+            _ => unsupported.push(
+                "a job_type other than a single-point energy, a force calculation or a geometry \
+                 optimization (MD, normal modes and the numerical dipole change the geometry or \
+                 the field without freezing the pair mask)",
+            ),
+        }
+        if mol.ctrl.tddft.is_some() {
+            unsupported.push("TDDFT and response TDDFT (tddft)");
+        }
+        if mol.ctrl.hessian.is_some() {
+            unsupported.push("Hessian / frequency analysis (hessian)");
+        }
+        if mol.ctrl.quasiparticle_methods.is_some() {
+            unsupported.push("quasiparticle methods such as GW and BSE (quasiparticle_methods)");
+        }
+        // A numerical force differentiates the pruned energy across geometries, and the pair
+        // mask is rebuilt at every displaced geometry: the finite difference then crosses a
+        // change of the row set, and its error does not converge with the displacement. Freezing
+        // the mask of the reference geometry for the whole stencil is still to be implemented.
+        if mol.ctrl.numerical_force {
+            unsupported.push("a numerical force ([ctrl] numerical_force = true)");
+        }
+        if mol.ctrl.outputs.iter().any(|output| output.eq("num_force")) {
+            unsupported.push("numerical force output (outputs = \"num_force\")");
+        }
+        if !unsupported.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Storage-level AO-pair pruning is enabled ([ctrl.ri_jk] pair_screen_threshold = \
+                 {:e}). It is implemented for a single-point energy and for the post-SCF \
+                 correlation energy of that single point, but not for: {}. Set \
+                 pair_screen_threshold = 0.0 to run these paths.",
+                mol.ctrl.ri_jk.pair_screen_threshold,
+                unsupported.join(", ")
+            ));
+        }
+    }
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
     }
+    // `[ctrl] num_threads` and `[ctrl] max_memory` are per-process values, so a hybrid
+    // MPI + threads job has to divide the cores and the memory of a node by the number of ranks
+    // placed on it. Warn once at startup when the requested thread count of all processes
+    // together exceeds what this node offers. Only the root rank reaches this point with a
+    // standard output (the other ranks are redirected to /dev/null above).
+    utilities::memory_batch::warn_thread_oversubscription(
+        mol.ctrl.num_threads,
+        mpi_operator.as_ref().map(|mpi_op| mpi_op.size),
+    );
     let mut time_mark = initialize_time_record(&mol);
     time_mark.count_start("Overall");
 
@@ -310,6 +380,10 @@ pub fn main_driver() -> anyhow::Result<()> {
                     }
                     geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark, &mpi_operator)
                         .map_err(|e| anyhow::anyhow!("Geometry optimization (geometric_pyo3 engine) failed: {}", e))?;
+                    // MOM (`mom_gap_check = "last"`): one S0 SCF at the geometry the
+                    // optimization ended on, for the adiabatic gap of the final
+                    // structure (the per-step variant runs inside the state guard).
+                    scf_data.mom_final_gap_report(&mpi_operator);
                     println!("Geometry after relaxation [Ang]:");
                     println!("{}", scf_data.mol.geom.formated_geometry());
                     time_mark.count("geom_opt");
@@ -325,15 +399,50 @@ pub fn main_driver() -> anyhow::Result<()> {
         JobType::NormalModes => {
             eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
         },
+        JobType::MD => {
+            let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
+            let (sd, tm, mo) = crate::md::run_md(scf_data, time_mark, mpi_operator, &ctrl_file);
+            scf_data = sd;
+            time_mark = tm;
+            mpi_operator = mo;
+        },
         // ------------
         _ => {}
     }
 
-    if scf_data.mol.ctrl.check_stab {
-        time_mark.new_item("Stability", "the scf stability check");
+    // Stability mode resolution: `[tddft] stability` wins; the top-level
+    // `check_stab` (same string values) is the fallback. "auto" is the
+    // recommended value: it currently resolves to "full" (internal + external)
+    // inside `stability::stability` and may become method-aware in the future,
+    // whereas the meaning of "full" stays frozen.
+    let mut stab_mode = scf_data
+        .mol
+        .ctrl
+        .tddft
+        .as_ref()
+        .map_or(String::from("off"), |t| t.stability.clone());
+    if stab_mode == "off" {
+        stab_mode = scf_data.mol.ctrl.check_stab.clone();
+    }
+    if stab_mode != "off" {
+        time_mark.new_item("Stability", "the SCF stability analysis (TDDFT Hessian)");
         time_mark.count_start("Stability");
 
-        scf_data.stability();
+        match crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
+            Ok(report) => {
+                // Expose the Hessian roots in rest_results.json, grouped under
+                // "stability" like the "tddft" block (machine-readable
+                // regression input; the lowest internal root is the stability
+                // verdict quantity).
+                if !report.roots_internal.is_empty() || !report.roots_external.is_empty() {
+                    json_extra.insert("stability".to_string(), json!({
+                        "roots_internal": report.roots_internal,
+                        "roots_external": report.roots_external,
+                    }));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!("stability analysis failed: {e}")),
+        }
 
         time_mark.count("Stability");
     }
@@ -394,9 +503,20 @@ pub fn main_driver() -> anyhow::Result<()> {
                 println!("{:3}-{:3}: {:10.6}, Ghost Atom", i, atom, pop)
             };
         }
+        if scf_data.mol.spin_channel == 2 {
+            let spin_pop = mulliken_spin_pop(&scf_data);
+            println!("Mulliken spin population analysis (alpha - beta):");
+            for (i, (pop, atom)) in spin_pop.iter().zip(elem_tot.iter()).enumerate() {
+                if i < ghost_atm_start {
+                    println!("{:3}-{:3}: {:10.6}", i, atom, pop)
+                } else {
+                    println!("{:3}-{:3}: {:10.6}, Ghost Atom", i, atom, pop)
+                };
+            }
+        }
     }
     
-    post_scf_analysis::post_scf_output(&scf_data, &mpi_operator);
+    post_scf_analysis::post_scf_output(&mut scf_data, &mpi_operator);
 
     //====================================
     // Now for post-correlation calculations
@@ -438,7 +558,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
             if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.response_tddft {
+        // A stability analysis (`[tddft] stability != "off"` or the top-level
+        // `check_stab != "off"`, run above) is mutually exclusive with the
+        // excitation-energy run: a stability-only deck carries the [tddft]
+        // section for the stability keywords alone.
+        let stability_requested =
+            tddft_ctrl.stability != "off" || scf_data.mol.ctrl.check_stab != "off";
+        if !tddft_ctrl.response_tddft && !stability_requested {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             match crate::ri_tddft::tddft_main(&mut scf_data) {
@@ -510,6 +636,9 @@ pub fn main_driver() -> anyhow::Result<()> {
         println!("              REST: Mission accomplished");
         println!("====================================================");
         output_result(&scf_data);
+        if scf_data.mol.ctrl.oss_roks {
+            scf_data.evaluate_oss_quantities();
+        }
         time_mark.report_all();
     }
 
@@ -530,7 +659,35 @@ pub fn main_driver() -> anyhow::Result<()> {
 }
 
 pub fn output_result(scf_data: &scf_io::SCF) {
-    
+
+    //===========================================================
+    // 0a. ROKS (oss_roks): the Mission-accomplished block
+    //     prints the spin-purified singlet energies only. The first
+    //     line is the final ROKS total E_S of the requested method
+    //     ("oss_e_singlet": method-level for the PT2 family, SCF-level
+    //     otherwise); the second line, printed only when it differs
+    //     from the first, is the SCF-level E_S(KS) = 2 E_mix - E_T(KS),
+    //     the analogue of Q-Chem's ROKS "SCF energy in the final basis
+    //     set". E_mix is an intermediate construction (not a physical
+    //     state) and appears only in the rohf-oss report table; the
+    //     legacy "(R)-xDH energy" line would print E_mix(DH) and is
+    //     skipped for OSS jobs.
+    //===========================================================
+    if scf_data.mol.ctrl.oss_roks {
+        if scf_data.mol.ctrl.solvent_enabled {
+            println!("The solvent energy    : {:18.10} Ha", scf_data.energies.get("solvent_energy").unwrap()[0]);
+        }
+        if let Some(v) = scf_data.energies.get("oss_e_singlet") {
+            println!("The ROKS energy (E_S) : {:18.10} Ha", v[0]);
+        }
+        if let (Some(e_scf), Some(e)) = (scf_data.energies.get("oss_e_singlet_scf"), scf_data.energies.get("oss_e_singlet")) {
+            if (e_scf[0] - e[0]).abs() > 1.0e-10 {
+                println!("The ROKS SCF energy   : {:18.10} Ha", e_scf[0]);
+            }
+        }
+        return;
+    }
+
     //--------------------------
     // 0. Solvent energy
     //--------------------------
@@ -569,7 +726,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     // RPA
     //--------------------------
-    if scf_data.mol.xc_data.is_rpa() {
+    if scf_data.mol.dfadef.is_rpa() {
         if let Some(e) = yamaguchi_tot {
             println!("The RPA energy        : {:18.10} Ha", e);
         } else {
@@ -581,7 +738,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     // DH / ZRPS / SCSRPA
     //--------------------------
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         if let Some(e) = yamaguchi_tot {
             println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
@@ -623,6 +780,37 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     }
 
     //==================================================================
+    // MOM (`force_state_occupation`): is this still the state that was asked
+    // for? The guard compares the current determinant with the ground-state
+    // determinant built from the same orbitals (one extra Fock build), with the
+    // spin signature of the first converged step and with the tracked-orbital
+    // overlap (`SCF::mom_state_check`, docs/dscf_s1_geomopt_plan.md A3). It runs
+    // BEFORE the reference commit: a state that fails the check must not become
+    // the reference of the following steps.
+    //==================================================================
+    scf_data.mom_state_check(mpi_operator);
+
+    //==================================================================
+    // MOM: roll the maximum-overlap reference forward to this geometry step's
+    // converged orbitals, so that the next step of a geometry optimization
+    // compares against its own predecessor instead of against the first
+    // (Franck-Condon) geometry.
+    // No-op unless `[ctrl] mom_strategy = "step"` (the default) and an
+    // occupation constraint is present; nothing is committed when the SCF
+    // did not converge. See `SCF::mom_commit_reference`.
+    //==================================================================
+    scf_data.mom_commit_reference();
+
+    //==================================================================
+    // Store the open-shell singlet energies (E_mix / K_ab / E_T / E_S)
+    // so that the chkfile and the total-energy collection see the
+    // spin-purified ROKS total energy E_S = 2 E_mix - E_T
+    //==================================================================
+    if scf_data.mol.ctrl.oss_roks {
+        scf_data.store_oss_energies(mpi_operator);
+    }
+
+    //==================================================================
     // Save the converged SCF results to the chkfile
     //==================================================================
     if scf_data.mol.ctrl.has_chkfile {
@@ -641,7 +829,7 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     // Now evaluate the advanced correction energy for the given method
     //==================================================================
     //let mut time_mark = utilities::TimeRecords::new();
-    if let Some(dft_method) = &scf_data.mol.xc_data.dfa_family_pos {
+    if let Some(dft_method) = &scf_data.mol.dfadef.family_pos() {
         match dft_method {
             dft::DFAFamily::PT2 | dft::DFAFamily::SBGE2 => {
                 //time_mark.new_item("PT2", "the PT2 evaluation");
@@ -671,6 +859,16 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
         scf_data.energies.insert("ai_correction".to_string(), scc);
     }
 
+    //==================================================================
+    // Finalize the ROKS open-shell singlet energies at the method level:
+    // for the PT2 family the triplet components were cached by
+    // store_oss_energies while the DFT grids were alive; they are now
+    // combined with E_mix(DH) = xdh_energy into E_T(DH) / E_S(DH)
+    //==================================================================
+    if scf_data.mol.ctrl.oss_roks {
+        scf_data.store_oss_energies_finalize();
+    }
+
     let total_energy = collect_total_energy(scf_data);
     scf_data.energies.insert("total_energy".to_string(), vec![total_energy]);
     total_energy
@@ -682,10 +880,19 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     // Determine the total energy
     //====================================
     let mut total_energy = scf_data.scf_energy;
-    
-    if scf_data.mol.xc_data.is_rpa() {
+
+
+    if scf_data.mol.ctrl.oss_roks {
+        // ROKS: the total energy is the spin-purified open-shell singlet
+        // E_S = 2 E_mix - E_T, stored by store_oss_energies at the SCF
+        // level and overwritten by store_oss_energies_finalize with the
+        // method-level values for the PT2 family. This branch must come
+        // FIRST: for an OSS + double-hybrid job the xdh branch below would
+        // otherwise return E_mix(DH) instead of E_S(DH).
+        total_energy = scf_data.energies.get("oss_e_singlet").unwrap()[0];
+    } else if scf_data.mol.dfadef.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
-    } else if scf_data.mol.xc_data.is_fifth_dfa() {
+    } else if scf_data.mol.dfadef.is_fifth_dfa() {
         total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
     } else {
         total_energy = scf_data.scf_energy;
@@ -714,7 +921,7 @@ fn initialize_time_record(mol: &Molecule) -> utilities::TimeRecords {
         },
         _ => {}
     };
-    if let Some(dft_method) = &mol.xc_data.dfa_family_pos {
+    if let Some(dft_method) = &mol.dfadef.family_pos() {
         match dft_method {
             dft::DFAFamily::PT2 | dft::DFAFamily::SBGE2 => {
                 time_mark.new_item("PT2", "the PT2 evaluation");
@@ -744,9 +951,50 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     // currently, this framework could not work for post-scf,
     // especially that currently there's no class that represents post-scf computation
 
+    // ROKS forces are not implemented yet (Phase 2, Step 5): both the
+    // analytical RHF branch (wrong occupation handling) and the numerical
+    // branch (would differentiate E_mix, not E_S) would give wrong results.
+    if scf_data.mol.ctrl.oss_roks {
+        panic!("ERROR: rohf-oss: forces / geometry optimization are not yet supported for oss_roks (planned for Phase 2, Step 5)");
+    }
+
+    // A force / geometry-optimization step of a MOM state must not differentiate
+    // a state the SCF did not settle on: which determinant is being computed is
+    // decided by the overlap selection inside the SCF, so a non-converged step
+    // can belong to a *different* determinant than the previous one, and the
+    // optimizer would receive a discontinuous energy and a meaningless gradient.
+    // Fail closed instead of continuing silently.
+    if !scf_data.mol.ctrl.force_state_occupation.is_empty() && !scf_data.scf_converged {
+        panic!(
+            "ERROR: the SCF of this force / geometry-optimization step with force_state_occupation \
+             (MOM) did not converge (or the iteration was skipped with [ctrl] noiter), so the \
+             electronic state of this geometry is not defined and its gradient cannot be used. \
+             Either make the step converge -- raise [ctrl] max_scf_cycle, check scf_acc_rho / \
+             scf_acc_etot, add [ctrl] mix_param damping, or reduce the geometry step via \
+             [geometric_pyo3] tmax -- or verify the state by hand at this geometry first."
+        );
+    }
+
     time_mark.count_start("force");
     if scf_data.mol.ctrl.print_level>0 {
         println!("Force calculation invoked");
+    }
+
+    // 力阶段的内存监控：后台线程每 20 ms 采样 RSS 并跟踪峰值；只有用户要求时
+    // （`abort_on_mem_exceed`，缺省 true）才按 `[ctrl] max_memory` 中止。SCF 阶段不在覆盖范围内。
+    let mem_monitor = crate::utilities::memory_monitor::MemMonitor::start_from_ctrl(
+        scf_data.mol.ctrl.max_memory,
+        scf_data.mol.ctrl.abort_on_mem_exceed,
+        std::time::Duration::from_millis(20),
+    );
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!(
+            "  Memory monitor (force phase): limit = {}",
+            mem_monitor
+                .limit_mb()
+                .map(|m| format!("{:.1} MiB ({:.3} GiB, abort on exceed)", m, m / 1024.0))
+                .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
+        );
     }
 
     // `job_type = "excited_state_opt"` puts the geometry optimizer on the
@@ -771,7 +1019,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             println!("Gradient evaluation using numerical differentiation");
         }
         let displace = scf_data.mol.ctrl.nforce_displacement / BOHR;
-        let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
+        let (energy, nforce) = numerical_force(scf_data, displace, &mpi_operator);
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
         println!("------------------------------------");
@@ -780,40 +1028,59 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // current available analytical gradients methods:
         // 1) analytical RHF, UHF force
         // 2) dftd force
-        // 
-        // disallow post-scf calculations for force
-        if scf_data.mol.xc_data.is_fifth_dfa() {
+        // 3) doubly-hybrid (PT2-family) correlation gradient, as a separate entry
+        let is_dh = matches!(scf_data.mol.dfadef.family_pos(), Some(crate::dft::DFAFamily::PT2));
+        if scf_data.mol.dfadef.is_fifth_dfa() && !is_dh {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
+        }
+        if is_dh && mpi_operator.is_some() {
+            panic!("Analytic Gradient calculation of post-SCF methods is not MPI-parallelized yet.");
         }
 
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using Analytical differentiation");
         }
 
-        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed
-        // along the auxiliary-basis dimension: each rank stores only its column block
-        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over
-        // ranks). The analytical gradient routines require the complete `[n_baspar, naux]`
-        // matrix on every rank, so gather it in place before entering the gradient code.
-        // The same applies to `rimatr_sr` for range-separated hybrid (RSH) functionals.
-        // This is collective and must be executed by all ranks symmetrically.
-        let naux_total = scf_data.mol.num_auxbas;
-        if scf_data.rimatr.is_some() {
-            let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
-            let full_rimatr =
-                crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
-                    .unwrap_or(rimatr);
-            scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
-        }
-        if scf_data.rimatr_sr.is_some() {
-            let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
-            let full_rimatr_sr =
-                crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
-                    .unwrap_or(rimatr_sr);
-            scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed along
+        // the auxiliary-basis dimension: each rank stores only its column block
+        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over ranks).
+        // The analytic gradient reads exactly that local block: `grad::rhf::get_itm_j_columns` and
+        // `get_itm_k_occtp_columns` restrict the pair-row contraction to the columns this rank
+        // owns and all-gather only the small intermediates (a `[naux]` vector and a
+        // `[nocc_tp, naux]` array), so the complete `[n_baspar, naux]` matrix is *not* replicated
+        // on every rank any more. For (H2O)30 that replication cost 6.56 GiB per rank, which made
+        // the node footprint of a force job grow linearly with the number of ranks.
+        //
+        // The exception is the RI-TDDFT response gradient, which reads the complete tensor
+        // through the full-space pair tables and is not part of the validated MPI scope, so its
+        // path still gets the gathered form here. Any other consumer of the full matrix has to
+        // call `mpi_io::gather_full_rimatr` itself (it is idempotent, and returns the input when
+        // the tensor already carries every column).
+        let needs_full_rimatr = scf_data
+            .mol
+            .ctrl
+            .tddft
+            .as_ref()
+            .map_or(false, |tddft| tddft.tddft_grad_state > 0);
+        if needs_full_rimatr {
+            let naux_total = scf_data.mol.num_auxbas;
+            if scf_data.rimatr.is_some() {
+                let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
+                let full_rimatr =
+                    crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
+                        .unwrap_or(rimatr);
+                scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
+            }
+            if scf_data.rimatr_sr.is_some() {
+                let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
+                let full_rimatr_sr =
+                    crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
+                        .unwrap_or(rimatr_sr);
+                scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+            }
         }
 
-        let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
 
         // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.
@@ -823,6 +1090,30 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // and then summarize the total gradient at the end
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
+
+        // the DH (PT2-family) entry hands the total relaxed density back for the fchk density
+        // dump (`SCF::dh_rdm1_resp`, written out by the `outputs` pass)
+        let mut dh_rdm1_resp: Option<Vec<MatrixFull<f64>>> = None;
+
+        // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
+        // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
+        // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
+        let is_dh = matches!(scf_data.mol.dfadef.family_pos(), Some(crate::dft::DFAFamily::PT2));
+        let dh_needs_grids = {
+            let dfadef = &scf_data.mol.dfadef;
+            let has_libxc = |comps: Option<&Vec<crate::dft::parse_xc::DFAComponent>>| {
+                comps.map_or(false, |comps| {
+                    comps.iter().any(|c| c.component_type == crate::dft::parse_xc::ComponentType::Libxc)
+                })
+            };
+            let final_xc = has_libxc(dfadef.xc_nscf.as_ref());
+            let delta_hyb =
+                dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
+            final_xc || delta_hyb.abs() > 1.0e-10 || has_libxc(dfadef.xc_scf.as_ref())
+        };
+        if is_dh && dh_needs_grids && scf_data.grids.is_none() {
+            scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
+        }
 
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
@@ -850,6 +1141,21 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         };
         grad_data_list.push(("SCF".into(), grad_data_scf));
 
+        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the decomposed rimatr
+        if is_dh {
+            if !scf_data.mol.ctrl.spin_polarization {
+                let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            } else {
+                let mut grad_data_dh = crate::grad::udh::UDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            }
+        }
+
         // 2. dftd gradient data
         //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
         use crate::dftd::grad::DFTDGrad;
@@ -870,6 +1176,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
             }
+        }
+
+        // the gradient objects borrow `scf_data`; release them before handing the DH relaxed
+        // density to the fchk output pass — force jobs only
+        drop(grad_data_list);
+        if is_dh && matches!(scf_data.mol.ctrl.job_type, JobType::Force) {
+            scf_data.dh_rdm1_resp = dh_rdm1_resp;
         }
 
         // TDDFT analytic-gradient response for the requested excited state.
@@ -920,9 +1233,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
         println!("------------------------------------");
 
-        (scf_data.scf_energy, gradient)
+        // the total energy (fifth-DFA/rpa/ai correction included), consistent with the gradient
+        (collect_total_energy(scf_data), gradient)
     };
 
+    // Excited-state PES: `E_SCF(R) + Omega_S(R)`.  The BSE step stored Omega and its analytic
+    // response gradient (`dOmega_S/dR`) for this geometry, so the optimizer's force is the
+    // ground-state gradient plus that response term.
     if is_excited_state_opt {
         let omega = *scf_data
             .energies
@@ -970,13 +1287,24 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("-------------------------------------------------");
     }
 
+    // 力阶段峰值（监控线程 20 ms 一次采样），随后关掉监控线程
+    let force_peak_mb = mem_monitor.stage_peak_mb();
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!(
+            "  [mem] force phase peak RSS = {:.1} MiB ({:.3} GiB)",
+            force_peak_mb,
+            force_peak_mb / 1024.0
+        );
+    }
+    mem_monitor.stop();
+
     time_mark.count("force");
     time_mark.report("force");
 
     (energy, gradient)
 }
 
-fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
+pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
     scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");
@@ -1014,18 +1342,97 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
     return (energy, gradient);
 }
 
-// UNVERIFIED NORMAL MODES CALCULATION
+/// l2 norm of the density-matrix gradient of an SCF state (the quantity the SCF reports as
+/// `grad_dm l2`). Both spin channels are inspected so that this also works for UHF/UDFT.
+fn density_gradient_norm(scf_data: &SCF) -> f64 {
+    let l2 = |m: &MatrixFull<f64>| -> f64 {
+        m.data.iter().map(|x| x * x).sum::<f64>().sqrt()
+    };
+    (0..2).map(|i| l2(&scf_data.grad_dm[i])).fold(0.0, f64::max)
+}
+
+/// SCF of one displaced geometry, followed by its analytic gradient.
+///
+/// A numerical Hessian differentiates the analytic gradient, so a displaced SCF has to converge
+/// the *density gradient*, not merely stop moving the density. `initial_guess = "inherit"` can
+/// stall DIIS in a state that satisfies `scf_conv_criteria = "dm,eev"` while the density gradient
+/// is still O(1e-1) Ha, and the Hessian column fed by such a state is pure noise (measured on
+/// H2O: two spurious modes at -1800 cm^-1 that the analytic Hessian does not have). The inherited
+/// start is kept because it normally needs a handful of iterations, but its result is verified
+/// against `gate`; if it is unusable the displacement is redone from a fresh guess, and if that
+/// fails too the calculation stops instead of returning a meaningless Hessian.
+fn displaced_gradient(
+    scf_data: &SCF,
+    atm_idx: usize,
+    displacement: [f64; 3],
+    gate: f64,
+    time_mark: &mut utilities::TimeRecords,
+    mpi_operator: &Option<MPIOperator>,
+) -> MatrixFull<f64> {
+    let mut last_grad = f64::INFINITY;
+    for (attempt, guess) in ["inherit", "pao"].iter().enumerate() {
+        let mut displaced = scf_data.clone();
+        displaced.mol.geom.geom_shift(atm_idx, displacement.to_vec());
+        displaced.mol.ctrl.print_level = 0;
+        displaced.mol.ctrl.initial_guess = String::from(*guess);
+        initialize_scf(&mut displaced, mpi_operator);
+        let _ = performance_essential_calculations(&mut displaced, time_mark, mpi_operator);
+        last_grad = density_gradient_norm(&displaced);
+        if displaced.scf_converged && last_grad <= gate {
+            let (_, gradient) = eval_force(&mut displaced, time_mark, mpi_operator);
+            return gradient;
+        }
+        if attempt == 0 && scf_data.mol.ctrl.print_level > 0 {
+            eprintln!(
+                "  WARNING: the displaced SCF (atom {}, displacement [{}, {}, {}] Bohr) reported \
+                 convergence with a density gradient of {:.2e} Ha (limit {:.2e} Ha); retrying from \
+                 a fresh guess.",
+                atm_idx, displacement[0], displacement[1], displacement[2], last_grad, gate
+            );
+        }
+    }
+    panic!(
+        "The displaced SCF for atom {} (displacement [{}, {}, {}] Bohr, used by the numerical \
+         Hessian) did not converge: its density gradient is still {:.2e} Ha, above the {:.2e} Ha \
+         that a Hessian at this geometry requires. Tighten [ctrl] scf_acc_rho / scf_acc_eev, or \
+         add \"g\" to scf_conv_criteria.",
+        atm_idx, displacement[0], displacement[1], displacement[2], last_grad, gate
+    );
+}
+
 fn eval_normal_modes(
     scf_data: &mut SCF,
     time_mark: &mut utilities::TimeRecords,
     mpi_operator: &Option<MPIOperator>,
 ) {
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
 
-    let num_atoms = scf_data.mol.geom.nfree;
-    let dim = num_atoms * 3;
+    // The Hessian is built over the *free* atoms only: an atom frozen by the geometry fix flag has
+    // no degrees of freedom, so displacing it would cost two SCF jobs per column for a row and a
+    // column that cannot enter the analysis. `geom.nfree` is the count of free atoms, while the
+    // displacement loop and the analytic gradient are indexed by the *real* atom index, so the two
+    // have to be kept apart: using `nfree` as the atom count silently reduces the Hessian to the
+    // leading atoms when the input freezes any of them.
+    let natom = scf_data.mol.geom.elem.len();
+    let free_atoms: Vec<usize> = (0..natom)
+        .filter(|&atm| !scf_data.mol.geom.fix.get(atm).copied().unwrap_or(false))
+        .collect();
+    if free_atoms.is_empty() {
+        panic!(
+            "Normal modes calculation requires at least one atom that is not frozen \
+             (geometry fix flag 0)."
+        );
+    }
+    let nfree = free_atoms.len();
+    let dim = nfree * 3;
+    // A displaced SCF only has to be as converged as the reference state it starts from: the
+    // Hessian differentiates the gradient, and a stalled SCF shows up as a gradient that is
+    // orders of magnitude worse than the reference one, not as a slightly worse one. The floor
+    // of 1e-5 Ha keeps a very tight reference from demanding the impossible at a displaced
+    // geometry; the factor of 100 catches the stall (measured: 1.1e-1 Ha against 8.6e-10 Ha).
+    let displaced_gate = (density_gradient_norm(scf_data) * 1.0e2).max(1.0e-5);
     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
     let displace = displace_ang / BOHR; // convert Angstrom to Bohr
 
@@ -1034,7 +1441,10 @@ fn eval_normal_modes(
         println!("=========================================================");
         println!("      Vibrational Normal Modes (Frequency) Calculation");
         println!("=========================================================");
-        println!("Number of atoms:               {}", num_atoms);
+        println!("Number of atoms:               {}", natom);
+        if nfree != natom {
+            println!("Frozen atoms (excluded):       {}", natom - nfree);
+        }
         println!("Hessian dimension:             {}", dim);
         println!("Finite-difference displacement: {:.6} Bohr ({:.6} Ang)", displace, displace_ang);
         println!("Number of displaced SCF jobs:  {}", dim * 2);
@@ -1044,43 +1454,54 @@ fn eval_normal_modes(
     // Build Hessian via central finite difference of analytical gradients
     let mut hessian = MatrixFull::new([dim, dim], 0.0);
 
+    // Every displaced job calls `initialize_scf`, which rebuilds the three-center tensors and the
+    // density grids from the displaced geometry. Cloning the SCF with those tensors resident would
+    // therefore copy them 6N times only to overwrite them immediately, and would hold a second
+    // copy of them for the whole loop: on a large system that is GBs per displacement. Park them
+    // for the duration of the loop and hand them back afterwards, so `scf_data.clone()` below
+    // copies only the cheap state (geometry, control, density, orbitals).
+    let parked = (
+        scf_data.ijkl.take(),
+        scf_data.ri3fn.take(),
+        scf_data.ri3fn_sr.take(),
+        scf_data.ri3fn_isdf.take(),
+        scf_data.ri3fn_bse.take(),
+        scf_data.rimatr.take(),
+        scf_data.rimatr_sr.take(),
+        scf_data.rimatr_bse.take(),
+        scf_data.ri3mo.take(),
+        scf_data.ri3mo_full.take(),
+        scf_data.tab_ao.take(),
+        scf_data.m.take(),
+        scf_data.grids.take(),
+    );
+
     if scf_data.mol.ctrl.print_level > 0 {
         print!("  Hessian finite difference progress: ");
         io::stdout().flush().unwrap();
     }
 
-    for atm_idx in 0..num_atoms {
+    for (free_idx, &atm_idx) in free_atoms.iter().enumerate() {
         for xyz in 0..3 {
-            let col_idx = atm_idx * 3 + xyz;
+            let col_idx = free_idx * 3 + xyz;
 
             // +δ displacement
-            let mut vec_plus = vec![0.0; 3];
+            let mut vec_plus = [0.0; 3];
             vec_plus[xyz] = displace;
-            let mut scf_plus = scf_data.clone();
-            scf_plus.mol.geom.geom_shift(atm_idx, vec_plus);
-            scf_plus.mol.ctrl.print_level = 0;
-            scf_plus.mol.ctrl.initial_guess = String::from("inherit");
-            initialize_scf(&mut scf_plus, mpi_operator);
-            let _ = performance_essential_calculations(&mut scf_plus, time_mark, mpi_operator);
-            let (_, force_plus) = eval_force(&mut scf_plus, time_mark, mpi_operator);
+            let force_plus = displaced_gradient(scf_data, atm_idx, vec_plus, displaced_gate, time_mark, mpi_operator);
 
             // -δ displacement
-            let mut vec_minus = vec![0.0; 3];
+            let mut vec_minus = [0.0; 3];
             vec_minus[xyz] = -displace;
-            let mut scf_minus = scf_data.clone();
-            scf_minus.mol.geom.geom_shift(atm_idx, vec_minus);
-            scf_minus.mol.ctrl.print_level = 0;
-            scf_minus.mol.ctrl.initial_guess = String::from("inherit");
-            initialize_scf(&mut scf_minus, mpi_operator);
-            let _ = performance_essential_calculations(&mut scf_minus, time_mark, mpi_operator);
-            let (_, force_minus) = eval_force(&mut scf_minus, time_mark, mpi_operator);
+            let force_minus = displaced_gradient(scf_data, atm_idx, vec_minus, displaced_gate, time_mark, mpi_operator);
 
-            // Hessian column = (F(+) - F(-)) / (2δ)
-            // force_plus/minus are [3, num_atoms], we flatten to 3*num_atoms vector
-            for a in 0..num_atoms {
+            // Hessian column = (g(+) - g(-)) / (2δ).
+            // The analytic gradient is [3, natom] (component first) while the Hessian is indexed
+            // atom-major, so rows go through the same free-atom map as the columns.
+            for (row_free_idx, &row_atm) in free_atoms.iter().enumerate() {
                 for d in 0..3 {
-                    let row_idx = a * 3 + d;
-                    hessian[(row_idx, col_idx)] = (force_plus[(d, a)] - force_minus[(d, a)]) / (2.0 * displace);
+                    let row_idx = row_free_idx * 3 + d;
+                    hessian[(row_idx, col_idx)] = (force_plus[(d, row_atm)] - force_minus[(d, row_atm)]) / (2.0 * displace);
                 }
             }
 
@@ -1094,6 +1515,23 @@ fn eval_normal_modes(
     if scf_data.mol.ctrl.print_level > 0 {
         println!(" done");
     }
+
+    // hand the parked tensors back, so the caller sees the SCF it passed in
+    (
+        scf_data.ijkl,
+        scf_data.ri3fn,
+        scf_data.ri3fn_sr,
+        scf_data.ri3fn_isdf,
+        scf_data.ri3fn_bse,
+        scf_data.rimatr,
+        scf_data.rimatr_sr,
+        scf_data.rimatr_bse,
+        scf_data.ri3mo,
+        scf_data.ri3mo_full,
+        scf_data.tab_ao,
+        scf_data.m,
+        scf_data.grids,
+    ) = parked;
 
     // Symmetrize Hessian: H = (H + H^T) / 2
     for i in 0..dim {
@@ -1110,22 +1548,19 @@ fn eval_normal_modes(
     // Mass-weight Hessian: H̃_ij = H_ij / sqrt(m_i * m_j)
     let mut mw_hessian = MatrixFull::new([dim, dim], 0.0);
     for i in 0..dim {
-        let atom_i = i / 3;
-        let mass_i = mass_charge[atom_i].0; // mass in amu
+        let mass_i = mass_charge[free_atoms[i / 3]].0; // mass in amu
         for j in 0..=i {
-            let atom_j = j / 3;
-            let mass_j = mass_charge[atom_j].0;
+            let mass_j = mass_charge[free_atoms[j / 3]].0;
             let mw_val = hessian[(i, j)] / (mass_i * mass_j).sqrt();
             mw_hessian[(i, j)] = mw_val;
             mw_hessian[(j, i)] = mw_val;
         }
     }
 
-    // Diagonalize mass-weighted Hessian
-    let (eigenvectors, eigenvalues, info) = _dsyevd(&mw_hessian, 'V');
-    if info != 0 {
-        panic!("DSYEVD (diagonalization of mass-weighted Hessian) failed with info = {}", info);
-    }
+    // Diagonalize the mass-weighted Hessian. `_dsyevd` returns (eigenvectors, eigenvalues, n),
+    // where the third element is the matrix dimension, not a LAPACK `info`: the wrapper panics
+    // on a non-zero `info` itself, so a failed diagonalization never returns here.
+    let (eigenvectors, eigenvalues, _) = _dsyevd(&mw_hessian, 'V');
 
     let eigvec = eigenvectors.unwrap();
 
@@ -1181,12 +1616,19 @@ fn eval_normal_modes(
             println!("");
             println!("Mode {:4} (ω = {:12.4} cm⁻¹):", i + 1, freq);
             println!("{:>6} {:>14} {:>14} {:>14}", "Atom", "dX", "dY", "dZ");
-            for a in 0..num_atoms {
-                let dx = eigvec[(a * 3,     i)];
-                let dy = eigvec[(a * 3 + 1, i)];
-                let dz = eigvec[(a * 3 + 2, i)];
-                println!("{:>6} {:14.8} {:14.8} {:14.8}",
-                    scf_data.mol.geom.elem[a], dx, dy, dz);
+            // The eigenvector lives in the free-coordinate space; frozen atoms stay at zero.
+            for atom in 0..natom {
+                match free_atoms.iter().position(|&free_atm| free_atm == atom) {
+                    Some(block) => {
+                        let dx = eigvec[(block * 3,     i)];
+                        let dy = eigvec[(block * 3 + 1, i)];
+                        let dz = eigvec[(block * 3 + 2, i)];
+                        println!("{:>6} {:14.8} {:14.8} {:14.8}",
+                            scf_data.mol.geom.elem[atom], dx, dy, dz);
+                    },
+                    None => println!("{:>6} {:>14} {:>14} {:>14}   (frozen)",
+                        scf_data.mol.geom.elem[atom], "0.0", "0.0", "0.0"),
+                }
             }
         }
     }
@@ -1350,21 +1792,27 @@ mod geometric_pyo3_impl {
                 } else {
                     use crate::analdrv::hessian::hess_interface;
                     use crate::analdrv::response::rresp_interface::rscf_resp_interface;
+                    use crate::analdrv::response::uresp_interface::uscf_resp_interface;
+                    use crate::analdrv::response::RespSCF;
                     use rstsr::prelude::*;
 
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-                    // shared RHF response object for the hessian.
-                    // UHF builds its own internally, and will implement the UHF response interface in the future.
-                    let mut resp_objs = if matches!(scf_data.scftype, crate::scf_io::SCFType::RHF) {
-                        Some(rscf_resp_interface(&scf_data, &config))
-                    } else {
-                        None
+                    // post-SCF (fifth-DFA) methods have no analytic hessian; reject before any
+                    // response object is built (the DFT grids it would need are already freed)
+                    if scf_data.mol.dfadef.is_fifth_dfa() {
+                        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+                    }
+                    // shared response object for the hessian, per the SCF type
+                    let mut resp_objs = match scf_data.scftype {
+                        crate::scf_io::SCFType::RHF => Some(RespSCF::R(rscf_resp_interface(&scf_data, &config))),
+                        crate::scf_io::SCFType::UHF => Some(RespSCF::U(uscf_resp_interface(&scf_data, &config))),
+                        _ => None,
                     };
                     let hess_out = hess_interface(&scf_data, &config, resp_objs.as_mut());
                     let hess_raw = hess_out.hessian;
                     let natm = (hess_raw.len() / 9).isqrt();
                     assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
-                    let device = crate::utilities::rstsr_util::device();
+                    let device = DeviceBLAS::default();
                     let hess_rt = rt::asarray((&hess_raw, [3, 3, natm, natm].f(), &device));
                     let hess_rt = hess_rt.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
                     let hess_vec = hess_rt.into_shape(-1).into_vec();

@@ -54,6 +54,11 @@ pub trait UHessCoreAPI: AnalDrvBaseAPI {
 ///
 /// Difference to [`RHessElecInteractAPI`] is that we may need different signature. Basic ideas are
 /// exactly the same.
+///
+/// This trait contains only the hessian-specific skeleton contractions. Response-related
+/// functionalities (fock generation, response preparation and contraction) live in the separate
+/// [`URespAPI`](crate::analdrv::response::trait_uresp::URespAPI) and its own response objects;
+/// drivers that need both maintain separate lists of the two kinds of objects.
 pub trait UHessElecInteractAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
@@ -137,36 +142,4 @@ pub trait UHessElecInteractAPI: AnalDrvBaseAPI {
         let deriv1_ao = self.get_deriv1_ao(mo_coeff, mo_occ, atm_list);
         [&deriv1_ao[α] % &mocc[α], &deriv1_ao[β] % &mocc[β]]
     }
-
-    /// Prepare the data for response calculation.
-    ///
-    /// # Parameters
-    ///
-    /// - `mo_coeff` : shape `[nao, nmo_α]` and `[nao, nmo_β]`. Molecular orbital coefficients.
-    /// - `mo_occ` : shape `[nmo_α]` and `[nmo_β]`. Molecular orbital occupation numbers.
-    ///
-    /// # See also
-    ///
-    /// [`RHessElecInteractAPI::make_response_preparation`]. Signature difference: `mo_coeff` and
-    /// `mo_occ` type different.
-    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]);
-
-    /// Get the response contribution for current SCF component.
-    ///
-    ///
-    /// # Parameters
-    ///
-    /// - `bra` : shape `[nao, nocc_α, ...]` and `[nao, nocc_β, ...]`. The bra part for response
-    ///   calculation.
-    ///
-    /// # Returns
-    ///
-    /// - `resp_bra` : shape `[nao, nocc_α, ...]` and `[nao, nocc_β, ...]`. The response potential
-    ///   (related to second order of density matrix derivative to energy).
-    ///
-    /// # See also
-    ///
-    /// [`RHessElecInteractAPI::get_response_bra`]. Signature difference: input and output type
-    /// different.
-    fn get_response_bra(&mut self, bra: &[TsrView; 2]) -> [Tsr; 2];
 }

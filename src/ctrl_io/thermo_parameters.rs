@@ -93,10 +93,11 @@ impl Default for ThermoParameters {
 }
 
 /// Parse a temperature/pressure value into a list of points.
-/// - Number               -> single point
-/// - [x]                  -> single point
-/// - [min, max, step]     -> arithmetic scan range
-/// - [a, b, c, ...]       -> explicit list
+///
+/// - `Number`: single point
+/// - `[x]`: single point
+/// - `[min, max, step]`: arithmetic scan range
+/// - `[a, b, c, ...]`: explicit list
 fn parse_tp_list(value: &serde_json::Value, default: f64) -> Vec<f64> {
     match value {
         serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(default)],

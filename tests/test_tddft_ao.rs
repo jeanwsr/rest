@@ -9,6 +9,7 @@ use pyrest::ri_tddft::matvec_ao::{contract_back, transition_density, RimatrTuple
 use pyrest::ri_tddft::tddft::{FxcDriver, TDDFTData};
 use pyrest::ri_tddft::TDDFTMode;
 use pyrest::dft::xceff::prelude::XCDenType;
+use pyrest::scf_io::SCFType;
 use pyrest::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI};
 use rest_tensors::matrixupper::map_upper_to_full;
 use rest_tensors::MatrixFull;
@@ -130,10 +131,9 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
     let data = TDDFTData {
         mode: TDDFTMode::AO,
-        alpha_hybrid: 0.0,
         fxc: None,
-        c_occ: Some(c_occ),
-        c_vir: Some(c_vir),
+        c_occ: vec![c_occ],
+        c_vir: vec![c_vir],
         ni: None,
         fxc_eff: None,
         den_type: Some(den_type),
@@ -141,15 +141,9 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
         fxc_driver: Some(FxcDriver::MO),
         psi_occ: None,
         psi_occ_grad: None,
-        ri_ov: None,
-        ri_oo_exch: None,
-        ri_vv_exch: None,
-        ri_ov_exch: None,
-        coeff_full: 0.0,
-        coeff_sr: 0.0,
-        ri_oo_sr: None,
-        ri_vv_sr: None,
-        ri_ov_sr: None,
+        ri_terms: vec![],
+        fxc_u: None,
+        reftype: SCFType::RHF,
     };
     data
 }
@@ -162,8 +156,8 @@ fn test_b_exchange_uses_transposed_density() {
     let rimatr = synthetic_rimatr(nao, naux);
     let eri = four_index_integrals(&rimatr);
     let data = build_ao_data(1); // nvar irrelevant for exchange
-    let c_occ = data.c_occ.as_ref().unwrap();
-    let c_vir = data.c_vir.as_ref().unwrap();
+    let c_occ = &data.c_occ[0];
+    let c_vir = &data.c_vir[0];
     let occ = c_occ.size[1];
     let vir = c_vir.size[1];
     let z: Vec<f64> = pseudo(occ * vir, 16.7);
@@ -202,8 +196,8 @@ fn test_exchange_coeff_route_matches_dm() {
     let nao = 6; let naux = 4;
     let rimatr = synthetic_rimatr(nao, naux);
     let data = build_ao_data(1);
-    let c_occ = data.c_occ.as_ref().unwrap();
-    let c_vir = data.c_vir.as_ref().unwrap();
+    let c_occ = &data.c_occ[0];
+    let c_vir = &data.c_vir[0];
     let occ = c_occ.size[1];
     let vir = c_vir.size[1];
     let z: Vec<f64> = pseudo(occ * vir, 18.9);
@@ -292,3 +286,4 @@ fn test_b_exchange_transpose_identity() {
     }
     assert!(max_d < 1e-10, "B-block exchange identity violated: max|D| = {max_d:e}");
 }
+

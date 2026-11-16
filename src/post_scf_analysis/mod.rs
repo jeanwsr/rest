@@ -29,8 +29,11 @@ use self::molden_build::{gen_molden};
 use self::strong_correlation_correction::scc15_for_rxdh7;
 pub use crate::fileop::chkfile::{save_chkfile, save_hamiltonian, save_overlap, save_geometry};
 
-pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
-    scf_data.mol.ctrl.outputs.iter().for_each(|output_type| {
+pub fn post_scf_output(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
+    // the list is cloned so that the closure below can hold `scf_data` mutably (the numerical
+    // force driver parks and rebuilds the integral tensors inside)
+    let outputs = scf_data.mol.ctrl.outputs.clone();
+    outputs.iter().for_each(|output_type| {
         if output_type.eq("fchk") {
             if let Some(mpi_op) = &mpi_operator {
                 if mpi_op.rank == 0 {scf_data.save_fchk_of_gaussian();}
@@ -69,7 +72,8 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                     let dm = &scf_data.density_matrix;
                     let mo = &scf_data.eigenvectors;
                     let occ = &scf_data.occupation;
-                    scf_data.mol.xc_data.post_tabulated_exc(grids, dm, mo, occ);
+                    let funcs = scf_data.mol.dfadef.scf_func_list(scf_data.mol.spin_channel);
+                    crate::dft::post_tabulated_exc(&funcs, scf_data.mol.spin_channel, grids, dm, mo, occ);
                 } else {
                     panic!("The grids are not yet initialized");
                 }
@@ -162,9 +166,8 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
 
 
 pub fn print_out_dfa(scf_data: &SCF) {
-    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     let post_xc_energy = if let Some(grids) = &scf_data.grids {
-        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+        crate::dft::post_xc_exc(&scf_data.mol.ctrl.post_xc, scf_data.mol.spin_channel, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
     } else {
         vec![[0.0,0.0]]
     };
@@ -174,9 +177,8 @@ pub fn print_out_dfa(scf_data: &SCF) {
 }
 
 pub fn print_out_xc_potentials(scf_data: &SCF) {
-    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     let post_xc_energy = if let Some(grids) = &scf_data.grids {
-        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+        crate::dft::post_xc_exc(&scf_data.mol.ctrl.post_xc, scf_data.mol.spin_channel, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
     } else {
         vec![[0.0,0.0]]
     };
@@ -218,9 +220,7 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
 
     let mut timerecords = TimeRecords::new();
     let spin_channel = scf_data.mol.spin_channel;
-    let dfa_family_pos = if let Some(tmp_dfa) = &scf_data.mol.xc_data.dfa_family_pos {
-        tmp_dfa.clone()
-    } else {crate::dft::DFAFamily::Unknown};
+    let dfa_family_pos = scf_data.mol.dfadef.family_pos().unwrap_or(crate::dft::DFAFamily::Unknown);
 
     if let None = scf_data.ri3mo {
         let (occ_range, vir_range) = crate::scf_io::determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
@@ -351,30 +351,7 @@ fn announce_gw_skipped(scf_data: &SCF, output_type: &str) {
 /// This is the *only* place the gradient driver gives them up; the escape hatch
 /// `REST_KEEP_GRID_AO=1` restores the historical behaviour for an A/B comparison.
 fn precompute_vxc_and_release_grid_ao(scf_data: &mut SCF) -> ri_gw::gw_grad::GwVxc {
-    let vxc = ri_gw::gw_grad::GwGradEngine::precompute_vxc(scf_data);
-    if std::env::var("REST_KEEP_GRID_AO").is_ok() {
-        return vxc;
-    }
-    // The only post-SCF consumer outside this gradient is the TDDFT-eigenvalue route
-    // (`num_int::prepare_fxc_data`), which runs *after* the QP section in `main_driver` and
-    // reads the compressed tables directly instead of re-evaluating.  A card that asks for
-    // both keeps the tables (the historical behaviour).
-    if scf_data.mol.ctrl.tddft.is_some() {
-        return vxc;
-    }
-    if let Some(grids) = scf_data.grids.as_mut() {
-        let freed = grids.release_tabulated_ao();
-        if freed > 0 {
-            crate::hessian::memory_monitor::trim_to_os(0);
-            if scf_data.mol.ctrl.print_level >= 1 {
-                println!(
-                    " [qp] released {:.0} MB of tabulated DFT-grid AO (the GW/BSE gradient evaluates its own AO)",
-                    freed as f64 / 1.0e6
-                );
-            }
-        }
-    }
-    vxc
+    ri_gw::gw_grad::GwGradEngine::precompute_vxc(scf_data)
 }
 
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
@@ -493,11 +470,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn_spin: Option<[Vec<f64>;2]> = if scf_data.mol.spin_channel==2 {
                 Some(ri_gw::vxc_ao2mo_spin(scf_data))
             } else { None };
-            let xc_data=scf_data.mol.xc_data.clone();
-            println!("Current XC data:");
-            println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
-            println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
-            println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
+            scf_data.mol.dfadef.summary();
             if qp_ctrl.homo_lumo_gw_qp==true{
                 ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
             }else if qp_ctrl.self_energy_spectrum_test==true{
@@ -1904,7 +1877,7 @@ fn report_analytic_gradient(scf_data:&mut SCF, label:&str, grad:&[f64]) {
 /// using the latter on a DFT reference leaves the xc term out entirely.
 fn reference_gradient(scf_data:&SCF) -> Vec<f64> {
     let mut gs = crate::grad::rhf::RIRHFGradient::new(scf_data, &None);
-    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+    if !scf_data.mol.dfadef.is_dfa_scf() {
         gs.calc();
     } else {
         gs.calc_rks();

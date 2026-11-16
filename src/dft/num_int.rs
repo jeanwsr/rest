@@ -6,6 +6,7 @@ use rest_tensors::{MatrixFull, MatrixFullSlice, RIFull};
 use rest_tensors::matrix_blas_lapack::{ _einsum_01_serial, _einsum_02_serial};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use tensors::matrix_blas_lapack::{_dgemm};
+use libxc::prelude::LibXCFunctional;
 use rayon::iter::{
     ParallelIterator, IndexedParallelIterator,
     plumbing::{Consumer, Folder, Producer, ProducerCallback, bridge},
@@ -13,13 +14,72 @@ use rayon::iter::{
 use crate::scf_io::SCF;
 use crate::molecule_io::Molecule;
 use crate::basis_io::{spheric_gto_deriv_batch_serial};
-use crate::dft::{Grids, DFA4REST};
+use crate::dft::Grids;
 use crate::dft::xc_deriv::XCType;
 use crate::scf_io::util::occupied_orbital_count_with_threshold;
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 use rest_libcint::prelude::CInt;
 
+
+/// Wall-clock accumulators (nanoseconds, summed across rayon workers) for the
+/// parallel grid-block pipeline that feeds the analytical XC gradient.
+/// The gradient driver (`grad::rks::calc_de_xc`) resets them right before the
+/// block loop and reports the totals at `print_level >= 2`, so the
+/// AO-evaluation / rho+XC / contraction split can be read from the log
+/// without an external profiler.
+pub static GRID_BLOCK_AO_NS: AtomicU64 = AtomicU64::new(0);
+pub static GRID_BLOCK_RHOXC_NS: AtomicU64 = AtomicU64::new(0);
+pub static GRID_BLOCK_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
+pub static GRID_BLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Sum of the per-block active (locality-screened) basis counts; averaged by
+/// the gradient driver to report the effective compression of the screened
+/// contraction.
+pub static GRID_BLOCK_ACTIVE_SUM: AtomicU64 = AtomicU64::new(0);
+/// Sub-split of `GRID_BLOCK_AO_NS`: time inside the per-atom GTO evaluator
+/// (`spheric_gto_deriv_batch_serial`) versus the screening+assembly around it.
+pub static GRID_BLOCK_GTO_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Z-order (Morton) permutation of grid points: sorting points by this order
+/// makes contiguous index ranges spatially compact, which is what the block
+/// locality screening in the XC gradient pipeline exploits. The sort only
+/// reorders quadrature points, so it changes results at the level of floating
+/// point summation order (roundoff), nothing else.
+pub fn morton_order(coords: &[[f64; 3]]) -> Vec<usize> {
+    fn spread(v: u32) -> u64 {
+        let mut x = (v as u64) & 0x1F_FFFF;
+        x = (x | (x << 32)) & 0x1F00_0000_00FF_FFFF;
+        x = (x | (x << 16)) & 0x1F00_00FF_0000_FFFF;
+        x = (x | (x << 8)) & 0x100F_00F0_0F00_F00F;
+        x = (x | (x << 4)) & 0x10C3_0C30_C30C_30C3;
+        x = (x | (x << 2)) & 0x1249_2492_4924_9249;
+        x
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for c in coords {
+        for k in 0..3 {
+            lo[k] = lo[k].min(c[k]);
+            hi[k] = hi[k].max(c[k]);
+        }
+    }
+    // 21-bit quantization per axis inside the bounding box
+    let scale: Vec<f64> = (0..3)
+        .map(|k| if hi[k] > lo[k] { (0x1F_FFFE as f64) / (hi[k] - lo[k]) } else { 0.0 })
+        .collect();
+    let key = |c: &[f64; 3]| -> u64 {
+        let q = |k: usize| -> u32 { ((c[k] - lo[k]) * scale[k]) as u32 };
+        spread(q(0)) | (spread(q(1)) << 1) | (spread(q(2)) << 2)
+    };
+    let mut perm: Vec<usize> = (0..coords.len()).collect();
+    perm.sort_by_cached_key(|&i| key(&coords[i]));
+    perm
+}
+
+// The locality-screening primitives (`atom_influence_radii`, `block_bbox`,
+// `atom_reaches_block`, `screen_rows_by_value`) live in `dft::locality`,
+// shared with the SCF sparse AO tabulation (`Grids::prepare_tabulated_ao_sparse`).
+use crate::dft::locality::{atom_influence_radii, atom_reaches_block, block_bbox, screen_rows_by_value};
 
 pub fn eval_ao_batch(mol:&Molecule, coords:&[[f64; 3]], ao_deriv:usize, num_grids:usize) -> RIFull<f64> {
     // let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
@@ -548,8 +608,8 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     let (start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
         tddft_occupation_parameters(scf);
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -559,7 +619,7 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -658,9 +718,8 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -740,8 +799,8 @@ fn prepare_fxc_data_impl(
     vir_size: usize,
     lumo: usize,
 ) -> FXCMatvecData {
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -751,7 +810,7 @@ fn prepare_fxc_data_impl(
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -848,9 +907,8 @@ fn prepare_fxc_data_impl(
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -977,8 +1035,8 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
     let nvir = [p0.3, p1.3];
     let lumo = [p0.5, p1.5];
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -988,7 +1046,7 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -1110,9 +1168,8 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
         raw[offset..offset + ngrids * nvar * 2].to_vec()
     };
 
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(2);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 1, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available for unrestricted TDDFT");
 
@@ -2132,8 +2189,8 @@ pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
     let (start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
         tddft_occupation_parameters(scf);
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -2210,9 +2267,8 @@ pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
         raw[offset..offset + ngrids * nvar].to_vec()
     };
 
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available");
     let fxc_raw: Vec<f64> = {
@@ -2532,12 +2588,17 @@ pub struct BlockData<'a> {
     pub coords: &'a [[f64; 3]],
     pub weights: &'a [f64],
     pub ao: RIFull<f64>, // atomic orbitals evaluated on grids
+    /// Global basis-function indices of the rows of `ao` when the block was
+    /// locality-screened (`ao` is then the compact [n_active, ngrids, ncomp]
+    /// table); `None` means the dense, unscreened [nao, ngrids, ncomp] table.
+    pub active_bas: Option<Vec<usize>>,
 }
 
 pub struct XCData<'a> {
     pub xc_type: XCType,
-    pub xc_code: &'a Vec<usize>,
-    pub xc_params: &'a Vec<f64>,
+    /// The initialized `(factor, functional)` list to evaluate, converted from the DFA
+    /// components at construction (the evaluation currency since P5-d; no code arrays).
+    pub funcs: Vec<(f64, LibXCFunctional)>,
     pub device: DeviceOpenBLAS,
     pub dm: &'a Vec<MatrixFull<f64>>, 
     pub mo_coeffs: Option<Vec<MatrixFull<f64>>>,
@@ -2590,6 +2651,7 @@ impl<'a> Iterator for GridIterator<'a> {
             coords: &self.grids.coordinates[start..end],
             weights: &self.grids.weights[start..end],
             ao: ao,
+            active_bas: None,
         })
     }
 }
@@ -2600,6 +2662,13 @@ struct GridBlockProducer<'a> {
     grids: &'a Grids,
     settings: BlockSettings,
     total_grids: usize,
+    /// Per-atom influence radii (bohr) used to skip atoms that cannot
+    /// contribute above `row_cutoff` anywhere in the block; empty means the
+    /// dense, unscreened path.
+    active_radii: std::sync::Arc<Vec<f64>>,
+    /// Row-keep threshold for the locality screen (magnitude of the AO value
+    /// at any block point); <= 0 disables screening.
+    row_cutoff: f64,
     /// Range of block indices this producer owns, [block_start, block_end).
     block_range: Range<usize>,
 }
@@ -2617,8 +2686,100 @@ impl<'a> GridBlockProducer<'a> {
         let num_grids = end - start;
         let coords = &self.grids.coordinates[start..end];
         let weights = &self.grids.weights[start..end];
-        let ao = eval_ao_batch(self.mol, coords, self.settings.ao_deriv, num_grids);
-        BlockData { coords, weights, ao }
+        let t_ao = std::time::Instant::now();
+        if self.row_cutoff <= 0.0 {
+            let ao = eval_ao_batch(self.mol, coords, self.settings.ao_deriv, num_grids);
+            GRID_BLOCK_AO_NS.fetch_add(t_ao.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            GRID_BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            GRID_BLOCK_ACTIVE_SUM.fetch_add(self.mol.num_basis as u64, Ordering::Relaxed);
+            return BlockData { coords, weights, ao, active_bas: None };
+        }
+        let (ao, active_bas) = self.eval_ao_batch_screened(coords);
+        if active_bas.is_empty() {
+            // Degenerate block (every AO value below the cutoff): fall back to
+            // the dense table so downstream never sees an empty contraction.
+            let ao = eval_ao_batch(self.mol, coords, self.settings.ao_deriv, num_grids);
+            GRID_BLOCK_AO_NS.fetch_add(t_ao.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            GRID_BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            GRID_BLOCK_ACTIVE_SUM.fetch_add(self.mol.num_basis as u64, Ordering::Relaxed);
+            return BlockData { coords, weights, ao, active_bas: None };
+        }
+        GRID_BLOCK_AO_NS.fetch_add(t_ao.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        GRID_BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+        GRID_BLOCK_ACTIVE_SUM.fetch_add(active_bas.len() as u64, Ordering::Relaxed);
+        BlockData { coords, weights, ao, active_bas: Some(active_bas) }
+    }
+
+    /// Locality-screened AO evaluation: keep only the atoms whose influence
+    /// radius reaches the block's bounding box, evaluate them with
+    /// `spheric_gto_deriv_batch_serial`, then keep only the basis rows whose
+    /// value exceeds `row_cutoff` at some point of the block. Returns the
+    /// compact [n_active, num_grids, ncomp] table and the global basis
+    /// indices of its rows.
+    fn eval_ao_batch_screened(&self, coords: &[[f64; 3]]) -> (RIFull<f64>, Vec<usize>) {
+        let num_grids = coords.len();
+        let ao_deriv = self.settings.ao_deriv;
+        let ncomp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
+
+        // block bounding box (shared helper)
+        let (lo, hi) = block_bbox(coords);
+
+        // per-atom passes: (global kept rows, per-component tables)
+        let mut parts: Vec<(usize, Vec<usize>, Vec<MatrixFull<f64>>)> = Vec::new();
+        let mut n_active = 0usize;
+        for (iatom, (elem, geom)) in self
+            .mol
+            .basis4elem
+            .iter()
+            .zip(self.mol.geom.rg_position.iter_columns_full())
+            .enumerate()
+        {
+            let mut center = [0.0_f64; 3];
+            center.iter_mut().zip(geom.iter()).for_each(|(c, v)| *c = *v);
+            if !atom_reaches_block(&center, self.active_radii[iatom], &lo, &hi) {
+                continue;
+            }
+            let t_gto = std::time::Instant::now();
+            let tab = spheric_gto_deriv_batch_serial(coords, &center, elem, ao_deriv);
+            GRID_BLOCK_GTO_NS.fetch_add(t_gto.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let bas_start = elem.global_index.0;
+            // keep a row when its value exceeds the cutoff at some block point
+            // (same predicate as the SCF sparse AO tabulation)
+            let kept = screen_rows_by_value(&tab[0], num_grids, self.row_cutoff);
+            if kept.is_empty() {
+                continue;
+            }
+            n_active += kept.len();
+            parts.push((bas_start, kept, tab));
+        }
+
+        // assemble the compact [n_active, num_grids, ncomp] column-major table;
+        // every element is written exactly once below, so skip the zero-init
+        let mut data: Vec<f64> = Vec::with_capacity(n_active * num_grids * ncomp);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            data.set_len(n_active * num_grids * ncomp);
+        }
+        let mut active_bas: Vec<usize> = Vec::with_capacity(n_active);
+        let mut row0 = 0usize;
+        for (bas_start, kept, tab) in &parts {
+            for c in 0..ncomp {
+                let src = &tab[c];
+                let comp_base = c * n_active * num_grids;
+                // g outer / row inner: contiguous writes into the destination
+                // column, gathered reads from the (short) source column
+                for g in 0..num_grids {
+                    let dst = &mut data[comp_base + g * n_active + row0..comp_base + g * n_active + row0 + kept.len()];
+                    for (r, &lr) in kept.iter().enumerate() {
+                        dst[r] = src[[lr, g]];
+                    }
+                }
+            }
+            active_bas.extend(kept.iter().map(|&lr| bas_start + lr));
+            row0 += kept.len();
+        }
+        let ao = RIFull::from_vec([n_active, num_grids, ncomp], data).unwrap();
+        (ao, active_bas)
     }
 }
 
@@ -2674,15 +2835,17 @@ impl<'a> Producer for GridBlockProducer<'a> {
     }
 
     fn split_at(self, index: usize) -> (Self, Self) {
-        let GridBlockProducer { mol, grids, settings, total_grids, block_range } = self;
+        let GridBlockProducer { mol, grids, settings, total_grids, active_radii, row_cutoff, block_range } = self;
         let mid = block_range.start + index;
         (
             GridBlockProducer {
                 mol, grids, settings, total_grids,
+                active_radii: active_radii.clone(), row_cutoff,
                 block_range: block_range.start..mid,
             },
             GridBlockProducer {
                 mol, grids, settings, total_grids,
+                active_radii, row_cutoff,
                 block_range: mid..block_range.end,
             },
         )
@@ -2709,6 +2872,8 @@ pub struct GridParallelIterator<'a> {
     settings: BlockSettings,
     total_grids: usize,
     num_blocks: usize,
+    active_radii: std::sync::Arc<Vec<f64>>,
+    row_cutoff: f64,
 }
 
 impl<'a> GridParallelIterator<'a> {
@@ -2720,7 +2885,21 @@ impl<'a> GridParallelIterator<'a> {
         let total_grids = grids.weights.len();
         let num_blocks = if total_grids == 0 { 0 }
             else { (total_grids + settings.blksize - 1) / settings.blksize };
-        Self { mol, grids, settings, total_grids, num_blocks }
+        // Locality screening for the gradient pipeline: the row-keep cutoff is
+        // tighter than `ao_cutoff` to cover the amplification of the AO first
+        // and second derivatives used by the gradient contraction. Disabled
+        // when `ao_cutoff <= 0` (exact, dense path).
+        let row_cutoff = if mol.ctrl.ao_cutoff > 0.0 {
+            mol.ctrl.ao_cutoff * 1.0e-3
+        } else {
+            0.0
+        };
+        let active_radii = if row_cutoff > 0.0 {
+            std::sync::Arc::new(atom_influence_radii(mol, row_cutoff))
+        } else {
+            std::sync::Arc::new(Vec::new())
+        };
+        Self { mol, grids, settings, total_grids, num_blocks, active_radii, row_cutoff }
     }
 }
 
@@ -2760,6 +2939,8 @@ impl<'a> IndexedParallelIterator for GridParallelIterator<'a> {
             grids: self.grids,
             settings: self.settings,
             total_grids: self.total_grids,
+            active_radii: self.active_radii.clone(),
+            row_cutoff: self.row_cutoff,
             block_range: 0..self.num_blocks,
         })
     }
@@ -2785,302 +2966,306 @@ pub trait NumInt<'a> {
     fn par_block_loop(
         &'a self,
         mol: &'a Molecule,
-        grids: &'a mut Grids,
+        grids: &'a Grids,
         settings: BlockSettings,
     ) -> GridParallelIterator<'a> {
         GridParallelIterator::new(mol, grids, settings)
     }
 }
 
+// Kept for reference (dead since introduction, see !16): the canonical NumInt impl on
+// DFA4REST never had a call site; the live gen_xc_data receivers are the gradient
+// structs. To re-enable, also restore `use crate::dft::DFA4REST;`.
+// impl<'a> NumInt<'a> for DFA4REST {
+//     fn gen_xc_data(&'a self, scf_data: &'a SCF, spin: usize) -> XCData<'a> {
+//         let xc_type = if self.use_kinetic_density() {
+//             XCType::MGGA
+//         } else if self.use_density_gradient() {
+//             XCType::GGA
+//         } else {
+//             XCType::LDA
+//         };
+//
+//         let xc_code = self.dfa_compnt_scf.clone();
+//         let xc_params = self.dfa_paramr_scf.clone();
+//
+//         let density_matrix = &scf_data.density_matrix;
+//         let mo_coeffs = scf_data.eigenvectors.clone().to_vec();
+//         let mo_occ = scf_data.occupation.clone().to_vec();
+//
+//         let device = DeviceOpenBLAS::default();
+//
+//         XCData {
+//             xc_type,
+//             xc_code,
+//             xc_params,
+//             device: device,
+//             dm: density_matrix,
+//             mo_coeffs: Some(mo_coeffs),
+//             occ: Some(mo_occ),
+//         }
+//     }
+//
+//     fn get_fxc(
+//         &'a self,
+//         xc_data0: &'a XCData,
+//         xc_data1: &'a XCData,
+//         grids: &mut Grids,
+//         mol: &Molecule,
+//         spin: usize,
+//     ) -> Vec<MatrixFull<f64>> {
+//         todo!("get_fxc has not yet implemented for DFA4REST");
+//     }
+//
+//     fn get_vxc(
+//         &'a self,
+//         xc_data: &'a XCData,
+//         grids: &mut Grids,
+//         mol: &Molecule,
+//         spin: usize,
+//     ) -> (Vec<f64>, Vec<f64>, Vec<MatrixFull<f64>>) {
+//
+//         let num_grids = grids.weights.len();
+//         let num_basis = mol.num_basis;
+//         // determine block settings 
+//         let ao_deriv = match xc_data.xc_type {
+//             XCType::HF => 0usize,
+//             XCType::LDA => 0usize,
+//             XCType::GGA => 1usize,
+//             XCType::MGGA => 1usize,
+//         };
+//         let max_memory = if let Some(max_memory) = mol.ctrl.max_memory {
+//             max_memory as usize
+//         } else {
+//             2000 as usize // default to 2000 MB
+//         };  
+//         let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6; // number of components for ao derivatives 
+//         let blksize = max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis);
+//         let blksize = blksize.min(num_grids).max(4); 
+//         let block_settings = BlockSettings {
+//             ao_deriv,
+//             max_memory,
+//             blksize,
+//         };
+//
+//         let device = &xc_data.device;
+//
+//         let mut nelec = vec![0.0; spin+1];
+//         let mut exc_sum = vec![0.0; spin+1];
+//         let mut vxc = rt::zeros(([num_basis, num_basis, spin + 1], device));
+//         let mut vxc_mgga_temp = match xc_data.xc_type {
+//             XCType::MGGA => Some(rt::zeros(([num_basis, num_basis, spin + 1], device))),
+//             _ => None,
+//         };
+//         let grids_iterator = self.block_loop(mol, grids, block_settings);
+//         // calculation starts here 
+//         let deriv = 1usize;          
+//         grids_iterator.into_iter().for_each(
+//             |block| 
+//             {
+//                 let num_grids = block.weights.len();
+//                 let loc_rho = if let Some(mo_coeffs) = &xc_data.mo_coeffs {
+//                     eval_rho5_batch(&block.ao, xc_data.xc_type, mo_coeffs, xc_data.occ.as_ref().unwrap(), spin, num_grids)
+//                 } else {
+//                     eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, xc_data.dm, spin, num_grids)
+//                 };
+//                 let shape = loc_rho.shape().clone();
+//
+//                 let rho_array = loc_rho.into_vec();
+//                 let loc_xc_tensor = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, spin, &rho_array, num_grids, deriv);
+//
+//                 let loc_rho = rt::asarray((rho_array, shape, device));
+//                 // let loc_exc = rt::asarray((&loc_xc_tensor[0].unwrap()));
+//                 // let loc_vxc = rt::asarray((&loc_xc_tensor[1].unwrap()));
+//
+//                 let loc_exc = if let Some(exc) = loc_xc_tensor[0].as_ref() {
+//                     rt::asarray(exc)
+//                 } else {
+//                     panic!("Exchange-correlation energy is not provided for the given xc_type: {:?}", xc_data.xc_type);
+//                 };
+//
+//                 let loc_vxc = if let Some(vxc) = loc_xc_tensor[1].as_ref() {
+//                     rt::asarray(vxc)
+//                 } else {
+//                     panic!("Exchange-correlation potential is not provided for the given xc_type: {:?}", xc_data.xc_type);
+//                 };
+//
+//                 let loc_weights = rt::asarray((block.weights, device));
+//
+//                 let ao_shape = vec![num_basis, num_grids, ao_comp];
+//                 let loc_ao = rt::asarray((&block.ao.data, ao_shape, device));
+//
+//
+//                 // let loc_exc = loc_xc_tensor[0].as_ref().unwrap();
+//                 // let loc_vxc = loc_xc_tensor[1].as_ref().unwrap();
+//
+//                 match spin {
+//                     0 => {
+//                         let loc_rho0 = loc_rho.i((0..num_grids, 0, 0));
+//                         let loc_den = loc_rho0 * &loc_weights;
+//                         let loc_nelec = rt::sum(&loc_den);
+//                         nelec[0] += loc_nelec;
+//                         let loc_exc_sum = (loc_exc * &loc_den).sum();
+//                         exc_sum[0] += loc_exc_sum;
+//
+//                         let mut loc_wv = loc_vxc * &loc_weights.i((.., None)); 
+//
+//                         match xc_data.xc_type {
+//                             XCType::LDA => {
+//                                 let aow = &loc_ao.i((.., .., 0)) * &loc_wv; 
+//                                 vxc.i_mut((.., .., 0)).matmul_from(
+//                                     &aow, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
+//                                 );
+//
+//                             },
+//                             XCType::GGA => {
+//                                 loc_wv.i_mut((.., 0)).mul_assign(0.5);
+//
+//                                 let aow = &loc_ao * &loc_wv.i((.., None, ..));
+//                                 for ic in 0..=3 {
+//                                     vxc.i_mut(0).matmul_from(
+//                                         &aow.i((.., .., ic)), &loc_ao.i((.., .., ic)).t(), 1.0, 1.0
+//                                     );
+//                                 }
+//                             },
+//                             XCType::MGGA => {
+//                                 loc_wv.i_mut((.., 0)).mul_assign(0.5);
+//                                 loc_wv.i_mut((.., 4)).mul_assign(0.5);
+//
+//                                 for ic in 0..=3 {
+//                                     let aow = &loc_ao.i((.., .., ic)) * &loc_wv.i((.., None, ic));
+//                                     vxc.i_mut(0).matmul_from(
+//                                         &loc_ao.i((.., .., 0)), &aow.t(), 1.0, 1.0
+//                                     );
+//                                 }
+//                                 let Some(v1) = vxc_mgga_temp.as_mut() else {
+//                                     panic!("vxc_mgga_temp is not initialized for MGGA type");
+//                                 };
+//                                 for ic in 0..=3 {
+//                                     let vtau_ket = &loc_ao.i((.., .., ic+1)) * &loc_wv.i((.., None, 4));
+//                                     v1.i_mut(0).matmul_from(
+//                                         &loc_ao.i((.., .., ic+1)), &vtau_ket.t(), 1.0, 1.0
+//                                     );
+//                                 }
+//                             },
+//                             XCType::HF => {},
+//                         }
+//                     },
+//                     1 => {
+//                         let loc_rho_a = loc_rho.i((0..num_grids, 0, 0));
+//                         let loc_rho_b = loc_rho.i((0..num_grids, 0, 1));
+//                         let loc_den_a = loc_rho_a * &loc_weights;
+//                         let loc_den_b = loc_rho_b * &loc_weights;
+//                         let loc_nelec_a = rt::sum(&loc_den_a);
+//                         let loc_nelec_b = rt::sum(&loc_den_b);
+//                         nelec[0] += loc_nelec_a;
+//                         nelec[1] += loc_nelec_b;
+//                         let loc_exc_sum_a = (&loc_exc * &loc_den_a).sum();
+//                         let loc_exc_sum_b = (&loc_exc * &loc_den_b).sum();
+//                         exc_sum[0] += loc_exc_sum_a;
+//                         exc_sum[1] += loc_exc_sum_b;
+//
+//                         //loc_vxc shape [num_grids, nderiv ,spin] nderiv = 1, 4, 5 for LDA (vrho), GGA (vrho, vnabla_rho), MGGA (.., vtau)
+//                         let mut loc_wv = &loc_vxc * &loc_weights.i((.., None, None)); 
+//
+//                         match xc_data.xc_type {
+//                             XCType::LDA => {
+//                                 let loc_wv_a = loc_wv.i((.., 0, 0));
+//                                 let loc_wv_b = loc_wv.i((.., 0, 1));
+//                                 let aow_a = &loc_ao.i((.., .., 0)) * &loc_wv_a.i((.., None)); 
+//                                 let aow_b = &loc_ao.i((.., .., 0)) * &loc_wv_b.i((.., None));
+//                                 vxc.i_mut((.., .., 0)).matmul_from(
+//                                     &aow_a, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
+//                                 );
+//                                 vxc.i_mut((.., .., 1)).matmul_from(
+//                                     &aow_b, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
+//                                 );
+//
+//                             },
+//                             XCType::GGA => {
+//                                 loc_wv.i_mut((.., 0, ..)).mul_assign(0.5);
+//                                 let loc_wv_a = loc_wv.i((.., .., 0));
+//                                 let aow_a = &loc_ao.i((.., .., 0..4)) * &loc_wv_a.i((.., None, ..));
+//                                 let loc_wv_b = loc_wv.i((.., .., 1));
+//                                 let aow_b = &loc_ao .i((.., .., 0..4)) * &loc_wv_b.i((.., None, ..));
+//                                 for ic in 0..4 {
+//                                     vxc.i_mut((.., .., 0)).matmul_from(
+//                                         &loc_ao.i((.., .., 0)), &aow_a.i((.., .., ic)).t(), 1.0, 1.0
+//                                     );
+//                                     vxc.i_mut((.., .., 1)).matmul_from(
+//                                         &loc_ao.i((.., .., 0)), &aow_b.i((.., .., ic)).t(), 1.0, 1.0
+//                                     );
+//                                 }
+//                             },
+//                             XCType::MGGA => {
+//                                 loc_wv.i_mut((.., 0, ..)).mul_assign(0.5);
+//                                 loc_wv.i_mut((.., 4, ..)).mul_assign(0.5);
+//                                 let Some(v1) = vxc_mgga_temp.as_mut() else {
+//                                     panic!("vxc_mgga_temp is not initialized for MGGA type");
+//                                 };
+//
+//                                 let loc_wv_a = loc_wv.i((.., .., 0));
+//                                 let aow_a = &loc_ao.i((.., .., 0..4)) * &loc_wv_a.i((.., None, 0..4));
+//                                 let loc_wv_b = loc_wv.i((.., .., 1));
+//                                 let aow_b = &loc_ao .i((.., .., 0..4)) * &loc_wv_b.i((.., None, 0..4));
+//
+//                                 for ic in 0..4 {
+//                                     vxc.i_mut((.., .., 0)).matmul_from(
+//                                         &loc_ao.i((.., .., 0)), &aow_a.i((.., .., ic)).t(), 1.0, 1.0
+//                                     );
+//                                     vxc.i_mut((.., .., 1)).matmul_from(
+//                                         &loc_ao.i((.., .., 0)), &aow_b.i((.., .., ic)).t(), 1.0, 1.0
+//                                     );
+//                                     let vtau_ket_a = &loc_ao.i((.., .., ic+1)) * &loc_wv_a.i((.., None, 4));
+//                                     let vtau_ket_b = &loc_ao.i((.., .., ic+1)) * &loc_wv_b.i((.., None, 4));
+//                                     v1.i_mut((.., .., 0)).matmul_from(
+//                                         &loc_ao.i((.., .., ic+1)), &vtau_ket_a.t(), 1.0, 1.0
+//                                     );
+//                                     v1.i_mut((.., .., 1)).matmul_from(
+//                                         &loc_ao.i((.., .., ic+1)), &vtau_ket_b.t(), 1.0, 1.0
+//                                     );
+//                                 }
+//                             },
+//                             XCType::HF => {},
+//                         }
+//
+//                     },
+//                     _ => unreachable!(),
+//                 }
+//             }
+//         ); // end block loop
+//
+//         let mut vmat = vec!();
+//
+//         match xc_data.xc_type {
+//             XCType::LDA => {},
+//             XCType::GGA => {
+//                 let vxc_trans = vxc.transpose([0, 2, 1]);
+//                 vxc = &vxc + vxc_trans;
+//             },
+//             XCType::MGGA => {
+//                 let vxc_trans = vxc.transpose([0, 2, 1]);
+//                 vxc = &vxc + vxc_trans;
+//                 let Some(v1) = vxc_mgga_temp.as_ref() else {
+//                     panic!("vxc_mgga_temp is not initialized for MGGA type");
+//                 };
+//                 vxc.add_assign(v1);
+//             },
+//             XCType::HF => {
+//                 unreachable!()
+//             },
+//         }
+//
+//         vmat.push(MatrixFull::from_vec([num_basis, num_basis], vxc.i(0).to_vec()).unwrap());
+//         if spin == 1 {
+//             vmat.push(MatrixFull::from_vec([num_basis, num_basis], vxc.i(1).to_vec()).unwrap());
+//         }
+//
+//         (nelec, exc_sum, vmat)
+//     }
+// }
 
-impl<'a> NumInt<'a> for DFA4REST {
-    fn gen_xc_data(&'a self, scf_data: &'a SCF, spin: usize) -> XCData<'a> {
-        let xc_type = if self.use_kinetic_density() {
-            XCType::MGGA
-        } else if self.use_density_gradient() {
-            XCType::GGA
-        } else {
-            XCType::LDA
-        };
 
-        let xc_code = &self.dfa_compnt_scf;
-        let xc_params = &self.dfa_paramr_scf;
-
-        let density_matrix = &scf_data.density_matrix;
-        let mo_coeffs = scf_data.eigenvectors.clone().to_vec();
-        let mo_occ = scf_data.occupation.clone().to_vec();
-
-        let device = crate::utilities::rstsr_util::device();
-
-        XCData {
-            xc_type,
-            xc_code,
-            xc_params,
-            device: device,
-            dm: density_matrix,
-            mo_coeffs: Some(mo_coeffs),
-            occ: Some(mo_occ),
-        }
-    }
-
-    fn get_fxc(
-        &'a self,
-        xc_data0: &'a XCData,
-        xc_data1: &'a XCData,
-        grids: &mut Grids,
-        mol: &Molecule,
-        spin: usize,
-    ) -> Vec<MatrixFull<f64>> {
-        todo!("get_fxc has not yet implemented for DFA4REST");
-    }
-
-    fn get_vxc(
-        &'a self,
-        xc_data: &'a XCData,
-        grids: &mut Grids,
-        mol: &Molecule,
-        spin: usize,
-    ) -> (Vec<f64>, Vec<f64>, Vec<MatrixFull<f64>>) {
-
-        let num_grids = grids.weights.len();
-        let num_basis = mol.num_basis;
-        // determine block settings 
-        let ao_deriv = match xc_data.xc_type {
-            XCType::HF => 0usize,
-            XCType::LDA => 0usize,
-            XCType::GGA => 1usize,
-            XCType::MGGA => 1usize,
-        };
-        let max_memory = if let Some(max_memory) = mol.ctrl.max_memory {
-            max_memory as usize
-        } else {
-            2000 as usize // default to 2000 MB
-        };  
-        let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6; // number of components for ao derivatives 
-        let blksize = max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis);
-        let blksize = blksize.min(num_grids).max(4); 
-        let block_settings = BlockSettings {
-            ao_deriv,
-            max_memory,
-            blksize,
-        };
-
-        let device = &xc_data.device;
-        
-        let mut nelec = vec![0.0; spin+1];
-        let mut exc_sum = vec![0.0; spin+1];
-        let mut vxc = rt::zeros(([num_basis, num_basis, spin + 1], device));
-        let mut vxc_mgga_temp = match xc_data.xc_type {
-            XCType::MGGA => Some(rt::zeros(([num_basis, num_basis, spin + 1], device))),
-            _ => None,
-        };
-        let grids_iterator = self.block_loop(mol, grids, block_settings);
-        // calculation starts here 
-        let deriv = 1usize;          
-        grids_iterator.into_iter().for_each(
-            |block| 
-            {
-                let num_grids = block.weights.len();
-                let loc_rho = if let Some(mo_coeffs) = &xc_data.mo_coeffs {
-                    eval_rho5_batch(&block.ao, xc_data.xc_type, mo_coeffs, xc_data.occ.as_ref().unwrap(), spin, num_grids)
-                } else {
-                    eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, xc_data.dm, spin, num_grids)
-                };
-                let shape = loc_rho.shape().clone();
-
-                let rho_array = loc_rho.into_vec();
-                let loc_xc_tensor = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, spin, &rho_array, num_grids, deriv);
-
-                let loc_rho = rt::asarray((rho_array, shape, device));
-                // let loc_exc = rt::asarray((&loc_xc_tensor[0].unwrap()));
-                // let loc_vxc = rt::asarray((&loc_xc_tensor[1].unwrap()));
-
-                let loc_exc = if let Some(exc) = loc_xc_tensor[0].as_ref() {
-                    rt::asarray(exc)
-                } else {
-                    panic!("Exchange-correlation energy is not provided for the given xc_type: {:?}", xc_data.xc_type);
-                };
-
-                let loc_vxc = if let Some(vxc) = loc_xc_tensor[1].as_ref() {
-                    rt::asarray(vxc)
-                } else {
-                    panic!("Exchange-correlation potential is not provided for the given xc_type: {:?}", xc_data.xc_type);
-                };
-
-                let loc_weights = rt::asarray((block.weights, device));
-
-                let ao_shape = vec![num_basis, num_grids, ao_comp];
-                let loc_ao = rt::asarray((&block.ao.data, ao_shape, device));
-                
-
-                // let loc_exc = loc_xc_tensor[0].as_ref().unwrap();
-                // let loc_vxc = loc_xc_tensor[1].as_ref().unwrap();
-
-                match spin {
-                    0 => {
-                        let loc_rho0 = loc_rho.i((0..num_grids, 0, 0));
-                        let loc_den = loc_rho0 * &loc_weights;
-                        let loc_nelec = rt::sum(&loc_den);
-                        nelec[0] += loc_nelec;
-                        let loc_exc_sum = (loc_exc * &loc_den).sum();
-                        exc_sum[0] += loc_exc_sum;
-
-                        let mut loc_wv = loc_vxc * &loc_weights.i((.., None)); 
-
-                        match xc_data.xc_type {
-                            XCType::LDA => {
-                                let aow = &loc_ao.i((.., .., 0)) * &loc_wv; 
-                                vxc.i_mut((.., .., 0)).matmul_from(
-                                    &aow, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
-                                );
-
-                            },
-                            XCType::GGA => {
-                                loc_wv.i_mut((.., 0)).mul_assign(0.5);
-                                
-                                let aow = &loc_ao * &loc_wv.i((.., None, ..));
-                                for ic in 0..=3 {
-                                    vxc.i_mut(0).matmul_from(
-                                        &aow.i((.., .., ic)), &loc_ao.i((.., .., ic)).t(), 1.0, 1.0
-                                    );
-                                }
-                            },
-                            XCType::MGGA => {
-                                loc_wv.i_mut((.., 0)).mul_assign(0.5);
-                                loc_wv.i_mut((.., 4)).mul_assign(0.5);
-
-                                for ic in 0..=3 {
-                                    let aow = &loc_ao.i((.., .., ic)) * &loc_wv.i((.., None, ic));
-                                    vxc.i_mut(0).matmul_from(
-                                        &loc_ao.i((.., .., 0)), &aow.t(), 1.0, 1.0
-                                    );
-                                }
-                                let Some(v1) = vxc_mgga_temp.as_mut() else {
-                                    panic!("vxc_mgga_temp is not initialized for MGGA type");
-                                };
-                                for ic in 0..=3 {
-                                    let vtau_ket = &loc_ao.i((.., .., ic+1)) * &loc_wv.i((.., None, 4));
-                                    v1.i_mut(0).matmul_from(
-                                        &loc_ao.i((.., .., ic+1)), &vtau_ket.t(), 1.0, 1.0
-                                    );
-                                }
-                            },
-                            XCType::HF => {},
-                        }
-                    },
-                    1 => {
-                        let loc_rho_a = loc_rho.i((0..num_grids, 0, 0));
-                        let loc_rho_b = loc_rho.i((0..num_grids, 0, 1));
-                        let loc_den_a = loc_rho_a * &loc_weights;
-                        let loc_den_b = loc_rho_b * &loc_weights;
-                        let loc_nelec_a = rt::sum(&loc_den_a);
-                        let loc_nelec_b = rt::sum(&loc_den_b);
-                        nelec[0] += loc_nelec_a;
-                        nelec[1] += loc_nelec_b;
-                        let loc_exc_sum_a = (&loc_exc * &loc_den_a).sum();
-                        let loc_exc_sum_b = (&loc_exc * &loc_den_b).sum();
-                        exc_sum[0] += loc_exc_sum_a;
-                        exc_sum[1] += loc_exc_sum_b;
-
-                        //loc_vxc shape [num_grids, nderiv ,spin] nderiv = 1, 4, 5 for LDA (vrho), GGA (vrho, vnabla_rho), MGGA (.., vtau)
-                        let mut loc_wv = &loc_vxc * &loc_weights.i((.., None, None)); 
-
-                        match xc_data.xc_type {
-                            XCType::LDA => {
-                                let loc_wv_a = loc_wv.i((.., 0, 0));
-                                let loc_wv_b = loc_wv.i((.., 0, 1));
-                                let aow_a = &loc_ao.i((.., .., 0)) * &loc_wv_a.i((.., None)); 
-                                let aow_b = &loc_ao.i((.., .., 0)) * &loc_wv_b.i((.., None));
-                                vxc.i_mut((.., .., 0)).matmul_from(
-                                    &aow_a, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
-                                );
-                                vxc.i_mut((.., .., 1)).matmul_from(
-                                    &aow_b, &loc_ao.i((.., .., 0)).t(), 1.0, 1.0
-                                );
-
-                            },
-                            XCType::GGA => {
-                                loc_wv.i_mut((.., 0, ..)).mul_assign(0.5);
-                                let loc_wv_a = loc_wv.i((.., .., 0));
-                                let aow_a = &loc_ao.i((.., .., 0..4)) * &loc_wv_a.i((.., None, ..));
-                                let loc_wv_b = loc_wv.i((.., .., 1));
-                                let aow_b = &loc_ao .i((.., .., 0..4)) * &loc_wv_b.i((.., None, ..));
-                                for ic in 0..4 {
-                                    vxc.i_mut((.., .., 0)).matmul_from(
-                                        &loc_ao.i((.., .., 0)), &aow_a.i((.., .., ic)).t(), 1.0, 1.0
-                                    );
-                                    vxc.i_mut((.., .., 1)).matmul_from(
-                                        &loc_ao.i((.., .., 0)), &aow_b.i((.., .., ic)).t(), 1.0, 1.0
-                                    );
-                                }
-                            },
-                            XCType::MGGA => {
-                                loc_wv.i_mut((.., 0, ..)).mul_assign(0.5);
-                                loc_wv.i_mut((.., 4, ..)).mul_assign(0.5);
-                                let Some(v1) = vxc_mgga_temp.as_mut() else {
-                                    panic!("vxc_mgga_temp is not initialized for MGGA type");
-                                };
-
-                                let loc_wv_a = loc_wv.i((.., .., 0));
-                                let aow_a = &loc_ao.i((.., .., 0..4)) * &loc_wv_a.i((.., None, 0..4));
-                                let loc_wv_b = loc_wv.i((.., .., 1));
-                                let aow_b = &loc_ao .i((.., .., 0..4)) * &loc_wv_b.i((.., None, 0..4));
-
-                                for ic in 0..4 {
-                                    vxc.i_mut((.., .., 0)).matmul_from(
-                                        &loc_ao.i((.., .., 0)), &aow_a.i((.., .., ic)).t(), 1.0, 1.0
-                                    );
-                                    vxc.i_mut((.., .., 1)).matmul_from(
-                                        &loc_ao.i((.., .., 0)), &aow_b.i((.., .., ic)).t(), 1.0, 1.0
-                                    );
-                                    let vtau_ket_a = &loc_ao.i((.., .., ic+1)) * &loc_wv_a.i((.., None, 4));
-                                    let vtau_ket_b = &loc_ao.i((.., .., ic+1)) * &loc_wv_b.i((.., None, 4));
-                                    v1.i_mut((.., .., 0)).matmul_from(
-                                        &loc_ao.i((.., .., ic+1)), &vtau_ket_a.t(), 1.0, 1.0
-                                    );
-                                    v1.i_mut((.., .., 1)).matmul_from(
-                                        &loc_ao.i((.., .., ic+1)), &vtau_ket_b.t(), 1.0, 1.0
-                                    );
-                                }
-                            },
-                            XCType::HF => {},
-                        }
-
-                    },
-                    _ => unreachable!(),
-                }
-            }
-        ); // end block loop
-
-        let mut vmat = vec!();
-
-        match xc_data.xc_type {
-            XCType::LDA => {},
-            XCType::GGA => {
-                let vxc_trans = vxc.transpose([0, 2, 1]);
-                vxc = &vxc + vxc_trans;
-            },
-            XCType::MGGA => {
-                let vxc_trans = vxc.transpose([0, 2, 1]);
-                vxc = &vxc + vxc_trans;
-                let Some(v1) = vxc_mgga_temp.as_ref() else {
-                    panic!("vxc_mgga_temp is not initialized for MGGA type");
-                };
-                vxc.add_assign(v1);
-            },
-            XCType::HF => {
-                unreachable!()
-            },
-        }
-
-        vmat.push(MatrixFull::from_vec([num_basis, num_basis], vxc.i(0).to_vec()).unwrap());
-        if spin == 1 {
-            vmat.push(MatrixFull::from_vec([num_basis, num_basis], vxc.i(1).to_vec()).unwrap());
-        }
-
-        (nelec, exc_sum, vmat)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3416,6 +3601,7 @@ mod tests {
     /// GGA performance benchmark: compare original (serial) vs optimised with
     /// 8 rayon threads.  Reports wall-clock times and speedup.
     #[test]
+    #[ignore = "slow"]
     fn test_opt_gga_performance() {
         let nocc = 50;
         let nvir = 200;
@@ -3893,6 +4079,7 @@ mod tests {
 
     /// NWChem-opt GGA performance benchmark.
     #[test]
+    #[ignore = "slow"]
     fn test_nwchem_opt_gga_performance() {
         let nocc = 50;
         let nvir = 200;
@@ -3953,6 +4140,7 @@ mod tests {
     /// Reports timing for original (serial) and NWChem-opt (8-thread rayon),
     /// scaling over a range of grid sizes.
     #[test]
+    #[ignore = "slow"]
     fn test_bench_vs_nwchem_h2o() {
         let nocc = 5;
         let nvir = 14;

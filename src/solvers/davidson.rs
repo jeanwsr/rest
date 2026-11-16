@@ -303,6 +303,10 @@ where
             && max_residue_norm > 1.0
             && max_residue_norm / max_dx_last.max(1e-30) > 3.0
             && ss.size[1] > nroots + 2
+            // Only restart from retained solutions; restarting with an empty
+            // history would leave an empty subspace (m=0) and crash the
+            // subspace solve below.
+            && x_solutions_prev.size[1] > 0
         {
             warn!("  Divergence detected: |r|={:.3e}, |r_last|={:.3e}, restarting", max_residue_norm, max_dx_last);
             // Restore previous state
@@ -515,7 +519,7 @@ where
         }));
         if cholesky_ok.is_err() {
             warn!("  Cholesky failed (A-B not positive-definite): this can happen with hybrid functionals.");
-            warn!("  Falling back to TDA approximation for this iteration.");
+            warn!("  Switching to the direct non-symmetric subspace solver for this iteration.");
         }
         let cholesky_result: Option<(MatrixFull<f64>, MatrixFull<f64>, Vec<f64>)> = if cholesky_ok.is_ok() {
             // Cholesky succeeded: use standard symmetrized Casida approach.
@@ -559,11 +563,8 @@ where
             None
         };
 
-        // `Some` → the Casida/Cholesky construction below returns `G Z` / `G^-T Z`,
-        // which still need the `omega^±1/2` rescaling; `None` → the direct-subspace
-        // (`dgeev`) branch already returns `X+Y` and `X-Y` themselves.
-        let (mut xpy, mut xmy, mut omega, scale_omega) = match cholesky_result {
-            Some((xp, xm, ow)) => (xp, xm, ow, true),
+        let (mut xpy, mut xmy, mut omega) = match cholesky_result {
+            Some((xp, xm, ow)) => (xp, xm, ow),
             None => {
                 // Cholesky fallback: solve [A B; -B -A] on the projected subspace
                 // Build 2m x 2m matrix H = [A_proj,  B_proj; -B_proj, -A_proj]
@@ -592,21 +593,6 @@ where
 
                 let (_, wr, wi, _vl, vr, _info) = _dgeev(&h_full, 'N', 'V');
 
-                if std::env::var("REST_DAV_DBG").is_ok() {
-                    let npos = wr.iter().filter(|w| **w > 1e-4).count();
-                    let nreal = wr
-                        .iter()
-                        .zip(wi.iter())
-                        .filter(|(w, i)| **w > 1e-4 && i.abs() < 1e-6)
-                        .count();
-                    eprintln!(
-                        "[davdbg] m={m} eig(2m)={} wr>1e-4: {npos}  real: {nreal}  \
-                         wr[:6]={:?}  |wi|max={:.3e}",
-                        wr.len(),
-                        &wr[..wr.len().min(6)],
-                        wi.iter().fold(0.0f64, |a, b| a.max(b.abs()))
-                    );
-                }
                 let mut pairs: Vec<(f64, Vec<f64>)> = wr
                     .iter()
                     .zip(wi.iter().zip(vr.iter_columns_full()))
@@ -634,35 +620,28 @@ where
                         xp[[i, k]] = vx + vy;
                         xm[[i, k]] = vx - vy;
                     }
-                    // NOTE: no `omega^±1/2` rescaling here.  The caller applies
-                    // `xpy /= sqrt(omega)`, `xmy *= sqrt(omega)` once, after this
-                    // branch, and the residual definition assumes exactly that
-                    // convention (`xpy = X+Y`, `xmy = X-Y`).  Scaling a second time
-                    // here left the Ritz vectors and the residual mutually
-                    // inconsistent, so `left:N/...` never converged and the solver
-                    // restarted until `max_iter` (acene BSE runs).
+                    // Convert the true [X; Y] eigenvector into the Casida
+                    // branch's convention (xpy ∝ (X+Y)·√ω, xmy ∝ (X−Y)/√ω);
+                    // the post-loop rescaling then recovers (X±Y). (Getting
+                    // this backwards corrupts every Ritz vector of an
+                    // iteration in which the fallback fires.)
+                    let omega_sqrt = val.sqrt();
+                    for i in 0..m {
+                        xp[[i, k]] *= omega_sqrt;
+                        xm[[i, k]] /= omega_sqrt;
+                    }
                 }
-                (xp, xm, ow, false)
+                (xp, xm, ow)
             }
         };
         // debug!("Subspace xmy:");
         // xmy.formated_output(1000,"full");
         let n_omega = omega.len();
-        // Rescale only the Casida branch.  Applying `omega^±1/2` to the direct-subspace
-        // vectors as well made the two residuals mutually inconsistent: they are
-        // defined as `(A-B)(X-Y) - omega(X+Y)` and `(A+B)(X+Y) - omega(X-Y)`, which
-        // vanish together only for the *unscaled* `X±Y` — while the Casida branch's
-        // `G Z` / `G^-T Z` are the `omega^±1/2`-scaled combinations by construction.
-        // With the extra scaling the second residual could never fall below the
-        // tolerance, so a BSE Davidson run (indefinite `A-B`, i.e. always this branch)
-        // cycled through restarts until `max_iter` without converging.
-        if scale_omega {
-            for j in 0..n_omega {
-                let eig = omega[j];
-                for i in 0..m {
-                    xmy[[i, j]] *= eig.sqrt();
-                    xpy[[i, j]] /= eig.sqrt();
-                }
+        for j in 0..n_omega {
+            let eig = omega[j];
+            for i in 0..m {
+                xmy[[i, j]] *= eig.sqrt();
+                xpy[[i, j]] /= eig.sqrt();
             }
         }
         let n_omega = omega.len();
@@ -744,38 +723,20 @@ where
             && max_residue_norm > 1.0
             && max_residue_norm / max_dx_last.max(1e-30) > 3.0
             && ss.size[1] > nroots + 2
+            // Only restart from retained solutions; restarting with an empty
+            // history would leave an empty subspace (m=0) and crash the
+            // subspace solve below.
+            && x_solutions_prev.size[1] > 0
         {
             warn!("  Divergence detected: |r|={:.3e}, |r_last|={:.3e}, restarting", max_residue_norm, max_dx_last);
             x_solutions = x_solutions_prev.clone();
             y_solutions = y_solutions_prev.clone();
             eigenvalues = eigenvalues_prev.clone();
-            // Restart from the best vectors that actually exist.  `x_solutions` only
-            // ever receives **converged** solutions, so on an early divergence it is
-            // still empty and `.take(restart_dim)` yields nothing; the subspace was
-            // then left with zero columns, and the next iteration fed `n = 0` to
-            // LAPACK (`DPOTRF`/`DGEEV` "illegal value" warnings, whose fallback then
-            // produced no roots) and finally hit `chunks_exact(0)` in
-            // `MatrixFull::iter_columns_full` — the "chunk size must be non-zero"
-            // panic seen on acene/def2-SVP BSE runs.  The current Ritz vectors
-            // (`xpy_full`, always at least one column here) are the natural source,
-            // exactly as in the explicit `restart` branch below.
-            let src: &MatrixFull<f64> = if x_solutions.size[1] > 0 {
-                &x_solutions
-            } else {
-                &xpy_full
-            };
             ss = MatrixFull::new([xlen, 0], 0.0);
-            // Keep at least one vector per tracked root: a subspace smaller than the
-            // root count cannot represent the Ritz vectors it is supposed to carry, so
-            // the solver would restart forever without ever passing the convergence
-            // test (`restart_dim = 6` against `nroots = 7` was exactly that).
-            src.iter_columns_full()
-                .take(cmp::max(config.restart_dim, nroots))
+            x_solutions
+                .iter_columns_full()
+                .take(config.restart_dim)
                 .for_each(|xi| ss.push_column(xi));
-            if ss.size[1] == 0 {
-                // last resort: never continue with an empty subspace
-                ss = generate_initial_guess(diag, nroots);
-            }
             max_dx_last = 1e9;
             continue;
         }
@@ -802,10 +763,9 @@ where
         if restart {
             debug!("Explicit LR restart: subspace {} -> restart_dim {}", ss.size[1], config.restart_dim);
             ss = MatrixFull::new([xlen, 0], 0.0);
-            // never restart below the tracked root count (see the divergence branch)
             xpy_full
                 .iter_columns_full()
-                .take(cmp::max(config.restart_dim, nroots))
+                .take(config.restart_dim)
                 .for_each(|xi| ss.push_column(xi));
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i, residue)| {
@@ -1026,6 +986,102 @@ mod tests {
         for (e1, e2) in per_vec.iter().zip(batched.iter()) {
             assert!((e1.0 - e2.0).abs() < 1e-8,
                 "eigenvalue mismatch: per-vector {} vs batched {}", e1.0, e2.0);
+        }
+    }
+
+
+    /// Dense Casida reference for the full LR problem (same reduction as the
+    /// solver's preferred route): A−B = GGᵀ (Cholesky), symmetric eigh of
+    /// Gᵀ(A+B)G, X±Y assembled from Z and ω. Returns (ω, [X; Y]) pairs.
+    fn dense_lr_reference(a: &MatrixFull<f64>, b: &MatrixFull<f64>, nroots: usize)
+        -> Vec<(f64, Vec<f64>)>
+    {
+        let n = a.size[0];
+        let mut apb = MatrixFull::new([n, n], 0.0);
+        let mut amb = MatrixFull::new([n, n], 0.0);
+        for i in 0..n {
+            for j in 0..n {
+                apb[[i, j]] = a[[i, j]] + b[[i, j]];
+                amb[[i, j]] = a[[i, j]] - b[[i, j]];
+            }
+        }
+        let mut g = amb;
+        _dpotrf(&mut g, 'L');
+        (0..n).cartesian_product(0..n).for_each(|(i, j)| {
+            if j > i {
+                g[[i, j]] = 0.0;
+            }
+        });
+        let mut apb_g = MatrixFull::new([n, n], 0.0);
+        _dgemm_full(&apb, 'N', &g, 'N', &mut apb_g, 1.0, 0.0);
+        let mut gt_apb_g = MatrixFull::new([n, n], 0.0);
+        _dgemm_full(&g, 'T', &apb_g, 'N', &mut gt_apb_g, 1.0, 0.0);
+        let (eigvecs_opt, omega2, _info) = _dsyev(&gt_apb_g, 'V');
+        let eigvecs = eigvecs_opt.expect("dsyev failed");
+        let ginv = _dinverse(&g).expect("dinverse failed");
+        let mut pairs: Vec<(f64, Vec<f64>)> = Vec::new();
+        for (w2, v) in omega2.iter().zip(eigvecs.iter_columns_full()) {
+            if *w2 <= 1e-12 {
+                continue;
+            }
+            let omega = w2.sqrt();
+            let z = MatrixFull::from_vec([n, 1], v.to_vec()).unwrap();
+            let mut xpy = MatrixFull::new([n, 1], 0.0);
+            _dgemm_full(&g, 'N', &z, 'N', &mut xpy, 1.0, 0.0);
+            let mut gtz = MatrixFull::new([n, 1], 0.0);
+            _dgemm_full(&ginv, 'T', &z, 'N', &mut gtz, 1.0, 0.0);
+            let mut vec = Vec::with_capacity(2 * n);
+            for i in 0..n {
+                vec.push(0.5 * (xpy[[i, 0]] + omega * gtz[[i, 0]]));
+            }
+            for i in 0..n {
+                vec.push(0.5 * (xpy[[i, 0]] - omega * gtz[[i, 0]]));
+            }
+            pairs.push((omega, vec));
+            if pairs.len() >= nroots {
+                break;
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_lr_davidson_matches_dense_casida() {
+        let n = 24;
+        // Non-diagonal A (diagonally dominant) plus a small non-diagonal B, so
+        // A±B stay positive definite and the dense Casida reference is exact.
+        let a = synthetic_symmetric(n, 3.0);
+        let mut b = synthetic_symmetric(n, 20.0);
+        for i in 0..n {
+            for j in 0..n {
+                b[[i, j]] *= 0.005;
+            }
+        }
+        let nroots = 4;
+        let hdiag: Vec<f64> = (0..n).map(|i| a[[i, i]]).collect();
+        let config = DavidsonConfig {
+            max_subspace: 30,
+            add_dim: 4,
+            restart_dim: nroots.max(2),
+            max_iter: 100,
+            tol: 1e-10,
+            ..Default::default()
+        };
+        let guess = generate_initial_guess(&hdiag, nroots);
+        let result = lr_davidson_solver_batched(
+            batched_a(&a), batched_a(&b), nroots, &hdiag, guess, &config);
+        let reference = dense_lr_reference(&a, &b, nroots);
+
+        assert_eq!(result.len(), reference.len(), "same number of roots");
+        for ((w_solver, v_solver), (w_ref, v_ref)) in result.iter().zip(reference.iter()) {
+            assert!((w_solver - w_ref).abs() < 1e-8,
+                "omega mismatch: solver {} vs reference {}", w_solver, w_ref);
+            let ns: f64 = v_solver.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let nr: f64 = v_ref.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let dot: f64 = v_solver.iter().zip(v_ref.iter()).map(|(x, y)| x * y).sum::<f64>();
+            let cos = (dot / (ns * nr)).abs();
+            assert!(cos > 1.0 - 1e-6,
+                "eigenvector direction mismatch for omega {}: |cos| = {}", w_solver, cos);
         }
     }
 }

@@ -15,7 +15,9 @@
 use itertools::Itertools;
 use rest_libcint::gto::deriv_util::FpSimd;
 use rayon::prelude::*;
+use std::sync::Mutex;
 
+use super::becke_partitioning::RadiiAdjust;
 use super::bragg;
 use super::parameters;
 
@@ -238,17 +240,21 @@ impl BeckeMolTables {
 /// `[-0.5, 0.5]`; pairs of equal radii (within [`parameters::SMALL`]) get 0, so that
 /// `nu_ab = mu_ab`.  The matrix is anti-symmetric with a zero diagonal, the same
 /// convention the switch-function passes read `adjustment_factor[A][B]` for `B < A`.
-pub fn gen_adjustment_factor(proton_charges: &[i32]) -> Vec<Vec<f64>> {
+///
+/// `radii_adjust` selects whether the Bragg radii themselves (Becke, 1988) or their
+/// square roots (Treutler-Ahlrichs, 1995, the PySCF/PyFock default) enter `u_ab`. It must
+/// match the scheme used when the grid weights were built, otherwise the grid-shift terms
+/// would be inconsistent with the energy.
+pub fn gen_adjustment_factor(proton_charges: &[i32], radii_adjust: RadiiAdjust) -> Vec<Vec<f64>> {
     let natm = proton_charges.len();
     let radii: Vec<f64> = proton_charges.iter().map(|&c| bragg::get_bragg_angstrom(c)).collect();
     let mut adjustment_factor = vec![vec![0.0; natm]; natm];
     for A in 0..natm {
         for B in 0..A {
             if (radii[A] - radii[B]).abs() > parameters::SMALL {
-                let u_ab = (radii[A] + radii[B]) / (radii[B] - radii[A]);
-                let a_ab = u_ab / (u_ab * u_ab - 1.0);
-                adjustment_factor[A][B] = a_ab.min(0.5).max(-0.5);
-                adjustment_factor[B][A] = -adjustment_factor[A][B];
+                let a_ab = radii_adjust.factor(radii[A], radii[B]);
+                adjustment_factor[A][B] = a_ab;
+                adjustment_factor[B][A] = -a_ab;
             }
         }
     }
@@ -364,38 +370,24 @@ pub fn becke_partition_with_tables<'a>(
     };
 
     // par-iter over grid coordinates in batches.  Each task accumulates its
-    // contraction partials privately (see [`TaskBuffers`]); w/dw/ddw write
-    // disjoint grid ranges and need no lock.
-    //
-    // The reduction is **deterministic**: the tasks are cut into a fixed number
-    // of index-ordered chunks (the cut size depends only on the task count, not
-    // on how many worker threads exist), each chunk reduces its own tasks
-    // serially in index order, and the chunk partials are then added in chunk
-    // order.  Accumulating into one shared buffer under a `Mutex` instead -- as
-    // this used to -- sums in *lock acquisition* order, so the XC potential, the
-    // SCF trace and every gradient built on them depended on the scheduler; the
-    // DFT SCF of H2O/PBE even took a different number of iterations at 1 and 4
-    // threads.
-    const NCHUNK: usize = 64;
-    let ntask = tasks.len();
-    let chunk = ntask.div_ceil(NCHUNK).max(1);
-    let mut partials: Vec<TaskBuffers> = tasks
-        .par_chunks(chunk)
-        .map(|group| {
-            let mut buffers = TaskBuffers::new(&ctx);
-            for task in group {
-                let (g0, g1) = task.range();
-                let lanes = gather_lane_batch(grid_coords, quadrature_weights, task, ctx.natm);
-                for ilane in 0..lanes.coords.len() {
-                    process_lane(&ctx, &lanes, ilane, &mut buffers, g0, g1);
-                }
+    // contraction partials privately (see [`TaskBuffers`]) and takes this lock
+    // once for the reduction; w/dw/ddw write disjoint grid ranges and need no
+    // lock.  `for_each_init` allocates the task buffers (including the large
+    // per-lane scratch) once per worker thread, not once per task.
+    let contract_guard = Mutex::new(());
+    tasks.into_par_iter().for_each_init(
+        || TaskBuffers::new(&ctx),
+        |buffers, task| {
+            let (g0, g1) = task.range();
+            let lanes = gather_lane_batch(grid_coords, quadrature_weights, &task, ctx.natm);
+            for ilane in 0..lanes.coords.len() {
+                process_lane(&ctx, &lanes, ilane, buffers, g0, g1);
             }
-            buffers
-        })
-        .collect();
-    for buffers in partials.iter_mut() {
-        buffers.contraction.reduce(&ctx);
-    }
+            // reduce() also resets the contraction partials, since the worker's
+            // next task reuses the same buffers
+            buffers.contraction.reduce(&ctx, &contract_guard);
+        },
+    );
 
     ctx.into_output()
 }
@@ -577,15 +569,16 @@ impl TaskContraction {
         }
     }
 
-    /// Add this chunk's contraction partials into the shared output buffers.
-    ///
-    /// Called **serially, in chunk order**, after every chunk has finished (see
-    /// the caller), so the floating-point accumulation order is fixed and the
-    /// result is identical for any number of worker threads.
-    fn reduce(&mut self, ctx: &BeckePartitionContext<'_>) {
+    /// Add this task's contraction partials into the shared output buffers,
+    /// under the task mutex (c/dc/ddc are grid sums written by every task), and
+    /// reset them: the buffers are owned by the worker thread (see
+    /// `for_each_init`) and reused by its next task, so the partials must not
+    /// survive past the reduction.
+    fn reduce(&mut self, ctx: &BeckePartitionContext<'_>, guard: &Mutex<()>) {
         if self.c.is_none() && self.dc.is_none() && self.ddc.is_none() {
             return;
         }
+        let _guard = guard.lock().unwrap();
         for (buf, partial) in
             [(&ctx.output.c, &mut self.c), (&ctx.output.dc, &mut self.dc), (&ctx.output.ddc, &mut self.ddc)]
         {

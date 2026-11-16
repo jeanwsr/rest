@@ -48,7 +48,7 @@ fn test_fxc_bench_h2o_real() {
     let (start_mo, num_state, nocc, nvir, _homo, _lumo) =
         tddft_occupation_parameters(&scf);
     let ngrids = scf.grids.as_ref().unwrap().weights.len();
-    let nvar = if scf.mol.xc_data.use_density_gradient() { 4 } else { 1 };
+    let nvar = if scf.mol.dfadef.use_density_gradient() { 4 } else { 1 };
 
     println!("\n  === H2O BLYP/def2-SVP SCF converged ===");
     println!("  Energy:           {:.12} Ha", scf.scf_energy);

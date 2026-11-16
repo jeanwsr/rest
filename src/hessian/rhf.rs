@@ -1670,9 +1670,9 @@ impl RIRHFHessian<'_> {
         // hybrid DFA (e.g. B3LYP, hyb=0.2) scales the K term by hyb so that
         //   h_partial = e1 + ej - hyb*ek        (PySCF df/hessian/rks.py:60)
         //   h1ao      = h1 + vj1 - 0.5*hyb*vk1  (PySCF df/hessian/rks.py:109)
-        let is_dft = !scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_dft = scf_data.mol.dfadef.is_dfa_scf();
         let factor_k = if is_dft {
-            scf_data.mol.xc_data.dfa_hybrid_scf
+            scf_data.mol.dfadef.dfa_hybrid_scf
         } else {
             1.0
         };
@@ -1686,13 +1686,9 @@ impl RIRHFHessian<'_> {
         }
     }
 
-    /// Check if this is an RKS (DFT) calculation: non-empty XC functional list.
-    fn is_rks(&self) -> bool {
-        !self.scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
-    }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
-        self.scf_data.mol.xc_data.is_hybrid()
+        self.scf_data.mol.dfadef.is_hybrid()
     }
 
     pub fn print_timings(&self) {
@@ -1887,7 +1883,7 @@ impl RIRHFHessian<'_> {
         let _tej = std::time::Instant::now();
 
         // ── rstsr device and tensor views (shared across all phases) ──
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         // Column-major tensors (native F-order)
         let dm0_t: TsrView<f64> = rt::asarray((&dm0, [nao, nao].f(), &device));
         let mc2_t: TsrView<f64> = rt::asarray((&mc2, [nocc, nao].f(), &device));
@@ -2441,7 +2437,7 @@ impl RIRHFHessian<'_> {
                     wj001: &wj001,
                     ip1: $ip1,
                     tmpf: $tmpf,
-                device: crate::utilities::rstsr_util::device(),
+                device: DeviceBLAS::default(),
                     cint_all: &cint_all,
                     nreg,
                     aux_nbas: naux_nbas,
@@ -2470,7 +2466,7 @@ impl RIRHFHessian<'_> {
         let i_t = |i0, j0, x, y| i0 * natm * 9 + j0 * 9 + x * 3 + y;
 
         // ══ rstsr accelerated G1-G2 (standard path, replaces for loops) ══
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
         let dm0_t: TsrView<f64> = rt::asarray((&dm0, [nao, nao].f(), &device));
         let vjd_t: TsrView<f64> = rt::asarray((&vjd, [nao, nao, 9].f(), &device));
         let vkd_t: TsrView<f64> = rt::asarray((&vkd, [nao, nao, 9].f(), &device));
@@ -2709,7 +2705,7 @@ impl RIRHFHessian<'_> {
         // Scatters directly into the live h_partial buffer (zero new allocation).
         // The implementation lives in rks.rs; split-borrow of self.result.data
         // and self.timings from a shared &SCF ref compiles cleanly here.
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             let scf = self.scf_data;
             let hp_data = &mut self
                 .result
@@ -2770,10 +2766,10 @@ impl RIRHFHessian<'_> {
         }
 
         // A single DeviceBLAS instance is reused by all H1AO contractions.
-        // Creating crate::utilities::rstsr_util::device() spawns a Rayon thread pool, so doing it
+        // Creating DeviceBLAS::default() spawns a Rayon thread pool, so doing it
         // per-block (42× previously) was a major hidden cost.
         // All BLAS blocks share this instance.
-        let device = crate::utilities::rstsr_util::device();
+        let device = DeviceBLAS::default();
 
         // rho0_Pij, rhoj0_P, rhok0_Pl_
         // H4: rho0_all[ia] = vinv · t3c_block  (GEMM [naux, naux] @ [naux, ni*nao])
@@ -3307,7 +3303,7 @@ impl RIRHFHessian<'_> {
 
         // Per-atom: h1ao = hcore_deriv + vj1 - 0.5*vk1 + vxc_deriv1
         let _t_vxc_d1 = std::time::Instant::now();
-        let vxc_d1: Option<Vec<Vec<f64>>> = if self.is_rks() {
+        let vxc_d1: Option<Vec<Vec<f64>>> = if self.scf_data.mol.dfadef.is_dfa_scf() {
             Some(crate::hessian::rks::compute_vxc_h1ao(scf))
         } else {
             None
@@ -3723,7 +3719,7 @@ impl RIRHFHessian<'_> {
                 );
             }
         }
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             self.timings
                 .push(("  rks: vxc_deriv1", _t_vxc_d1.elapsed()));
         }
@@ -3987,11 +3983,11 @@ impl RIRHFHessian<'_> {
             // RKS: hybrid exchange scaling (0.5*hyb for closed-shell). For HF
             // (no DFA components), hyb=1.0 so k_scaling=0.5, recovering the
             // historical J - 0.5*K response.
-            let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+            let is_hf = !scf.mol.dfadef.is_dfa_scf();
             let hyb_e1 = if is_hf {
                 1.0
             } else {
-                scf.mol.xc_data.dfa_hybrid_scf
+                scf.mol.dfadef.dfa_hybrid_scf
             };
             let k_scaling_e1 = 0.5 * hyb_e1;
             for ia in 0..natm {
@@ -4732,13 +4728,19 @@ fn run_hessian_pipeline(
     if pl > 1 {
         memory_monitor::print_system_size("before Hessian pipeline", natm, nao, nocc, naux, ngrids);
     }
-    let limit_gb = scf.mol.ctrl.max_memory;
-    let monitor = MemMonitor::start(limit_gb, std::time::Duration::from_millis(20));
+    // `max_memory` 的单位是 MiB，而且只有用户要求时才武装中止（`abort_on_mem_exceed`，缺省 true）。
+    // 监控模块移到 utilities 之前，这里把 MiB 当作 GiB 传进去，限值大了 1024 倍。
+    let monitor = MemMonitor::start_from_ctrl(
+        scf.mol.ctrl.max_memory,
+        scf.mol.ctrl.abort_on_mem_exceed,
+        std::time::Duration::from_millis(20),
+    );
     if pl > 1 {
         println!(
             "  Memory monitor: limit = {}",
-            limit_gb
-                .map(|g| format!("{:.3} GiB (abort on exceed)", g))
+            monitor
+                .limit_mb()
+                .map(|m| format!("{:.1} MiB ({:.3} GiB, abort on exceed)", m, m / 1024.0))
                     .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
         );
     }

@@ -6,7 +6,8 @@
 
 我已确认以下事项：
 
-- [ ] 本分支的代码可以通过编译及与改动有关部分的测试（如 `cargo test --test xxx`）。源代码和测试部分需要的文件使用恰当的相对路径（参见 `src/basis_io/bse_downloader.rs::local_test`），不包含本地路径，以保证在所有机器上都能运行。
+- [ ] 本 PR 已拟定了恰当的标题（请勿使用无意义的标题如 `Merge remote-tracking branch 'upstream/master'`）。本 PR 已恰当总结了更改的内容（请勿使用 Gitee 自动生成的 commit message 列表代替总结）。本 PR 的代码更改总结中不包含与本 PR 无关的内容及冗长的本地开发过程文档。当 PR 含有较多 commit 时，已勾选`使用扁平化（Squash）合并`选项（在 Gitee 页面右侧）。
+- [ ] 本分支的代码可以通过编译（一般来说，采用默认编译选项；对于涉及某个 feature，如 mpi，的改动，需要保证该 feature 启用或不启用时都能编译）及与改动有关部分的测试（如 `cargo test --test xxx`）。源代码和测试部分需要的文件使用恰当的相对路径（参见 `src/basis_io/bse_downloader.rs::local_test`），不包含本地路径，以保证在所有机器上都能运行。
 - [ ] 本 pr 的改动对其他功能没有破坏性影响，或这种影响是可控的。具体来说，至少已有的回归测试（`rest_regression`）可以通过。如果存在理应被破坏的回归测试或新增测试，已在 rest_regression 项目提交 pr。
 - [ ] 本 pr 的改动不包含临时文件，与本项目无关的文件，与已有文件重复的文件（如基组文件，包括名称不同但内容相同的）。（本地开发中需要的此类文件，可通过 `.gitignore` 过滤）
 - [ ] 本 pr 的改动不包含篇幅非常大的文档。（文档更新可提交至对应项目: `rest_doc`: 用户文档，开发者文档；`rest-dev-ai-agent`: AI SKILLs）

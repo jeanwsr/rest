@@ -11,15 +11,11 @@
 //!
 //! Scaling difference to the restricted ([`crate::ri_jk::hess_r::RHessRIJK`]) counterpart:
 //! - Skeleton: ``factor_j * de_J - factor_k * de_K`` (K coefficient ``-1``, not ``-0.5`` as in RHF),
-//!   because UHF ``de_K = K^alpha + K^beta`` already absorbs the spin sum (matches
-//!   [`crate::ri_jk::hess_u_naive::UHessRIJKNaive`]).
+//!   because UHF ``de_K = K^alpha + K^beta`` already absorbs the spin sum.
 //! - First derivative (bra form): ``factor_j * (j1ao @ mocc_s) - factor_k * k1bra_s`` per spin (no
-//!   ``0.5`` factor), again matching the naive UHF convention.
+//!   ``0.5`` factor).
 //!
-//! The response (`get_response_bra`) reuses the separated J/K response core
-//! [`crate::ri_jk::resp_r::get_rijk_response_bra_separated`] shared with RHF: J is produced once
-//! in AO form from the total density response and right half-transformed per spin; K is produced
-//! per spin in bra form (same-spin only).
+//! The response (`URespRIJK`) lives in the separate [`crate::ri_jk::resp_u`] module.
 
 use super::prelude_dev::*;
 use crate::analdrv::prelude::*;
@@ -30,7 +26,6 @@ use crate::ri_jk::hess_r::{
     generate_cderi_with_decomp, get_rijk_skeleton_decomposed_separated, KEYS_J02, KEYS_J11, KEYS_J1AO, KEYS_J20,
     KEYS_K02, KEYS_K11, KEYS_K1BRA, KEYS_K20,
 };
-use crate::ri_jk::resp_r::{build_rijk_response_intmd, get_rijk_response_bra_separated, RijkRespIntmd};
 
 /* #region impl */
 
@@ -45,23 +40,12 @@ pub struct UHessRIJK<'a> {
     pub result: HashMap<&'static str, Tsr>,
     pub timing: Vec<(String, f64)>,
     pub is_skeleton_ready: bool,
-    /// Aux-batch size of the response kernel (shared by the cache and its application).
-    pub nbatch_aux: usize,
-    /// Whether `make_response_preparation` should build `resp_intmd`.
-    pub cache_kernel: bool,
-    /// Memory budget (bytes) of `resp_intmd`.
-    pub cache_budget: f64,
-    /// Precomputed bra-independent response-kernel intermediates (see
-    /// [`crate::ri_jk::resp_r::build_rijk_response_intmd`]).
-    pub resp_intmd: RijkRespIntmd,
-    /// Wall time (seconds) spent building `resp_intmd`.
-    pub cache_timing: f64,
 }
 
 impl<'a> UHessRIJK<'a> {
     pub fn new_without_cderi(mol: &CInt, aux: &CInt, factor_j: f64, factor_k: f64) -> Self {
-        let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Upper, distributed: J2CDistributedMode::Off };
-        let device = crate::utilities::rstsr_util::device();
+        let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Upper, distributed: J2CDistributedMode::Off, cd_threads: 0 };
+        let device = DeviceBLAS::default();
         let (cderi, j2c_decomp) = generate_cderi_with_decomp(mol, aux, j2c_decomp_option, &device);
         Self {
             mol: mol.clone(),
@@ -74,11 +58,6 @@ impl<'a> UHessRIJK<'a> {
             result: HashMap::new(),
             timing: Vec::new(),
             is_skeleton_ready: false,
-            nbatch_aux: 72,
-            cache_kernel: false,
-            cache_budget: 0.0,
-            resp_intmd: RijkRespIntmd::none(72),
-            cache_timing: 0.0,
         }
     }
 
@@ -101,20 +80,7 @@ impl<'a> UHessRIJK<'a> {
             result: HashMap::new(),
             timing: Vec::new(),
             is_skeleton_ready: false,
-            nbatch_aux: 72,
-            cache_kernel: false,
-            cache_budget: 0.0,
-            resp_intmd: RijkRespIntmd::none(72),
-            cache_timing: 0.0,
         }
-    }
-
-    /// Enable (or disable) caching of the bra-independent response-kernel intermediates, and set
-    /// its memory budget in bytes (see [`crate::ri_jk::resp_r::RijkRespIntmd`]).
-    pub fn with_cache_kernel(mut self, enabled: bool, budget_bytes: f64) -> Self {
-        self.cache_kernel = enabled;
-        self.cache_budget = budget_bytes;
-        self
     }
 
     /// Build the total density ``D^alpha + D^beta`` from the per-spin mo_coeff / mo_occ.
@@ -286,86 +252,6 @@ impl<'a> UHessElecInteractAPI for UHessRIJK<'a> {
         self.result.insert("deriv1_bra_0", deriv1_bra[0].clone());
         self.result.insert("deriv1_bra_1", deriv1_bra[1].clone());
         deriv1_bra
-    }
-
-    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) {
-        self.intmd.insert("mo_coeff_0".to_string(), mo_coeff[0].view().into_contig(RowMajor));
-        self.intmd.insert("mo_coeff_1".to_string(), mo_coeff[1].view().into_contig(RowMajor));
-        self.intmd.insert("mo_occ_0".to_string(), mo_occ[0].to_owned());
-        self.intmd.insert("mo_occ_1".to_string(), mo_occ[1].to_owned());
-
-        // Intermediates of the response kernel; the unpacked `cderi` batches are shared by the two
-        // spins (only the occupied half-transforms are spin-resolved).
-        if self.cache_kernel {
-            let t0 = std::time::Instant::now();
-            self.resp_intmd = build_rijk_response_intmd(
-                self.cderi.view(),
-                mo_coeff,
-                mo_occ,
-                self.factor_k != 0.0,
-                self.nbatch_aux,
-                self.cache_budget,
-            );
-            self.cache_timing = t0.elapsed().as_secs_f64();
-            if std::env::var("REST_RESP_KERNEL_TIMING").is_ok() {
-                let mb = self.resp_intmd.memory_bytes() as f64 / 1024.0 / 1024.0;
-                println!(
-                    "[resp-kernel] UHF cache built in {:.3} s (active: {}, memory: {:.1} MiB)",
-                    self.cache_timing,
-                    self.resp_intmd.is_active(),
-                    mb
-                );
-            }
-        } else {
-            self.resp_intmd = RijkRespIntmd::none(self.nbatch_aux);
-            self.cache_timing = 0.0;
-        }
-    }
-
-    fn get_response_bra(&mut self, bra: &[TsrView; 2]) -> [Tsr; 2] {
-        let mo_coeff = [self.intmd["mo_coeff_0"].view(), self.intmd["mo_coeff_1"].view()];
-        let mo_occ = [self.intmd["mo_occ_0"].view(), self.intmd["mo_occ_1"].view()];
-        let cderi = self.cderi.view();
-        let device = mo_coeff[0].device();
-        // Shared separated J/K response core: J (AO form, from total density) + per-spin K (bra form).
-        let (j_ao, k_bras) = get_rijk_response_bra_separated(
-            cderi,
-            &mo_coeff,
-            &mo_occ,
-            bra,
-            self.factor_j != 0.0,
-            self.factor_k != 0.0,
-            self.nbatch_aux,
-            Some(&self.resp_intmd),
-        );
-
-        let nao = mo_coeff[0].shape()[0];
-        let occidx = [mo_occ[0].view().greater(0.0).into_vec(), mo_occ[1].view().greater(0.0).into_vec()];
-        let mocc = [
-            mo_coeff[0].view().bool_select(-1, &occidx[0]).into_contig(ColMajor),
-            mo_coeff[1].view().bool_select(-1, &occidx[1]).into_contig(ColMajor),
-        ];
-        let nocc = [mocc[0].shape()[1], mocc[1].shape()[1]];
-
-        let mut resp = [None, None];
-        for s in 0..2 {
-            let shape = bra[s].shape().to_vec();
-            let nprop: usize = shape[2..].iter().product();
-            let mut r = rt::zeros(([nao, nocc[s], nprop], device));
-            // J: spin-independent AO operator, right half-transformed by this spin's mocc.
-            // The shared `j_ao` carries the RHF symmetrization factor (effective `4 * J1`); UHF
-            // naive J uses `2 * J1`, so an extra `0.5` prefactor is applied here (occ = 1 vs 2).
-            if let Some(j_ao) = j_ao.as_ref() {
-                r += 0.5 * self.factor_j * (j_ao.view() % &mocc[s]);
-            }
-            // K: same-spin bra form (UHF occ = 1, so no 0.5 factor — unlike RHF). The core already
-            // bakes in the exchange sign, so this is an additive contribution.
-            if let Some(k_bra) = k_bras.get(s) {
-                r += self.factor_k * k_bra.view().reshape((nao, nocc[s], nprop));
-            }
-            resp[s] = Some(r.into_shape(shape));
-        }
-        [resp[0].take().unwrap(), resp[1].take().unwrap()]
     }
 }
 

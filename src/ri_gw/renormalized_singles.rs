@@ -39,12 +39,13 @@ use libc::seccomp_notif;
 /// stage, which shifts the RS quasiparticle energies by the full exact-exchange
 /// term.  Restore the saved fields so that the reference keeps its identity.
 fn generate_rs_hf_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
-    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
-    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    // The XC metadata lives in `mol.dfadef` after the functional-API unification; `xc_scf` is the
+    // field that carries the SCF component list, and `DFAdef::is_dfa_scf()` is what
+    // `ri_gw::exchange_fraction` uses to recognise a genuine HF reference.
+    let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
+    scf_data.mol.dfadef.xc_scf=Some(vec![]);
     scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
-    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
-    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+    scf_data.mol.dfadef.xc_scf=xc_scf_save;
 }
 
 pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>)->(MatrixFull<f64>,MatrixFull<f64>){

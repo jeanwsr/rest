@@ -39,41 +39,19 @@ use crate::ri_pt2::PT2FPMode;
 use crate::SCF;
 
 use enumflags2::BitFlags;
-use libxc::prelude::*;
 
 /// J/K factors of the RI-JK part of the (restricted) final-energy functional of a DH.
 ///
 /// The final functional carries the full Coulomb (`factor_j = 1`) and its own hybrid coefficient
-/// `dfa_hybrid_pos` (for an HF final functional without DFT parts, the full exchange). Compare
+/// `dfa_hybrid_nscf` (for an HF final functional without DFT parts, the full exchange). Compare
 /// [`scf_jk_factors`](super::rresp_interface::scf_jk_factors) for the SCF-iteration functional.
 pub fn dh_jk_factors(scf_data: &SCF) -> (f64, f64) {
-    let xc_data = &scf_data.mol.xc_data;
-    // the final functional's total hybrid coefficient; absent `dfa_hybrid_pos` (post-SCF family
+    let dfadef = &scf_data.mol.dfadef;
+    // the final functional's total hybrid coefficient; absent `dfa_hybrid_nscf` (post-SCF family
     // without its own functional), the final functional is the SCF functional. For an HF final
     // functional (e.g. MP2 correlation on HF), this correctly yields the full exchange 1.0.
-    let factor_k = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf);
+    let factor_k = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf);
     (1.0, factor_k)
-}
-
-/// List of `(scale, functional)` pairs of the final-energy functional's DFT (XC numint) part
-/// (spin-unpolarized); `None` when the final functional has no DFT part.
-pub fn dh_xc_func_list(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    let xc_data = &scf_data.mol.xc_data;
-    let (xc_code, xc_params) = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-        // a present-but-empty component list (pure-MP2-family post-SCF methods) carries no DFT
-        // part; treated the same as absent, so no empty KS contribution object is built
-        (Some(code), Some(_)) if code.is_empty() => return None,
-        (Some(code), Some(param)) => (code, param),
-        (None, None) => return None,
-        _ => panic!("dfa_compnt_pos and dfa_paramr_pos must be present or absent together."),
-    };
-    Some(
-        xc_code
-            .iter()
-            .zip(xc_params.iter())
-            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-            .collect_vec(),
-    )
 }
 
 /// Solve the Z-vector (CP-SCF) equation for a Lagrangian of the (combined) post-SCF contributions.
@@ -380,23 +358,25 @@ impl RGFockAPI for RGFockDH<'_> {
 ///   [`xdh_calculations`](crate::ri_pt2::xdh_calculations) frees the grids, so this interface
 ///   must be called before it, or the grids must be regenerated in between.
 pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
-    let device = crate::utilities::rstsr_util::device();
+    let device = DeviceBLAS::default();
 
     // --- basic preparation and checks --- //
 
-    let mo_coeff = scf_data.eigenvectors[0].to_rstsr(&device);
-    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
-    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
+    // The generalized-Fock/Z-vector kernels use `0..nocc` as the occupied block.
+    let perm = crate::analdrv::trait_util::occupied_first_permutation(&scf_data.occupation[0]);
+    let mo_coeff = scf_data.eigenvectors[0].to_rstsr(&device).index_select(-1, &perm);
+    let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).index_select(0, &perm);
+    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device).index_select(0, &perm);
 
     assert_eq!(
         scf_data.mol.start_mo, 0,
         "RGFockDH does not support frozen-core double hybrids yet (mol.start_mo != 0)."
     );
-    match scf_data.mol.xc_data.dfa_family_pos {
+    match scf_data.mol.dfadef.family_pos() {
         Some(DFAFamily::PT2) => {}
         _ => panic!("RGFockDH currently requires the PT2 post-SCF family (ri_pt2 correlation)."),
     }
-    if scf_data.mol.xc_data.omega().is_some() {
+    if scf_data.mol.dfadef.omega().is_some() {
         panic!(
             "RGFockDH does not support range-separated double hybrids yet: the final-energy \
              functional's range separation is not stored in xc_data (only the SCF functional's \
@@ -405,12 +385,13 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
     }
     let [c_os, c_ss] = scf_data
         .mol
-        .xc_data
-        .dfa_paramr_adv
+        .dfadef
+        .fifth_rung_component()
+        .expect("RGFockDH requires the fifth-rung spin factors (os/ss parameters).")
+        .param_positional
         .clone()
-        .expect("RGFockDH requires the PT2 spin factors (dfa_paramr_adv).")
         .try_into()
-        .expect("dfa_paramr_adv must have exactly two entries (c_os, c_ss).");
+        .expect("the fifth-rung factors must have exactly two entries (c_os, c_ss).");
 
     let nocc = mo_occ.view().greater(0).sum();
 
@@ -425,6 +406,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- RI-JK --- //
 
+    crate::ri_jk::require_unpruned_rimatr(&scf_data.rimatr_pair_map, "the generalized-Fock RI-JK object (rgfock_interface)");
     let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
         "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
     );
@@ -441,7 +423,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- DFT (final-energy functional, common SCF grid) --- //
 
-    if let Some(xc_func_list) = dh_xc_func_list(scf_data) {
+    if let Some(xc_func_list) = scf_data.mol.dfadef.nscf_func_list(1) {
         let mol = get_cint_mol(&scf_data.mol);
         let grids = scf_data.grids.as_ref().expect(
             "The DH generalized Fock requires the SCF grids; note xdh_calculations frees them, so build this interface before it or regenerate the grids in between.",
@@ -457,6 +439,22 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- RI-PT2 (correlation contribution; an ordinary element of the list) --- //
 
+    // the PT2 kernel streams its amplitudes over occupied windows (storage bounded by the
+    // `nvir * nocc * naux` class): size the windows so the per-window transients stay within a
+    // few times that class and inside `max_memory`
+    let (nmo_, naux_) = (mo_coeff.shape()[1], rimatr.to_rstsr_view(&device).shape()[1]);
+    let nvir = nmo_ - nocc;
+    let mem_avail = scf_data.mol.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
+    let elems_per_step = 2 * nvir * nvir * nocc + nvir * naux_;
+    crate::utilities::memory_batch::handle_memory_exceed(
+        elems_per_step as f64 * 8.0 / 1048576.0,
+        mem_avail,
+        scf_data.mol.ctrl.abort_on_mem_exceed,
+    );
+    let index_occ_outer = crate::ri_pt2::occ_batch_index(
+        nocc,
+        crate::ri_pt2::occ_batch_step(nocc, elems_per_step, nvir * nocc * naux_, mem_avail, 4.0),
+    );
     // the RI-PT2 working precision follows the `[ri_pt2] fp_mode` control keyword (default FP32;
     // the pre-transformed f32 `cderi_vox` is not supplied here, so the kernel transforms in f64
     // and casts on the fly); all outputs (`gfock_part`, `rdm1_corr`, `e_corr`) are f64 regardless
@@ -467,17 +465,19 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
             mo_energy.to_owned(),
             rimatr.to_rstsr_view(&device).into_cow(),
             None,
-            vec![0, nocc],
+            index_occ_outer.clone(),
             c_os,
             c_ss,
         ))),
-        PT2FPMode::FP32 => gfock_list.push(Box::new(RGFockPT2::<f32>::new(
+        // TF32 is only executable by the torch energy engine; the CPU rgfock path
+        // falls back to the f32 kernel
+        PT2FPMode::FP32 | PT2FPMode::TF32 => gfock_list.push(Box::new(RGFockPT2::<f32>::new(
             mo_coeff.to_owned(),
             mo_occ.to_owned(),
             mo_energy.to_owned(),
             rimatr.to_rstsr_view(&device).into_cow(),
             None,
-            vec![0, nocc],
+            index_occ_outer.clone(),
             c_os,
             c_ss,
         ))),

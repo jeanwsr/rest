@@ -19,128 +19,6 @@ use crate::grad::rhf::pack_triu_tilde;
 use crate::ri_jk::pure_incore::{get_vj_ri_incore, get_vk_ri_incore_coeff, get_vk_ri_incore_dm};
 use crate::ri_jk::util::get_dm0_restricted;
 
-/* #region response kernel intermediates */
-
-/// Bra-independent intermediates of the RI-JK response kernel (the K part of
-/// [`get_rijk_response_bra_separated`]), precomputed once per orbital state.
-///
-/// Every aux batch of the kernel loads the packed `cderi` slice, unpacks it to `[nao, nao, nbatch]`,
-/// and half-transforms it with the occupied coefficients into `cderi_bxo [nao, nbatch, nocc]` and
-/// `cderi_oxo [nocc, nbatch, nocc]`. None of these three objects depends on the `bra`, yet they are
-/// rebuilt on every kernel call. The kernel is applied to `3 * natm` right-hand sides by an
-/// analytic Hessian (where the rebuild is amortized), but to a single right-hand side by a Z-vector
-/// solve (DH/PT2 relaxed multipoles, the CD-GW gradient), which iterates the kernel tens of times
-/// for one column — there the rebuild dominates the call.
-///
-/// This struct holds the three objects per batch, so that the up-front pass is paid once and every
-/// later call only performs the bra-dependent contractions. The unpacked batches are the memory-
-/// dominant part (`nao^2 * naux` doubles); see [`build_rijk_response_intmd`] for the budget policy.
-pub struct RijkRespIntmd {
-    /// Aux-batch size the batches were built with; the kernel must use the same value.
-    pub nbatch_aux: usize,
-    /// Unpacked `cderi` batches, each `[nao, nao, nbatch]`, in aux order; empty when not cached.
-    pub cderi_batches: Vec<Tsr>,
-    /// Per-spin half-transforms (in the spin order of `mo_coeff`); empty when not cached.
-    pub spins: Vec<RijkRespSpinIntmd>,
-}
-
-/// Per-spin part of [`RijkRespIntmd`]; one entry per aux batch, in aux order.
-pub struct RijkRespSpinIntmd {
-    /// Number of occupied orbitals of this spin (must match the kernel's `nocc`).
-    pub nocc: usize,
-    /// `cderi @ mocc`: `[nao, nbatch, nocc]` per batch.
-    pub bxo: Vec<Tsr>,
-    /// `mocc^T @ cderi_bxo`: `[nocc, nbatch, nocc]` per batch.
-    pub oxo: Vec<Tsr>,
-}
-
-impl RijkRespIntmd {
-    /// An empty cache (nothing cached; the kernel falls back to its own computation).
-    pub fn none(nbatch_aux: usize) -> Self {
-        Self { nbatch_aux, cderi_batches: Vec::new(), spins: Vec::new() }
-    }
-
-    /// Memory held by the cache, in bytes.
-    pub fn memory_bytes(&self) -> usize {
-        let batch_bytes =
-            |v: &Vec<Tsr>| v.iter().map(|x| x.shape().iter().product::<usize>() * std::mem::size_of::<f64>()).sum::<usize>();
-        batch_bytes(&self.cderi_batches) + self.spins.iter().map(|s| batch_bytes(&s.bxo) + batch_bytes(&s.oxo)).sum::<usize>()
-    }
-
-    /// Whether any part of the cache is populated.
-    pub fn is_active(&self) -> bool {
-        !self.cderi_batches.is_empty() || self.spins.iter().any(|s| !s.bxo.is_empty())
-    }
-}
-
-/// Build [`RijkRespIntmd`] for one orbital state (one or two spins).
-///
-/// `budget_bytes` caps the memory held by the cache; the two tiers are budgeted independently, so a
-/// system whose unpacked `cderi` exceeds the budget still gets the (much smaller) half-transforms
-/// cached:
-/// - the unpacked `cderi` batches cost `nao^2 * naux` doubles,
-/// - the half-transforms cost `(nao + nocc) * naux * nocc` doubles per spin.
-///
-/// A non-positive `budget_bytes` disables the cache entirely (the returned object is inactive).
-#[allow(clippy::too_many_arguments)]
-pub fn build_rijk_response_intmd(
-    cderi: TsrView,
-    mo_coeff: &[TsrView],
-    mo_occ: &[TsrView],
-    do_k: bool,
-    nbatch_aux: usize,
-    budget_bytes: f64,
-) -> RijkRespIntmd {
-    let nset = mo_coeff.len();
-    assert_eq!(mo_occ.len(), nset);
-    let nao = mo_coeff[0].shape()[0];
-    let naux = cderi.shape()[1];
-
-    let mocc: Vec<Tsr> =
-        (0..nset).map(|s| mo_coeff[s].view().bool_select(-1, &mo_occ[s].view().greater(0).into_vec())).collect();
-    let nocc: Vec<usize> = mocc.iter().map(|m| m.shape()[1]).collect();
-
-    let nbatch = naux.div_ceil(nbatch_aux.max(1));
-    let bytes_of = |n: usize| n as f64 * std::mem::size_of::<f64>() as f64;
-    let bytes_cderi = bytes_of(nao * nao * naux);
-    let bytes_aux = if do_k { nocc.iter().map(|&n| bytes_of((nao + n) * naux * n)).sum() } else { 0.0 };
-    let cache_cderi = bytes_cderi <= budget_bytes;
-    let cache_aux = do_k && bytes_aux <= budget_bytes;
-    if !cache_cderi && !cache_aux {
-        return RijkRespIntmd::none(nbatch_aux);
-    }
-
-    let mut cderi_batches: Vec<Tsr> = Vec::with_capacity(if cache_cderi { nbatch } else { 0 });
-    let mut spins: Vec<RijkRespSpinIntmd> = (0..nset)
-        .map(|s| RijkRespSpinIntmd {
-            nocc: nocc[s],
-            bxo: Vec::with_capacity(if cache_aux { nbatch } else { 0 }),
-            oxo: Vec::with_capacity(if cache_aux { nbatch } else { 0 }),
-        })
-        .collect();
-
-    for iaux_start in (0..naux).step_by(nbatch_aux) {
-        let iaux_end = (iaux_start + nbatch_aux).min(naux);
-        let nbatch = iaux_end - iaux_start;
-        let slc = rt::slice!(iaux_start, iaux_end);
-        let batch = cderi.i((.., slc)).unpack_tri(Upper, FlagSymm::Sy);
-        if cache_aux {
-            for s in 0..nset {
-                let bxo = (batch.reshape([nao, nao * nbatch]).t() % &mocc[s]).into_shape([nao, nbatch, nocc[s]]);
-                let oxo = (&mocc[s].t() % bxo.reshape([nao, nbatch * nocc[s]])).into_shape([nocc[s], nbatch, nocc[s]]);
-                spins[s].bxo.push(bxo);
-                spins[s].oxo.push(oxo);
-            }
-        }
-        if cache_cderi {
-            cderi_batches.push(batch);
-        }
-    }
-    RijkRespIntmd { nbatch_aux, cderi_batches, spins }
-}
-
-/* #endregion response kernel intermediates */
-
 /* #region response */
 
 /// Separated J/K response-bra core, shared by RHF and UHF.
@@ -170,10 +48,6 @@ pub fn build_rijk_response_intmd(
 /// - The internal factors (`2.0` on J, the two-term symmetrized sum on K) match the existing RHF
 ///   optimized response; the per-method `factor_j` / `factor_k` and the RHF `0.5` vs UHF `1.0`
 ///   exchange prefactor are applied by the consumer, not here.
-/// - `intmd` optionally supplies the bra-independent K intermediates precomputed by
-///   [`build_rijk_response_intmd`]; it is used only when it matches this call (same aux batching,
-///   same spin count and occupations), otherwise the intermediates are recomputed in place. The
-///   result is identical either way.
 #[allow(clippy::too_many_arguments)]
 pub fn get_rijk_response_bra_separated(
     cderi: TsrView,
@@ -183,7 +57,6 @@ pub fn get_rijk_response_bra_separated(
     do_j: bool,
     do_k: bool,
     nbatch_aux: usize,
-    intmd: Option<&RijkRespIntmd>,
 ) -> (Option<Tsr>, Vec<Tsr>) {
     // notes on shape
     // - cderi: [nao_tp, naux]
@@ -232,31 +105,18 @@ pub fn get_rijk_response_bra_separated(
         let dm1 = &dm1 + &dm1.swapaxes(0, 1);
         let dm1_tp = pack_triu_tilde(dm1.view());
         let itm_j_aux = cderi.t() % &dm1_tp;
-        // The internal 2.0 factor of the symmetric contraction is applied to the small
-        // `[naux, nprop]` auxiliary vector, not to the full `[nao_tp, naux]` `cderi`: scaling the
-        // latter materialises a copy of the whole integral matrix (tens of MB to GB) on **every**
-        // kernel call, which dominates a one-column application (`nao^2 * naux` writes against
-        // `naux * nprop` writes). Exact in floating point: doubling the left operand of every
-        // product is the same as doubling each product and each partial sum.
-        let resp_tp_j: Tsr = &cderi % (2.0 * &itm_j_aux);
+        let resp_tp_j: Tsr = 2.0 * &cderi % itm_j_aux;
         j_ao = Some(resp_tp_j.unpack_tri(Upper, FlagSymm::Sy));
     }
 
     // --- K contribution (same-spin, bra form, two symmetrized terms) --- //
 
     if do_k {
-        // Accept the precomputed intermediates only when they describe exactly this call.
-        let cache = intmd.filter(|c| {
-            c.nbatch_aux == nbatch_aux
-                && c.spins.len() == nset
-                && c.spins.iter().zip(nocc.iter()).all(|(sp, &n)| sp.nocc == n)
-        });
         for s in 0..nset {
             let mocc_s = &mocc[s];
             let bra_s = &bra[s];
-            let spin_cache = cache.map(|c| &c.spins[s]);
             let mut resp_bra_k: Tsr = rt::zeros_like(bra_s);
-            for (ibatch, iaux_start) in (0..naux).step_by(nbatch_aux).enumerate() {
+            for iaux_start in (0..naux).step_by(nbatch_aux) {
                 let iaux_end = (iaux_start + nbatch_aux).min(naux);
                 let slc = rt::slice!(iaux_start, iaux_end);
                 // note: the following `naux` is the batch size, shadowing the outer one for brevity
@@ -266,45 +126,16 @@ pub fn get_rijk_response_bra_separated(
                 // - cderi_bxo: [nao, naux, nocc]
                 // - cderi_oxo: [nocc, naux, nocc]
                 // - cderi_box: [nao, nocc, naux]
-                //
-                // All three are bra-independent; take them from the cache when available, else
-                // build them here (the `_owned` holders keep the freshly built ones alive).
-                let cached_cderi = cache.and_then(|c| c.cderi_batches.get(ibatch));
-                let cderi_owned =
-                    if cached_cderi.is_none() { Some(cderi.i((.., slc)).unpack_tri(Upper, FlagSymm::Sy)) } else { None };
-                let cderi = match cached_cderi {
-                    Some(x) => x.view(),
-                    None => cderi_owned.as_ref().unwrap().view(),
-                };
-
-                let cached_bxo = spin_cache.and_then(|sp| sp.bxo.get(ibatch));
-                let bxo_owned = if cached_bxo.is_none() {
-                    Some((cderi.reshape([nao, nao * naux]).t() % mocc_s).into_shape([nao, naux, nocc[s]]))
-                } else {
-                    None
-                };
-                let cderi_bxo = match cached_bxo {
-                    Some(x) => x.view(),
-                    None => bxo_owned.as_ref().unwrap().view(),
-                };
-
-                let cached_oxo = spin_cache.and_then(|sp| sp.oxo.get(ibatch));
-                let oxo_owned = if cached_oxo.is_none() {
-                    Some((mocc_s.t() % cderi_bxo.reshape([nao, naux * nocc[s]])).into_shape([nocc[s], naux, nocc[s]]))
-                } else {
-                    None
-                };
-                let cderi_oxo = match cached_oxo {
-                    Some(x) => x.view(),
-                    None => oxo_owned.as_ref().unwrap().view(),
-                };
+                let cderi = cderi.i((.., slc)).unpack_tri(Upper, FlagSymm::Sy);
+                let cderi_bxo = (cderi.reshape([nao, nao * naux]).t() % mocc_s).into_shape([nao, naux, nocc[s]]);
+                let cderi_oxo =
+                    (mocc_s.t() % cderi_bxo.reshape([nao, naux * nocc[s]])).into_shape([nocc[s], naux, nocc[s]]);
 
                 for a in 0..nprop {
                     let bra_sa = bra_s.i((.., .., a));
                     let mut respka = resp_bra_k.i_mut((.., .., a));
                     // k contribution part 0: uPj, iPj -> ui
-                    let cderi_bxo_1 =
-                        (cderi.reshape([nao, nao * naux]).t() % &bra_sa).into_shape([nao, naux, nocc[s]]);
+                    let cderi_bxo_1 = (cderi.reshape([nao, nao * naux]).t() % &bra_sa).into_shape([nao, naux, nocc[s]]);
                     respka -=
                         cderi_bxo_1.reshape([nao, naux * nocc[s]]) % cderi_oxo.reshape([nocc[s], naux * nocc[s]]).t();
                     // k contribution part 1: uPj, iPj -> ui (i from mocc, j from bra)
@@ -339,50 +170,41 @@ pub struct RRespRIJK<'a> {
     pub factor_j: f64,
     /// Exchange factor, absorbed into the returned fock/response tensors.
     pub factor_k: f64,
-    /// Cholesky decomposed 3c-2e ERI, shape `[nao_tp, naux]`.
+    /// Cholesky decomposed 3c-2e ERI of the SCF auxiliary basis (the high-precision resource),
+    /// shape `[nao_tp, naux]`.
     pub cderi: TsrCow<'a>,
+    /// Optional decomposed ERI of the response auxiliary basis (`resp_auxbas_path`, the
+    /// low-precision resource); `None` reuses `cderi`.
+    pub cderi_resp: Option<TsrCow<'a>>,
     /// Response intermediates: `mo_coeff [nao, nmo]` (RowMajor) and `mo_occ [nmo]`, stored by
     /// [`RRespAPI::make_response_preparation`].
     pub intmd: HashMap<String, Tsr>,
-    /// Aux-batch size of the response kernel, used both to build and to apply
-    /// [`Self::resp_intmd`].
-    pub nbatch_aux: usize,
-    /// Whether [`RRespAPI::make_response_preparation`] should build [`Self::resp_intmd`].
-    pub cache_kernel: bool,
-    /// Memory budget (in bytes) of [`Self::resp_intmd`]; see [`build_rijk_response_intmd`].
-    pub cache_budget: f64,
-    /// Precomputed bra-independent kernel intermediates, built by
-    /// [`RRespAPI::make_response_preparation`] and consumed by `get_response_bra`.
-    pub resp_intmd: RijkRespIntmd,
-    /// Wall time (seconds) spent building [`Self::resp_intmd`].
-    pub cache_timing: f64,
 }
 
 impl<'a> RRespRIJK<'a> {
     /// Create from a Cholesky-decomposed ERI (`cderi`).
-    ///
-    /// The response-kernel cache is off by default (see [`Self::with_cache_kernel`]); it is an
-    /// opt-in trade of memory for speed, enabled by the analysis driver through the CP-SCF config.
     pub fn new_with_cderi(factor_j: f64, factor_k: f64, cderi: TsrCow<'a>) -> Self {
-        Self {
-            factor_j,
-            factor_k,
-            cderi,
-            intmd: HashMap::new(),
-            nbatch_aux: 72,
-            cache_kernel: false,
-            cache_budget: 0.0,
-            resp_intmd: RijkRespIntmd::none(72),
-            cache_timing: 0.0,
-        }
+        Self { factor_j, factor_k, cderi, cderi_resp: None, intmd: HashMap::new() }
     }
 
-    /// Enable (or disable) caching of the bra-independent response-kernel intermediates, and set
-    /// its memory budget in bytes.
-    pub fn with_cache_kernel(mut self, enabled: bool, budget_bytes: f64) -> Self {
-        self.cache_kernel = enabled;
-        self.cache_budget = budget_bytes;
+    /// Attach a dedicated decomposed ERI (`cderi_resp`) of the response auxiliary basis for the
+    /// low-precision (`prec = false`) path.
+    ///
+    /// When set, the response contractions called with `prec = false` (the CP-SCF machinery)
+    /// evaluate on this tensor instead of the SCF-basis `cderi`.
+    pub fn set_cderi_resp(mut self, cderi_resp: TsrCow<'a>) -> Self {
+        self.cderi_resp = Some(cderi_resp);
         self
+    }
+
+    /// The decomposed ERI selected by the precision flag: the SCF-basis `cderi` for `prec = true`,
+    /// the response-basis [`Self::cderi_resp`] for `prec = false` (falling back to `cderi`).
+    fn cderi_in_use(&self, prec: bool) -> &TsrCow<'a> {
+        if prec {
+            &self.cderi
+        } else {
+            self.cderi_resp.as_ref().unwrap_or(&self.cderi)
+        }
     }
 }
 
@@ -392,17 +214,18 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
     /// Fock from density matrix: `factor_j * J(rdm) - 0.5 * factor_k * K(rdm)`.
     ///
     /// The `rdm` is assumed to be symmetric, as required by the pure in-core functions.
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_fock_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         assert_eq!(rdm.ndim(), 2, "rdm must have 2 dimensions");
         let nao = rdm.shape()[0];
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         // pure functions require (nao, nao, nset) f-contiguous inputs
         let dms = rdm.into_contig(ColMajor).into_shape((nao, nao, 1));
 
         // TODO: batch size `72` should be tunable by max-memory.
-        let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
-        let vk = get_vk_ri_incore_dm(self.cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+        let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+        let vk = get_vk_ri_incore_dm(cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
 
         let mut fock = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
@@ -416,20 +239,21 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
 
     /// Fock from molecular coefficients: J by the dm route (no coeff-native vj exists), K by the
     /// coeff-native pure function.
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
+    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) -> Tsr {
         let [nao, nmo] = mo_coeff.shape().to_vec().try_into().unwrap();
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let dm = get_dm0_restricted(mo_coeff.view(), mo_occ.view());
         let dms = dm.into_contig(ColMajor).into_shape((nao, nao, 1));
-        let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+        let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
 
         let coeff = mo_coeff.into_contig(ColMajor).into_shape((nao, nmo, 1));
         let occ = mo_occ.into_contig(ColMajor).into_shape((nmo, 1));
 
         // TODO: batch size `72` should be tunable by max-memory.
         let vk =
-            get_vk_ri_incore_coeff(self.cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+            get_vk_ri_incore_coeff(cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
 
         let mut fock = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
@@ -441,68 +265,39 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
         fock
     }
 
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_response_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         // assume rdm can be symmetrized, 4 * J - 2 * K
         assert_eq!(rdm.ndim(), 2, "rdm must have 2 dimensions");
         let [nao, nao2] = rdm.shape().to_vec().try_into().unwrap();
         assert_eq!(nao, nao2, "rdm must be square");
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let rdm_sym = ((&rdm + &rdm.t()) * 0.5).into_contig(ColMajor).into_shape((nao, nao, 1));
 
         let mut resp = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
-            let vj = get_vj_ri_incore(self.cderi.view(), rdm_sym.view()).i((.., .., 0)).into_contig(ColMajor);
+            let vj = get_vj_ri_incore(cderi.view(), rdm_sym.view()).i((.., .., 0)).into_contig(ColMajor);
             resp += 4.0 * self.factor_j * &vj;
         }
         // TODO: batch size `72` should be tunable by max-memory.
         if self.factor_k != 0.0 {
-            let vk = get_vk_ri_incore_dm(self.cderi.view(), rdm_sym.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+            let vk = get_vk_ri_incore_dm(cderi.view(), rdm_sym.view(), 72).i((.., .., 0)).into_contig(ColMajor);
             resp -= 2.0 * self.factor_k * &vk;
         }
         resp
     }
 
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
-        // Build the bra-independent response-kernel intermediates. This is the only place where the
-        // orbitals are known, and the kernel is re-applied on every CP-SCF iteration afterwards.
-        if self.cache_kernel {
-            let t0 = std::time::Instant::now();
-            // `mo_coeff` / `mo_occ` are still owned here (they are stored below), so hand the
-            // builder fresh views of them.
-            let mo_coeff_v = mo_coeff.view();
-            let mo_occ_v = mo_occ.view();
-            self.resp_intmd = build_rijk_response_intmd(
-                self.cderi.view(),
-                &[mo_coeff_v],
-                &[mo_occ_v],
-                self.factor_k != 0.0,
-                self.nbatch_aux,
-                self.cache_budget,
-            );
-            self.cache_timing = t0.elapsed().as_secs_f64();
-            if std::env::var("REST_RESP_KERNEL_TIMING").is_ok() {
-                let mb = self.resp_intmd.memory_bytes() as f64 / 1024.0 / 1024.0;
-                println!(
-                    "[resp-kernel] cache built in {:.3} s (active: {}, memory: {:.1} MiB)",
-                    self.cache_timing,
-                    self.resp_intmd.is_active(),
-                    mb
-                );
-            }
-        } else {
-            self.resp_intmd = RijkRespIntmd::none(self.nbatch_aux);
-            self.cache_timing = 0.0;
-        }
-
+    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, _prec: bool) {
+        // the intermediates are precision-independent (the decomposed ERI is selected per call)
         self.intmd.insert("mo_coeff".to_string(), mo_coeff.into_contig(RowMajor));
         self.intmd.insert("mo_occ".to_string(), mo_occ.to_owned());
     }
 
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
+    fn get_response_bra(&mut self, bra: TsrView, prec: bool) -> Tsr {
         let mo_coeff = self.intmd["mo_coeff"].view();
         let mo_occ = self.intmd["mo_occ"].view();
-        let cderi = self.cderi.view();
+        let cderi = self.cderi_in_use(prec).view();
 
         // RHF (single spin) assembly of the separated J/K response core.
         // - J (AO form, from total density) contracted with `mocc` and scaled by `factor_j`.
@@ -516,6 +311,7 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
         let nocc = mocc.shape()[1];
         let nprop: usize = shape_bra[2..].iter().product();
 
+        // TODO: batch size `72` should be tunable by max-memory.
         let (j_ao, k_bras) = get_rijk_response_bra_separated(
             cderi,
             &[mo_coeff.view()],
@@ -523,8 +319,7 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
             &[bra.view()],
             self.factor_j != 0.0,
             self.factor_k != 0.0,
-            self.nbatch_aux,
-            Some(&self.resp_intmd),
+            72,
         );
 
         let mut resp: Tsr = rt::zeros(([nao, nocc, nprop], device));

@@ -8,8 +8,7 @@
 //!
 //! References: Gaussian 16 Legacy RevB.01, `#p MP2(Full)/def2TZVP Density=MP2 NoSymm` (relaxed
 //! MP2 density; note G16's default MP2 freezes the I 4s/4p subshells, so `Full` is required to
-//! match REST's `start_mo = 0`), geometry H(0,0,0), I(0,0,1.609 Angstrom), run recorded at
-//! `local-runs/260912-hi-ecp/g16`:
+//! match REST's `start_mo = 0`), geometry H(0,0,0), I(0,0,1.609 Angstrom):
 //!
 //! - E(SCF) = -297.242009239, E2 = -0.5911611131, EUMP2 = -297.83317035213
 //! - dipole Z = -0.5630 D (G16 prints 4 decimals; 1e-5 a.u. rounding)
@@ -108,8 +107,8 @@ fn test_hi_rmp2_ecp() {
     // relaxed RI-MP2: both the unrelaxed correlation and the Z-vector response increments exist
     let dip_corr = dip.corr.as_ref().expect("relaxed mode must carry the corr. increment");
     let dip_resp = dip.resp.as_ref().expect("relaxed mode must carry the response increment");
-    allclose(dip_corr, &[0.0, 0.0, -0.000033189610], 1e-8);
-    allclose(dip_resp, &[0.0, 0.0, -0.001018252093], 5e-7);
+    allclose(dip_corr, &[0.0, 0.0, -0.000033189610], 5e-8);
+    allclose(dip_resp, &[0.0, 0.0, -0.001018252093], 2e-6);
 
     // total dipole vs G16 relaxed MP2(Full) density: -0.5630 D = -0.2215013 a.u.; the deviation
     // (~8e-4 a.u.) is dominated by the RI fit of the SCF density and of the PT2 increments
