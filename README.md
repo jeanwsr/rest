@@ -509,30 +509,18 @@ GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
     - `"g0w0"`（缺省）：单次GW计算，不做自洽迭代。
     - `"evgw"`：本征值自洽GW（evGW），每轮用更新后的准粒子能量同时重建 G 和 W。需配合 `evgw_rounds` 设置迭代次数。
-    - `"evgw0"`：本征值自洽 G0W0（evGW0），每轮只把更新后的准粒子能量用于 G，**W 固定为初始 G0W0 水平**（初值为 KS 能量；若 `w_rs = true` 则为 RS 能量）。同样使用 `evgw_rounds`、`evgw_solver`、`evgw_damping`、`evgw_diis` 等外循环控制。
+    - `"evgw0"`：本征值自洽 G0W0（evGW0），每轮只把更新后的准粒子能量用于 G，**W 固定为初始 G0W0 水平**（初值为 KS 能量；若 `w_rs = true` 则为 RS 能量）。同样使用 `evgw_rounds`、`evgw_damping`、`evgw_diis` 等外循环控制。
 - `evgw_rounds`: 取值usize，evGW/evGW0 自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 或 `"evgw0"` 时需要设置。缺省为0。
 
 #### evGW 外循环收敛控制
 
 evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不动点迭代。与 PySCF、MolGW 的经验一致，**不做任何加速的朴素迭代对多数分子不会收敛**：`F` 的 Jacobian 在不动点附近有接近甚至超过单位模的特征值，迭代会落入极限环；若再叠加低秩等离面路径中"最近格点"选取带来的分段常值（不连续）误差，连迭代轨迹的逐次可复现性都会丧失。
 
-REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
-
-- `evgw_solver`: 取值String，evGW/evGW0 外循环更新方式。
-    - `"auto"`（缺省）：`scgw = "evgw"` 时使用 `"molgw"`；`scgw = "evgw0"` 时使用 `"z_update"`。
-    - `"molgw"`：每个轨道每轮做一次自能求值，不求解准粒子方程。
-    - `"diis"`：每轮完整求解准粒子方程，并对整条准粒子能量矢量做 Pulay/DIIS 外推。
-    - `"z_update"`：Z 阻尼（线性化牛顿）单步更新；`evgw_diis = true` 时可叠加 DIIS。
-
 - `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
     - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
-- `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
-
-  该步长必须同时满足两个尺度条件：明显大于最小的虚轴求积频点（`num_freq = 20` 时约为 `1.7e-3 Ha`），且不大于留数判据 `cdgw_res_tol`（否则差分被截断偏差污染）。
-
 - `evgw_degeneracy_tol`: 取值f64，单位Hartree，缺省 `1e-4`。evGW 的简并投影容差。
 
-- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推。它叠加在 `evgw_solver` 所选用的每轮映射之上。
+- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推。
 - `evgw_diis_space`: DIIS 历史长度。缺省 8。
 - `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
 - `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。
@@ -710,14 +698,10 @@ gw_or_bse = "gw"
 gw_scheme = "extrapolated"
 scgw = "evgw"
 evgw_rounds = 5
-# 外循环求解技巧与收敛判据（缺省即为下列取值；'diis' 鲁棒性最好，'z_update' 在
-# 无近简并前线轨道的体系上更快，但两者互斥）
-evgw_solver = "diis"        # 或 "z_update"（Z 阻尼牛顿单步）/ "molgw"（MolGW 的单次求值）
 evgw_freeze_outside = false # true = 窗口外轨道保持 KS 能量（MolGW 行为）
 evgw_diis = true
 evgw_diis_space = 8
 evgw_damping = 1.0
-evgw_z_step = 0.01          # 仅 evgw_solver = "z_update" 时使用
 evgw_conv_tol = 1e-5
 evgw_stop_on_convergence = true
 renormalized_singles = true
