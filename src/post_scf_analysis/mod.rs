@@ -700,18 +700,22 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                      evaluation is not used by the gradient."
                 );
             }
-            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd") && !ac && !wac;
+            // The low-rank contour-deformation gradient has been removed.  CD
+            // (and its fscd sampling variant) always use the full-CD engine;
+            // AC/WAC keep the shared low-rank QP-cache engine (the full-CD
+            // engine only implements the CD functional).
+            let use_full_cd = !ac && !wac;
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
-            let (grad, omega, z) = if use_cd {
+            let (grad, omega, z) = if use_full_cd {
                 let engine = ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(scf_data, cfg, vxc);
                 engine.analytic_gradient(target)
             } else {
                 let engine = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
-                engine.analytic_gradient(target)
+                engine.analytic_gradient_ac_wac(target)
             };
             println!(
                 "GW quasiparticle energy of orbital {target}: {omega:.12} Ha  (Z = {z:.6}, engine = \"{}\", gw_variant = \"{}\")",
-                if use_cd {"cd"} else {"lr"},
+                if use_full_cd {"cd"} else {"ac/wac"},
                 qp_ctrl.gw_variant.as_str()
             );
             report_analytic_gradient(scf_data, "GW", &grad);

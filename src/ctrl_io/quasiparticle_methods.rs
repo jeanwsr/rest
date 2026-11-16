@@ -276,9 +276,10 @@ pub struct QuasiParticle {
     pub use_low_rank_contour:bool,
     // ---- analytic nuclear gradients ------------------------------------
     // Triggered by `gw_or_bse = "gw_gradient"` / `"bse_gradient"`.
-    /// Which engine differentiates the GW quasiparticle energy: `"lr"` (the
-    /// production low-rank CD engine) or `"cd"` (the full-CD engine).
-    /// Default `"lr"`.
+    /// Retained for input compatibility.  Contour-deformation (`cd`/`fscd`)
+    /// always uses the full-CD gradient engine; AC/WAC use the shared low-rank
+    /// QP-cache engine.  The former low-rank CD gradient no longer exists, so
+    /// the value is ignored for CD.
     pub gradient_engine:String,
     /// Orbital whose quasiparticle energy `"gw_gradient"` differentiates.
     /// Negative selects the HOMO.  Default `-1`.

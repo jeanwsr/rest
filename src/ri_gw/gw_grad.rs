@@ -1,117 +1,40 @@
-//! Analytic nuclear gradients of low-rank contour-deformation (LR-CD) and
-//! analytic-continuation (AC) G0W0 quasiparticle energies.
+//! Analytic nuclear gradients of GW quasiparticle energies and GW-BSE
+//! excited states.
 //!
-//! The self-energy representation is selected by
-//! [`GwGradConfig::gw_variant`], which mirrors the energy path's
-//! `gw_variant = "cd" | "ac" | "fscd"` keyword:
+//! The differentiated self-energy is selected by [`GwGradConfig::gw_variant`]:
 //!
-//! * `"cd"` (default) differentiates the contour-deformation functional
-//!   described below;
-//! * `"ac"` differentiates the analytic-continuation (Padé) functional of
-//!   `ri_gw::scgw::single_orbital_gw_ac`: `Sigma_c` is sampled on the
-//!   imaginary axis, a Thiele continued fraction is built from the samples
-//!   and evaluated at `omega + i eta`.  The gradient differentiates that
-//!   approximant with respect to every sample and with respect to the Fermi
-//!   shift (which moves all nodes), see [`crate::ri_gw::ac_grad`]; the exact
-//!   coefficients are then fed through the same RI/CPHF pullback as the CD
-//!   kernel.  Because the AC functional is a **linear** functional of the
-//!   imaginary-axis screened rows `W_c[n,m](iu_k)`, the pullback only needs
-//!   the per-`(k,m)` coefficient stored in [`AcQpData`], plus the explicit
-//!   mean-field energy derivative.  This also covers the BSE diagonal, whose
-//!   QP energies are built from these caches;
-//! * `"wac"` is **CD with an analytic continuation of `W`** (CD-WAC,
-//!   Panadés-Barrueta & Golze, J. Chem. Theory Comput. 19, 5450 (2023)):
-//!   the imaginary-axis integral is the CD one, while the residue term
-//!   evaluates `W_c,nm(zeta_m)` from a Thiele Padé approximant built on
-//!   reference rows `W_c,nm(z_p)` (the imaginary-axis grid plus near-real
-//!   points).  The gradient differentiates the approximant with respect to
-//!   every reference value and to the evaluation node, and the reference
-//!   response rows are pulled back through the same RI/CPHF machinery
-//!   ([`WacQpData`]).  Because the reference screening factors are shared by
-//!   every target orbital and every QP iteration, this is the O(N^4)
-//!   alternative to the O(N^5) residue loop for deep core levels.  This also
-//!   covers the BSE diagonal computed from these caches;
-//! * `"fscd"` currently differentiates the CD functional (the frequency
-//!   sampling of the residue sum is not used by the gradient).
+//! * [`GwVariant::Cd`] / [`GwVariant::Fscd`] — the full-CD G0W0 functional,
+//!   implemented by [`GwCdGradEngine`]: static-subtracted continuous
+//!   self-energy, direct `naux x naux` screening factorisation (no low-rank
+//!   truncation) and exact moving residue frequencies.  The former low-rank
+//!   CD derivative driver has been removed; CD always uses this engine.
+//! * [`GwVariant::Ac`] — analytic continuation of `Sigma_c` on the imaginary
+//!   axis (Thiele Padé), differentiated through the low-rank QP cache
+//!   ([`GwGradEngine`]).
+//! * [`GwVariant::Wac`] — CD-WAC: the CD imaginary-axis integral with a
+//!   Padé-continued screened interaction `W_c,nm(z)`, also through the
+//!   low-rank QP cache.
 //!
-//! This module ports the validated PySCF implementation
-//! `pyscf/gw/gw_lr_cd_grad.py` (+ `gw_cd_grad*.py`) to REST.  It reproduces
-//! REST's own LR-CD G0W0 energy functional (`ri_gw::gw_calculations_lowrank`
-//! / `newton_solver_lowrank_v2`) — the contour-deformation decomposition with
-//! REST's real-symmetric screened response, REST's imaginary-axis quadrature
-//! grids, REST's real-axis residue interpolation (`low_rank_interp`: nearest
-//! grid point or linear between bracketing nodes, the latter by default) and
-//! REST's finite-difference Newton root finder — and differentiates it exactly.
+//! The low-rank QP-cache machinery is retained because AC/WAC and the BSE
+//! gradient need it; only the LR-CD *gradient* assembly was removed.
 //!
-//! By default the differentiated functional is the **static-subtracted**
-//! self-energy of the full-CD engine (see [`GwCdGradEngine`]),
-//! evaluated through the same low-rank response factors,
+//! Shared infrastructure used by both engines:
+//!
+//! * raw RI tensors `q[P,pq] = (P|pq)` and the metric `J[P,Q] = (P|Q)`;
+//! * the low-rank response factors used by AC/WAC and by BSE screening;
+//! * canonical CP-HF/CP-KS responses (`analdrv` + RI-JK response) and the
+//!   adjoint (Z-vector) contraction of the CP-HF channel;
+//! * pair packing and the QP pullback shared with the BSE gradient.
+//!
+//! The full-CD engine differentiates the static-subtracted functional
 //!
 //!     Sigma_sub = sum_m [ -1/pi sum_k w_k K(t_m, u_k) (W_m(iu_k) - W_m(0))
 //!                         + (1/2 - f_m) W_m(0)
 //!                         + s_m pf_m (W_m(zeta_m) - W_m(0)) ],
 //!
-//! with the *same* residue protocol (pole selection, `pole_factor` smoothing,
-//! `low_rank_interp` interpolation) as REST's raw LR energy.  The static
-//! subtraction removes the artificial pole-selection jump of the raw
-//! decomposition at `omega = e_m`, making the QP energy — and therefore its
-//! gradient — well defined even when a quasiparticle energy coincides with a
-//! mean-field pole (degenerate shells, near-zero QP shifts).  Wherever no
-//! pole is crossed the two forms are numerically identical:
-//! `Sigma_sub - Sigma_raw = sum_m [A_m + 1/2 - f_m - s_m pf_m] W_m(0)` with
-//! `A_m = 1/pi sum_k w_k K(t_m,u_k) = 1/2 sign(t_m) + O(1e-9)` on REST's
-//! transformed Gauss-Legendre grids, so finite differences of the *raw*
-//! production energy match the subtracted analytic gradient (validated in
-//! `tests/gw_bse/test_gw_grad_subtracted.rs`).  `GwGradConfig::subtracted =
-//! false` restores the legacy raw functional.
-//!
-//! Key design points
-//! -----------------
-//! * Everything is expressed in the **raw RI representation** `(mu nu | P)`
-//!   (PySCF `gw_cd_grad` style): `q[P,pq] = sum_mu nu I C C`, metric
-//!   `J[P,Q] = (P|Q)`.  The screened correlation part is
-//!   `W_c[n,m](z) = q_nm^T [(J - Q(z))^-1 - J^-1] q_nm`, so no derivative of
-//!   the `J^{-1/2}` metric factorisation ever appears.
-//! * REST stores metric-transformed (`J^{-1/2}`) 3-center integrals; the
-//!   low-rank spectral factorisation of REST's real-symmetric response,
-//!   `W_c = S U diag(lam) U^T S` with `S = J^{-1/2}` and `lam = lam0/(1-lam0)`,
-//!   provides the response vectors `y = (J - Q)^{-1} q` cheaply, exactly as
-//!   PySCF's `gw_lr_cd_grad`.  The same low-rank truncation
-//!   (`low_rank_tolerance`) as the energy is applied, so the analytic
-//!   gradient matches finite differences of REST's low-rank energy.  Use a
-//!   tight tolerance (1e-10) for validation runs.
-//! * The pole selection, `pole_factor` smoothing, frequency grids, real-axis
-//!   grid construction (de_max scan, linear/quadratic nodes) and the QP Newton
-//!   iteration all follow REST's production low-rank path
-//!   (`ri_gw::contour_rayon_lowrank`, `generate_real_axis_vchiv`,
-//!   `newton_solver_lowrank`).
-//! * [`GwGradConfig::low_rank_interp`] mirrors the energy path's
-//!   `low_rank_interp` keyword.  The real-axis nodes are built from `de_max`,
-//!   which depends on the reference geometry, so the gradient also carries the
-//!   node-motion channel `d z_i / dR = (d z_i / d de_max)(d de_max / dR)`; the
-//!   interpolation weight adds `d t / dR`.  Both are exact, and the FD
-//!   validation in `tests/gw_bse/test_gw_bse_interp.rs` covers the two rules.
-//! * The reference is a restricted closed-shell density-fitted calculation
-//!   without frozen orbitals: HF, pure-DFA (GGA) and global-hybrid references
-//!   are supported.  The static term `B_n = (1-alpha) Sigma_x,nn - v_xc,nn`
-//!   of the QP equation is differentiated in full: the `(1-alpha)` RI
-//!   exchange through the (bq, bJ) pullback, the v_xc part (explicit grid
-//!   derivative, orbital rotation and XC-kernel density response) through
-//!   the `b_x` covector of `canonical_response_batch` (port of
-//!   `pyscf/gw/gw_cd_grad.py::_b_nuclear_deriv`).  Range-separated hybrids
-//!   are rejected.
-//! * The orbital response (U, eps1) is the full canonical CPHF response:
-//!   the CP-HF equation is solved by REST's `analdrv` driver (`RHessSCF`
-//!   block-Krylov over all perturbations, RI-JK response on `rimatr`), and
-//!   the remaining blocks are restored from the differentiated Roothaan
-//!   equation, exactly as `pyscf/gw/gw_cd_grad*.py::_cp_response_atom`.
-//!
-//! The module also provides [`GwCdGradEngine`], the port of the FULL
-//! (non-low-rank) CD-G0W0 gradients of `pyscf/gw/gw_cd_grad*.py`: the
-//! static-subtracted continuous self-energy with direct (naux x naux)
-//! factorisation of the screening matrix — no low-rank truncation — and
-//! exact moving residue frequencies.  See the section header below.
-
+//! whose subtraction removes the artificial pole-selection jump of the raw
+//! decomposition at `omega = e_m`, making the QP energy and its gradient well
+//! defined even when a QP energy coincides with a mean-field pole.
 use crate::ctrl_io::quasiparticle_methods::GwVariant;
 use crate::ri_gw::ac_grad::{pade_derivatives, pade_derivatives_greedy, pade_derivatives_nodes};
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
@@ -591,23 +514,6 @@ pub struct GwGradConfig {
     /// `O(naux nao nrow_A + naux_A nao^2)` and the whole gradient from
     /// `O(3 natm naux nao^2)` to `O(naux nao^2)`.
     pub local_di: bool,
-    /// Keep the individual adjoint skeleton tensors of the CP-HF channel in
-    /// [`CphfAdjoint`] (`Theta` alongside its folded combination `di_cov`, and the
-    /// MO-basis covectors), so that the piecewise identities can be checked term by term.
-    ///
-    /// Off by default: `Theta` duplicates an `naux * nao^2` tensor (874 MB at
-    /// naphthalene/def2-TZVP) that the gradient itself never reads after the fold.
-    /// This only affects memory, not the numbers.
-    pub keep_adjoint_pieces: bool,
-    /// Memory budget (MiB) of the RI-JK response-kernel cache used inside the adjoint CP-HF build.
-    ///
-    /// The cache trades memory for speed on the Z-vector solve. Its two tiers are the unpacked
-    /// three-centre ERI (`nao^2 * naux` doubles — 874 MB at naphthalene/def2-TZVP) and the much
-    /// smaller occupied half-transforms (`(nao+nocc) * naux * nocc`). The default here is
-    /// deliberately small: with a large budget the unpacked-`cderi` tier is resident *while the
-    /// folded covector `B_ao` (`naux*nao^2` doubles) is also alive*, which sets the gradient's peak.
-    /// 256 MiB keeps the half-transforms (the per-call win) and drops the big tier, costing about
-    /// 0.5 s on the Z solve; raise it on a memory-rich machine.
     /// Krylov tolerance of the CP-HF/CP-KS response solve (`cpscf_tol`, default
     /// `1e-9`) and the inflation factor of its intermediate iterations
     /// (`cpscf_tol_inflation`, default `1000`).
@@ -622,7 +528,6 @@ pub struct GwGradConfig {
     pub cpscf_tol: f64,
     /// Inflation of [`Self::cpscf_tol`] for the intermediate Krylov iterations.
     pub cpscf_tol_inflation: f64,
-    /// Cache the bra-independent intermediates of the RI-JK response kernel
     /// Evaluate the adjoint CP-HF channel without the per-perturbation skeleton
     /// right-hand side tensor: `rhs_d` is linear in the derivative integrals,
     /// so `sum_d <Z, rhs_d>` is folded into direction-independent AO-basis
@@ -730,7 +635,6 @@ impl Default for GwGradConfig {
             // `gradient_adjoint_cphf = false`) restores the canonical route.
             adjoint_cphf_dft: std::env::var("REST_ADJOINT_DFT").map_or(true, |v| v != "0"),
             local_di: true,
-            keep_adjoint_pieces: false,
             cpscf_tol: 1.0e-9,
             cpscf_tol_inflation: 1000.0,
             fold_cphf_rhs: true,
@@ -1257,11 +1161,6 @@ impl RawRiTensors {
         (blk, f0, f1)
     }
 
-    /// Debug probe: is another thread currently building or reading the raw-integral buffer?
-    pub fn i3_dbg_try_borrow(&self) -> bool {
-        self.i3.try_lock().is_err()
-    }
-
     /// Length of the resident raw-integral buffer (0 while evicted) -- profiling aid.
     pub fn i3_len(&self) -> usize {
         self.i3
@@ -1286,58 +1185,6 @@ impl RawRiTensors {
     /// shared by its three Cartesian components.  The total integral work
     /// summed over atoms equals one full `dI1`/`dI2` build, but only one
     /// atom's blocks are resident at a time.
-    /// Atom-sliced `int3c2e_ip1` block only (AO-derivative tables).  The caller
-    /// usually needs either the `ip1` or the `ip2` block; evaluating both every
-    /// time doubles the integral cost for no reason.
-    pub fn d1_blocks(&self, atm: usize) -> AtomDerivBlocks {
-        let row = self.ao_range[atm];
-        let nrow = row[1] - row[0];
-        let aux_r = self.aux_range[atm];
-        let shls1 = [self.ao_shl_range[atm], [0, self.mol.nbas()], [0, self.auxmol.nbas()]];
-        let (d1, shape1) = CInt::integrate_cross(
-            "int3c2e_ip1",
-            [&self.mol, &self.mol, &self.auxmol],
-            "s1",
-            &shls1,
-        )
-        .into();
-        assert_eq!(shape1, vec![nrow, self.nao, self.naux, 3], "sliced int3c2e_ip1 shape");
-        AtomDerivBlocks {
-            d1,
-            d2: Vec::new(),
-            atm,
-            row0: row[0],
-            nrow,
-            naux_a: aux_r[1] - aux_r[0],
-            aux0: aux_r[0],
-        }
-    }
-
-    /// Atom-sliced `int3c2e_ip2` block only (auxiliary-basis derivative).
-    pub fn d2_blocks(&self, atm: usize) -> AtomDerivBlocks {
-        let row = self.ao_range[atm];
-        let aux_r = self.aux_range[atm];
-        let naux_a = aux_r[1] - aux_r[0];
-        let shls2 = [[0, self.mol.nbas()], [0, self.mol.nbas()], self.aux_shl_range[atm]];
-        let (d2, shape2) = CInt::integrate_cross(
-            "int3c2e_ip2",
-            [&self.mol, &self.mol, &self.auxmol],
-            "s1",
-            &shls2,
-        )
-        .into();
-        assert_eq!(shape2, vec![self.nao, self.nao, naux_a, 3], "sliced int3c2e_ip2 shape");
-        AtomDerivBlocks {
-            d1: Vec::new(),
-            d2,
-            atm,
-            row0: row[0],
-            nrow: row[1] - row[0],
-            naux_a,
-            aux0: aux_r[0],
-        }
-    }
-
     pub fn d_atom_blocks(&self, atm: usize) -> AtomDerivBlocks {
         let row = self.ao_range[atm];
         let nrow = row[1] - row[0];
@@ -1411,14 +1258,6 @@ impl RawRiTensors {
         di
     }
 
-    /// One-shot derivative of one perturbation (blocks are rebuilt; prefer
-    /// [`RawRiTensors::d_atom_blocks`] + [`RawRiTensors::d_i_from_blocks`]
-    /// inside the per-atom loop).
-    pub fn d_i_atom(&self, atm: usize, comp: usize) -> Vec<f64> {
-        let blocks = self.d_atom_blocks(atm);
-        self.d_i_from_blocks(&blocks, comp)
-    }
-
     /// Assemble the `[nao, nao]` slice of `dI` for ONE auxiliary function
     /// `p` into `out` (col-major, overwritten).  Streaming variant of
     /// [`RawRiTensors::d_i_from_blocks`]: lets the qx U-part-gemm consume
@@ -1486,10 +1325,6 @@ pub fn flat_dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-pub fn solve_linear(a: &MatrixFull<f64>, b: &[f64]) -> Vec<f64> {
-    _dsolve(a, b).expect("gw_grad: singular linear system")
-}
-
 fn to_mat(v: &[f64], r: usize, c: usize) -> MatrixFull<f64> {
     MatrixFull::from_vec([r, c], v.to_vec()).unwrap()
 }
@@ -1522,17 +1357,6 @@ fn gemm_nt(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> 
     let mut out = MatrixFull::new([ac, bc], 0.0);
     _dgemm_full(&am, 'T', &bm, 'N', &mut out, 1.0, 0.0);
     out.data
-}
-
-/// Explicit transpose of a flat col-major `[r, c]` buffer.
-fn transpose_buf(a: &[f64], r: usize, c: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; r * c];
-    for i in 0..r {
-        for j in 0..c {
-            out[j + i * c] = a[i + j * r];
-        }
-    }
-    out
 }
 
 /// `A B` for flat col-major buffers `A [ar, ac]`, `B [br, bc]`, `ac == br`; result `[ar, bc]`.
@@ -1709,28 +1533,6 @@ fn build_lr_factor_at(
     tol: f64,
 ) -> LrFactor {
     build_lr_factor(qtia, naux, nov, de_ia, z, 'R', eta, tol)
-}
-
-#[allow(dead_code)]
-fn build_lr_factors(
-    qtia: &[f64],
-    naux: usize,
-    nov: usize,
-    de_ia: &[f64],
-    quad: &[(f64, f64)],
-    z_grid: &[f64],
-    eta: f64,
-    tol: f64,
-) -> (Vec<LrFactor>, Vec<LrFactor>) {
-    let lr_imag = quad
-        .iter()
-        .map(|&(u, _)| build_lr_factor(qtia, naux, nov, de_ia, u, 'I', 0.0, tol))
-        .collect();
-    let lr_grid = z_grid
-        .iter()
-        .map(|&z| build_lr_factor(qtia, naux, nov, de_ia, z, 'R', eta, tol))
-        .collect();
-    (lr_imag, lr_grid)
 }
 
 fn build_lr_factor(
@@ -2174,29 +1976,6 @@ struct AcParts {
     be_omega: Vec<f64>,
 }
 
-/// The LR-CD G0W0 analytic-gradient engine for one geometry.
-///
-/// Pair layout used throughout: `q[Q + (p + q_mo*nmo)*naux]` for the raw
-/// integrals and `qt` (metric-transformed), and
-/// `qia[Q + (i + a*nocc)*naux]` for the occupied-virtual block.
-/// A `Sync` view of a [`GwGradEngine`] for read-only parallel phases.
-///
-/// `GwGradEngine` holds its evictable caches in `RefCell`s, so it is not `Sync`:
-/// the type system cannot know that the lazy builders are no-ops once the caches
-/// exist.  The QP pullback is the one phase that needs to share the engine
-/// across threads, and it runs **after** the serial prologue that builds every
-/// cache it reads ([`BseGradEngine::analytic_gradients`] builds each active
-/// [`QpCache`] and the QP-cache construction already materialises the low-rank
-/// factors), so under the invariant below the shared access is pure reads.
-///
-/// # Safety
-///
-/// Code holding a `&SyncGw` must not call a `GwGradEngine` method that can
-/// mutate a `RefCell` (the `ensure_*` builders, `evict_*`, `rebuild_*`, the
-/// `*_cache` constructors) while another thread is using the same engine.  The
-/// only users are the page workers of the parallel QP pullback, which call
-/// `qp_pullback_chunk_public` / `qp_pullback_chunk_omega_public` — both of which
-/// only read the caches, `qia`, `de_ia` and the quadrature.
 #[derive(Clone, Copy)]
 pub struct SyncGw<'a, 'b>(pub &'a GwGradEngine<'b>);
 
@@ -2273,22 +2052,6 @@ impl<'a, 'b> SyncGw<'a, 'b> {
     #[inline]
     pub fn nmo(&self) -> usize {
         self.0.nmo
-    }
-    #[inline]
-    pub fn scf_num_threads(&self) -> Option<usize> {
-        self.0.scf.mol.ctrl.num_threads
-    }
-    #[inline]
-    pub fn ao_shl_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.ao_shl_range[atm]
-    }
-    #[inline]
-    pub fn ao_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.ao_range[atm]
-    }
-    #[inline]
-    pub fn aux_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.aux_range[atm]
     }
     #[inline]
     pub fn d_atom_blocks(&self, atm: usize) -> AtomDerivBlocks {
@@ -3055,11 +2818,6 @@ impl<'a> GwGradEngine<'a> {
         b.copy_from_slice(&bm.data);
     }
 
-    /// Public single-rhs metric solve (verification helper).
-    pub fn solve_metric_public(&self, rhs: &mut [f64]) {
-        self.solve_metric_batch(rhs, 1);
-    }
-
     /// `J^{-1} rhs` for a single right-hand side.
     pub(crate) fn solve_metric(&self, rhs: &[f64]) -> Vec<f64> {
         let mut b = rhs.to_vec();
@@ -3127,11 +2885,6 @@ impl<'a> GwGradEngine<'a> {
         let _ = self.lr_grid[idx].set(factor);
     }
 
-    /// Are all the low-rank slots resident?  (debug/probe helper)
-    pub fn lr_grid_all_resident(&self) -> bool {
-        self.lr_grid.iter().all(|c| c.get().is_some())
-    }
-
     /// Make the static (`z = 0`) low-rank factor resident, building it on
     /// first use (see [`Self::lr_static`]).  The `z = 0` Lorentzian diagonal
     /// `-4 de/(de^2 + eta^2)` is exactly what the production real-axis grid
@@ -3158,20 +2911,6 @@ impl<'a> GwGradEngine<'a> {
             )
         });
         *self.lr_static.borrow_mut() = Some(factor);
-    }
-
-    /// Static response row values `W_m(0)` of one orbital row from its metric
-    /// intermediate `m = S q_n` (empty when the engine runs raw/full-CD).
-    fn lr_static_row_values(&self, m: &[f64]) -> Vec<f64> {
-        if !self.config.subtracted || self.config.skip_lr_cache {
-            return Vec::new();
-        }
-        self.ensure_lr_static();
-        let guard = self.lr_static.borrow();
-        guard
-            .as_ref()
-            .expect("gw_grad: static low-rank factor missing")
-            .response_value_from_qt(m, self.nmo)
     }
 
     /// Static response vectors `y0s = (J - Q(0))^-1 q_n` of one orbital row
@@ -4052,74 +3791,10 @@ impl<'a> GwGradEngine<'a> {
         self.lr_static_row_response(m)
     }
 
-    /// Sample the QP equation `f(omega) = consts + Sigma_c(omega) - omega` of
-    /// one orbital on a uniform grid.  Validation aid for the Newton solver:
-    /// the quantised residue protocol makes `f` piecewise continuous with
-    /// jumps, so it is worth seeing where the sign changes.
-    pub fn sample_qp_equation(&self, n: usize, lo: f64, hi: f64, npts: usize) -> Vec<(f64, f64)> {
-        let consts = self.consts(n);
-        (0..npts)
-            .map(|i| {
-                let x = lo + (hi - lo) * i as f64 / (npts - 1) as f64;
-                (x, consts + self.sigma_c(x, n) - x)
-            })
-            .collect()
-    }
-
-    /// Sample `(f(omega), f'(omega))` of the QP equation of one orbital, where
-    /// `f'` is the derivative the solver uses (`sigma_c_and_d`).  Validation
-    /// aid: in a self-consistent protocol the analytic `f'` must agree with a
-    /// central difference of `f`.
-    pub fn qp_equation_consistency(
-        &self,
-        n: usize,
-        omegas: &[f64],
-        h: f64,
-    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        let consts = self.consts(n);
-        let f = |om: f64| consts + self.sigma_c(om, n) - om;
-        let mut vals = Vec::with_capacity(omegas.len());
-        let mut ana = Vec::with_capacity(omegas.len());
-        let mut num = Vec::with_capacity(omegas.len());
-        for &om in omegas {
-            vals.push(f(om));
-            let (_sc, ds) = self.sigma_c_and_d(om, n);
-            ana.push(ds - 1.0);
-            num.push((f(om + h) - f(om - h)) / (2.0 * h));
-        }
-        (vals, ana, num)
-    }
-
-    /// The metric intermediate `m = s_metric * q_n` of one orbital row.
-    pub fn row_metric_intermediate(&self, n: usize) -> Vec<f64> {
-        self.ensure_q();
-        let qn = self.with_q(|q| self.gather_row(q, n));
-        gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo)
-    }
-
-    /// Rebuild `(y, y0)` of one quadrature point from `m`
-    /// (see [`Self::screened_row_compact`]).
-    pub fn row_response_from_m(&self, wi: usize, m: &[f64]) -> (Vec<f64>, Vec<f64>) {
-        self.ensure_lr();
-        let lr_imag = self.lr_imag.borrow();
-        let y = lr_imag[wi].response_vectors_from_qt(&self.s_metric, m, self.nmo);
-        let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, m, self.naux, self.nmo);
-        (y, y0)
-    }
-
     /// Raw CD self-energy `Sigma_c(omega) = contour(omega) - imag(omega)`.
     pub fn sigma_c(&self, omega: f64, n: usize) -> f64 {
         let (contour, imag, _, _, _, _) = self.sigma_c_parts(omega, n, false, false);
         contour - imag
-    }
-
-    /// Decomposed self-energy at fixed omega (for validation).  With the
-    /// static-subtracted functional the parts are already rebalanced: the
-    /// returned `imag` carries `W(iu) - W(0)` kernels and `contour` the static
-    /// and residue `W(0)` bookkeeping, so `contour - imag` is `Sigma_sub`.
-    pub fn sigma_c_decomposed(&self, omega: f64, n: usize) -> (f64, f64) {
-        let (contour, imag, _, _, _, _) = self.sigma_c_parts(omega, n, false, false);
-        (contour, imag)
     }
 
     /// Omega-derivative pieces from already-collected response data:
@@ -4234,116 +3909,6 @@ impl<'a> GwGradEngine<'a> {
     /// representation is never needed there.
     pub fn build_target_cache_compact(&self, n: usize) -> QpCache {
         self.build_target_cache_with(n, false)
-    }
-
-    /// Build the QP caches of `targets` **in parallel**, sharing `self` through
-    /// the read-only [`SyncGw`] view.
-    ///
-    /// This is the one large serial block of the BSE gradient: at vitamin
-    /// C/def2-TZVP on an EPYC 9654 it is 128.9 s of the 434.7 s one-thread BSE
-    /// gradient (only 1.71x at 8 threads), while the screening assembly and the
-    /// BSE matrices together cost 0.15 s.  A cache is a pure function of the
-    /// geometry-fixed row table and the low-rank factors, so a per-orbital map
-    /// cannot change the numbers — but it does have to satisfy the invariant
-    /// below, which is why the warm-up lives here and not at the call site.
-    ///
-    /// # Invariant
-    ///
-    /// `build_target_cache_with` reaches five interior-mutable slots:
-    ///
-    /// | slot | reached through | filled by |
-    /// |---|---|---|
-    /// | `raw.i3` | `build_q` -> `raw.with_i3` | [`RawRiTensors::ensure_i3`] |
-    /// | `q` | `consts` -> `with_qt` -> `ensure_qt` -> `ensure_q` | `ensure_q` |
-    /// | `qt`, `qtia` | `ensure_qt`, `with_qtia` | `ensure_qt`, `with_qtia` |
-    /// | `lr_imag` | `ensure_lr` | `ensure_lr` |
-    /// | `lr_grid[*]`, `lr_static` | `ensure_lr_grid_factor`, `ensure_lr_static` | same |
-    ///
-    /// They are all materialised **serially and in that order** before the pool
-    /// starts: `q`/`qt` must precede the low-rank factors because `ensure_lr`'s
-    /// cold path goes back through `with_qtia` -> `ensure_qt` -> `ensure_q`, and
-    /// `raw.i3` must precede everything because `build_q` reads it.  Once they
-    /// are resident the guards short-circuit and the sweep only reads, which is
-    /// what makes `SyncGw` sound.
-    ///
-    /// **Not yet enabled in production.**  A residual cold path still trips
-    /// `ensure_q` under the parallel sweep (`RefCell already mutably borrowed`,
-    /// `gw_grad.rs`'s `ensure_q`); the `debug_assert`s below are there to make
-    /// that fail loudly instead of confusingly once the last path is found.  See
-    /// `docs/GW_BSE_并行效率优化方案.md` section 16 for the analysis and the
-    /// recommended fix (`OnceLock<Mutex<Option<..>>>`, which keeps `evict_*`'s
-    /// release-and-rebuild semantics that a plain `OnceLock` would lose).
-    pub fn build_target_caches_parallel(&self, targets: &[usize]) -> Vec<(usize, QpCache)> {
-        use rayon::prelude::*;
-        self.warm_lazy_caches();
-        debug_assert!(
-            !self.raw.i3_dbg_try_borrow(),
-            "build_target_caches_parallel: raw.i3 still borrowed after warm-up"
-        );
-        debug_assert!(
-            !self.q_dbg_try_borrow() && !self.qt_dbg_try_borrow() && !self.qtia_dbg_try_borrow(),
-            "build_target_caches_parallel: q/qt/qtia not resident after warm-up"
-        );
-        let gwv = SyncGw(self);
-        //
-        // **Bounded concurrency.**  Handing the whole target list to `par_iter`
-        // was measured to be a *net loss* on the whole gradient (vitamin
-        // C/def2-TZVP, EPYC 9654: `BSE build` 125.5 s -> 48.3 s, but the 1-vs-8
-        // gradient speedup fell from 2.75x to 2.16x and the peak rose from 6.9 GB
-        // to 7.6 GB) because every in-flight cache keeps its own QP-solve work
-        // arrays, so the workers contend for memory bandwidth.
-        //
-        // Building in batches of `batch` and trimming the arena between them
-        // keeps the peak near the serial level while still overlapping the
-        // integral-free part of the solves.
-        let batch = std::env::var("REST_QP_BUILD_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
-            .max(1);
-        let mut out: Vec<(usize, QpCache)> = Vec::with_capacity(targets.len());
-        for chunk in targets.chunks(batch) {
-            let part: Vec<(usize, QpCache)> = chunk
-                .par_iter()
-                .map(|&n| (n, gwv.build_target_cache_compact(n)))
-                .collect();
-            out.extend(part);
-            crate::hessian::memory_monitor::trim_to_os(0);
-        }
-        out
-    }
-
-    /// Serial warm-up of every interior-mutable slot
-    /// [`Self::build_target_caches_parallel`] depends on.
-    ///
-    /// The order is a correctness condition; see that method.  `raw.i3` is
-    /// included because `build_q` reaches it through `RawRiTensors::with_i3`,
-    /// whose cold path (`*self.i3.borrow_mut() = i3`) is itself a
-    /// `RefCell already mutably borrowed` hazard for a parallel sweep.
-    pub fn warm_lazy_caches(&self) {
-        self.raw.ensure_i3();
-        self.ensure_q();
-        self.ensure_qt();
-        self.ensure_lr_static();
-        self.ensure_lr();
-        // The real-axis grid is **deliberately not** pre-filled: each node is its
-        // own `OnceLock`, so the sweep may build the one or two nodes it needs
-        // concurrently.  Pre-filling the whole grid is what made an earlier
-        // attempt at this parallelisation 5.7x *slower* than the serial loop
-        // (`z_grid.len() * naux^2` doubles, measured 428 s vs 75 s at vitamin
-        // C/def2-TZVP).
-    }
-
-    /// Debug probes for the invariant of
-    /// [`Self::build_target_caches_parallel`].
-    pub fn q_dbg_try_borrow(&self) -> bool {
-        self.q.try_borrow().is_err()
-    }
-    pub fn qt_dbg_try_borrow(&self) -> bool {
-        self.qt.try_borrow().is_err()
-    }
-    pub fn qtia_dbg_try_borrow(&self) -> bool {
-        self.qtia.try_borrow().is_err()
     }
 
     /// Cache of the **static on-shell** quasiparticle energy
@@ -5014,107 +4579,6 @@ impl<'a> GwGradEngine<'a> {
         }
     }
 
-    /// Exact complex screening row `W_c,nm(z)` (and `dW/dz`) at one
-    /// frequency, computed with a fresh response LU.  Diagnostic only: the
-    /// production WAC path never calls this.
-    #[allow(dead_code)]
-    fn wac_w_at(
-        &self,
-        table: &QpRowTable,
-        z: Complex<f64>,
-    ) -> (Vec<Complex<f64>>, Vec<Complex<f64>>) {
-        let (naux, nov) = (self.naux, self.de_ia.len());
-        let nmo = self.nmo;
-        self.with_qtia(|qtia| {
-            let mut chi = wac_chi0(qtia, naux, nov, &self.de_ia, z);
-            for x in chi.data.iter_mut() {
-                *x = -*x;
-            }
-            for d in 0..naux {
-                chi[[d, d]] += Complex::new(1.0, 0.0);
-            }
-            let re: Vec<f64> = chi.data.iter().map(|c| c.re).collect();
-            let im: Vec<f64> = chi.data.iter().map(|c| c.im).collect();
-            let lu = CdLuFactor::factor(&re, &im, naux);
-            let wts: Vec<Complex<f64>> = self
-                .de_ia
-                .iter()
-                .map(|&de| {
-                    let den = Complex::new(de * de, 0.0) - z * z;
-                    Complex::new(-8.0 * de, 0.0) * z / (den * den)
-                })
-                .collect();
-            let dchi = wac_chi0_weights(qtia, naux, nov, &wts);
-            let qn = &table.m;
-            let mut y: Vec<Complex<f64>> = qn.iter().map(|&x| Complex::new(x, 0.0)).collect();
-            lu.solve_in_place(&mut y, nmo);
-            let mut w = vec![Complex::new(0.0, 0.0); nmo];
-            let mut dw = vec![Complex::new(0.0, 0.0); nmo];
-            for m in 0..nmo {
-                let mut acc = Complex::new(0.0, 0.0);
-                let mut dacc = Complex::new(0.0, 0.0);
-                for a in 0..naux {
-                    let q = qn[a + m * naux];
-                    let ya = y[a + m * naux];
-                    acc += q * (ya - Complex::new(q, 0.0));
-                    for b in 0..naux {
-                        dacc += ya * dchi[[a, b]] * y[b + m * naux];
-                    }
-                }
-                w[m] = acc;
-                dw[m] = dacc;
-            }
-            (w, dw)
-        })
-    }
-
-    /// Diagnostic: compare the Padé-continued `W_c,nm` and `dW/dz` at every
-    /// active residue node of orbital `n` with the exact complex response.
-    #[allow(dead_code)]
-    pub fn wac_debug_residue(&self, n: usize) {
-        let cache = self.build_target_cache(n);
-        let omega = cache.omega;
-        let table = self.qp_row_table(n);
-        self.ensure_wac_reference();
-        let guard = self.wac_ref.borrow();
-        let r = guard.as_ref().unwrap();
-        let (vals, _dvals) = self.wac_values(&table, r);
-        let eta = self.config.eta;
-        let ef = 0.5 * (self.e[self.nocc - 1] + self.e[self.nocc]);
-        let sign = if omega > ef { 1.0 } else { -1.0 };
-        let start = if sign > 0.0 { self.nocc } else { 0 };
-        let end = if sign > 0.0 { self.nmo } else { self.nocc };
-        println!("WAC debug: n={n} omega={omega:.10} sign={sign} nref={}", r.z.len());
-        for m in start..end {
-            let de = if sign > 0.0 { omega - self.e[m] } else { self.e[m] - omega };
-            if de <= -self.config.res_tol {
-                continue;
-            }
-            let pf = if de.abs() < self.config.res_tol { 0.5 } else { 1.0 };
-            let ze = Complex::new(de, eta);
-            let column: Vec<Complex<f64>> = vals.iter().map(|row| row[m]).collect();
-            let p = match pade_derivatives_greedy(&r.u, &column, ze * ze) {
-                Some(p) => p,
-                None => {
-                    println!("   m={m:2} zeta={de:.6}: PADE BREAKDOWN");
-                    continue;
-                }
-            };
-            let (w_ex, dw_ex) = self.wac_w_at(&table, ze);
-            let du = 2.0 * ze * sign;
-            let dpade_dz = p.dvalue_dz;
-            println!(
-                "   m={m:2} zeta={de:+.6} pf={pf:.1} |W_ex|={:.4e} |W_p|={:.4e} err={:.3e} rel={:.2e} |dWdz ex|={:.4e} err={:.3e}",
-                w_ex[m].norm(),
-                p.value.norm(),
-                (p.value - w_ex[m]).norm(),
-                (p.value - w_ex[m]).norm() / w_ex[m].norm().max(1e-30),
-                (dw_ex[m] * du).norm(),
-                (dpade_dz * du - dw_ex[m] * du).norm(),
-            );
-        }
-    }
-
     /// CD-WAC cache at a fixed frequency (pinned QP energies).
     fn wac_cache_at_omega(&self, n: usize, omega: f64, want_y: bool) -> QpCache {
         let table = self.qp_row_table(n);
@@ -5266,30 +4730,6 @@ impl<'a> GwGradEngine<'a> {
             w_coeff_omega,
             be_omega,
         })
-    }
-
-    /// Debug/validation aid: the raw AC setup of one orbital (sample
-    /// frequencies, Fermi shift and sample values).  Used by the finite
-    /// difference diagnostics of the AC chain rule.
-    #[doc(hidden)]
-    pub fn ac_debug_setup(&self, n: usize) -> (Vec<f64>, f64, Vec<Complex<f64>>) {
-        let table = self.qp_row_table(n);
-        let setup = self.ac_setup(&table);
-        (setup.lambdas, self.ac_fermi_level(), setup.values)
-    }
-
-    /// Debug/validation aid: AC value, coefficient table and screened rows at
-    /// one frequency.
-    #[doc(hidden)]
-    pub fn ac_debug_coeff(
-        &self,
-        n: usize,
-        omega: f64,
-    ) -> (f64, Vec<Vec<f64>>, Vec<Vec<f64>>) {
-        let table = self.qp_row_table(n);
-        let setup = self.ac_setup(&table);
-        let parts = self.ac_parts(&table, &setup, omega).unwrap();
-        (parts.sigma, parts.w_coeff, table.w_imag)
     }
 
     /// Assemble a [`QpCache`] from AC pieces.  The static-subtraction fields
@@ -7999,16 +7439,6 @@ fn k_deriv_from_impl(
     out
 }
 
-/// multi-right-hand-side metric solve on a flat [naux, ncol] col-major buffer
-/// (kept for the validation harnesses that solve column by column)
-#[allow(dead_code)]
-fn solve_metric_flat(b: &mut [f64], naux: usize, ncol: usize, solve: &dyn Fn(&[f64]) -> Vec<f64>) {
-    for col in 0..ncol {
-        let sol = solve(&b[col * naux..(col + 1) * naux]);
-        b[col * naux..(col + 1) * naux].copy_from_slice(&sol);
-    }
-}
-
 impl GwGradEngine<'_> {
     /// Canonical response of every nuclear perturbation `(atm, comp)`,
     /// computed by the `analdrv` CP-HF driver: `RHessSCF` assembles the
@@ -8025,33 +7455,10 @@ impl GwGradEngine<'_> {
     pub fn canonical_response_batch(
         &self,
     ) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-        self.canonical_response_batch_impl(false).0
+        self.canonical_response_batch_impl()
     }
 
-    /// Same as [`GwGradEngine::canonical_response_batch`], but also returns the
-    /// per-perturbation intermediates (`jd`, `kd`, `f1_skel_mo`, `s1_mo`,
-    /// `mo1`, `rhs`) used by the adjoint cross-checks.
-    pub fn canonical_response_batch_full(
-        &self,
-    ) -> (
-        Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
-        Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
-    ) {
-        self.canonical_response_batch_impl(true)
-    }
-
-    /// Shared driver of [`Self::canonical_response_batch`] and
-    /// [`Self::canonical_response_batch_full`]; `collect_debug` also keeps the
-    /// per-perturbation intermediates (6 buffers per perturbation, ≈ 75 MB at
-    /// naphthalene/def2-SVP), which only the validation harnesses read.
-    #[allow(clippy::type_complexity)]
-    fn canonical_response_batch_impl(
-        &self,
-        collect_debug: bool,
-    ) -> (
-        Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
-        Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
-    ) {
+    fn canonical_response_batch_impl(&self) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
         use crate::analdrv::prelude::{
             AnalDrvConfig, HessNucAPI, RHessCoreAPI, RHessElecInteractAPI, RHessHcore,
             RHessOvlp, RHessSCF,
@@ -8209,7 +7616,6 @@ impl GwGradEngine<'_> {
         // route here.
         let mo1_data = &mo1_tsr.raw()[mo1_tsr.offset()..];
         let rhs_tsr = &rhs_map["rhs"];
-        let rhs_data = &rhs_tsr.raw()[rhs_tsr.offset()..];
         let n2 = nao * nao;
         // The per-perturbation assembly is embarrassingly parallel: each
         // perturbation owns its `h1`/`s1`/`dI`/`dJ` slabs and its Roothaan
@@ -8229,7 +7635,6 @@ impl GwGradEngine<'_> {
             t_fin: f64,
             sub: [f64; 4],
             resp: (Vec<f64>, Vec<f64>, Vec<f64>),
-            dbg: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
         }
         // The workers below share the engine through `SyncGw`, which is only sound while the
         // lazy caches are **read-only**.  `int3c2e` (`raw.i3`) is the one they reach through
@@ -8307,23 +7712,8 @@ impl GwGradEngine<'_> {
                     );
                     let t_fin = t0.elapsed().as_secs_f64();
                     let sub = T_TIMER.with(|c| *c.borrow());
-                    let dbg = if collect_debug {
-                        Some((
-                            jd,
-                            kd,
-                            f1_skel_mo,
-                            s1_mo,
-                            mo1_slab.to_vec(),
-                            rhs_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc].to_vec(),
-                        ))
-                    } else {
-                        // the intermediates are only read by the validation
-                        // harnesses; dropping them here keeps the CP-HF work space
-                        // (and its transient copies) off the production path
-                        drop((jd, kd, f1_skel_mo, s1_mo));
-                        None
-                    };
-                    PertOut { t_dij, t_skel, t_fin, sub, resp, dbg }
+                    drop((jd, kd, f1_skel_mo, s1_mo));
+                    PertOut { t_dij, t_skel, t_fin, sub, resp }
                 })
                 .collect()
             };
@@ -8331,8 +7721,6 @@ impl GwGradEngine<'_> {
             k0 = k1;
         }
         let mut responses: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::with_capacity(natm * 3);
-        let mut debug: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> =
-            Vec::with_capacity(natm * 3);
         let (mut t_dij, mut t_skel, mut t_fin) = (0.0f64, 0.0f64, 0.0f64);
         let mut sub_tot = [0.0f64; 4];
         for p in per_pert {
@@ -8343,9 +7731,6 @@ impl GwGradEngine<'_> {
                 *a += *b;
             }
             responses.push(p.resp);
-            if let Some(d) = p.dbg {
-                debug.push(d);
-            }
         }
         T_TIMER.with(|c| *c.borrow_mut() = sub_tot);
 
@@ -8357,7 +7742,7 @@ impl GwGradEngine<'_> {
             );
         }
         let _ = n2;
-        (responses, debug)
+        responses
     }
 
     /// Full-MO skeleton Fock and overlap derivatives of one perturbation,
@@ -8672,7 +8057,11 @@ impl GwGradEngine<'_> {
         (u, eps1, b_x)
     }
 
-    /// Analytic gradient of one LR-CD G0W0 QP energy.
+    /// Analytic gradient of one AC / WAC G0W0 QP energy.
+    ///
+    /// The LR-CD derivative path has been removed; CD is differentiated by
+    /// [`GwCdGradEngine`].  This driver only builds the low-rank AC/WAC QP
+    /// caches and contracts their pullback.
     ///
     /// Returns `(grad, omega, z_factor)` with `grad[atm*3 + comp]` in
     /// Hartree/Bohr (row-major over atoms and Cartesian components).
@@ -8685,7 +8074,11 @@ impl GwGradEngine<'_> {
     /// QP energy of orbital `target` converges to: displacing the nuclei
     /// splits the shell, the sorted index follows the *other* branch at `-h`,
     /// so the two-sided difference averages the two level derivatives.
-    pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
+    pub fn analytic_gradient_ac_wac(&self, target: usize) -> (Vec<f64>, f64, f64) {
+        assert!(
+            matches!(self.config.gw_variant, GwVariant::Ac | GwVariant::Wac),
+            "GwGradEngine::analytic_gradient_ac_wac covers only AC/WAC; use GwCdGradEngine for CD"
+        );
         mem_probe("gradient: enter");
         let shell = self.degenerate_shell(target);
         let caches: Vec<QpCache> = shell.iter().map(|&m| self.build_target_cache(m)).collect();
@@ -8841,7 +8234,7 @@ impl GwGradEngine<'_> {
     }
 
     /// QP energy of one orbital (the scalar whose gradient is returned by
-    /// [`GwGradEngine::analytic_gradient`]).
+    /// [`GwGradEngine::analytic_gradient_ac_wac`]).
     pub fn qp_energy_of(&self, target: usize) -> f64 {
         self.build_target_cache(target).omega
     }
@@ -9879,16 +9272,6 @@ impl<'a> GwCdGradEngine<'a> {
     /// `GwGradConfig::qpe_graphical` the root comes from REST's production
     /// graphical linear-interpolation solver instead of the
     /// analytic-derivative Newton iteration (PySCF `qp_energy_subtracted`).
-    /// One-step Newton ("linearized") quasiparticle energy for the full-CD
-    /// engine — the counterpart of [`GwGradEngine::linearized_cache`].
-    ///
-    /// ```text
-    /// E_lin = e_n + Z(e_n) [ consts_n + Re Sigma_sub(e_n) - e_n ],
-    /// Z(e_n) = 1/(1 - d Re Sigma_sub/d omega)
-    /// ```
-    /// Full-CD static on-shell fallback: mean-field frequency and `Z = 1`
-    /// (`E = consts_n + Re Sigma_sub(e_n)`), the branch used for deep levels and
-    /// for a linearized step that is not a contraction.
     fn static_fallback_cache(&self, n: usize) -> CdQpCache {
         let e_n = self.base.e[n];
         let consts = self.consts(n);
@@ -9900,43 +9283,6 @@ impl<'a> GwCdGradEngine<'a> {
         cache.static_fallback = true;
         cache.linearized = false;
         cache.lin_shift = 0.0;
-        cache
-    }
-
-    #[allow(dead_code)]
-    /// Counterpart of [`GwGradEngine::linearized_guarded`] for the full-CD
-    /// engine: a non-positive linearized `Z` is rejected and the static
-    /// on-shell energy is used instead.
-    fn linearized_guarded(&self, n: usize) -> CdQpCache {
-        let e_n = self.base.e[n];
-        let consts = self.consts(n);
-        let (sigma, dsigma, _) = self.sigma_sub(e_n, n);
-        let z = 1.0 / (1.0 - dsigma);
-        if !(z > 0.0) {
-            println!(
-                "warning!!! cd_gw_grad orbital {n}: linearized (one-step Newton) Z = {z:.4} \
-                 is not positive (step would be {:+.3e} Ha); using the static on-shell energy",
-                z * (consts + sigma - e_n)
-            );
-            return self.static_fallback_cache(n);
-        }
-        self.linearized_cache(n)
-    }
-
-    #[allow(dead_code)]
-    fn linearized_cache(&self, n: usize) -> CdQpCache {
-        let e_n = self.base.e[n];
-        let consts = self.consts(n);
-        let (sigma, dsigma, mut cache) = self.sigma_sub(e_n, n);
-        let z = 1.0 / (1.0 - dsigma);
-        let shift = consts + sigma - e_n;
-        cache.omega = e_n + z * shift;
-        cache.freq = e_n;
-        cache.z_factor = z;
-        cache.dsigma_domega = dsigma;
-        cache.static_fallback = false;
-        cache.linearized = true;
-        cache.lin_shift = shift;
         cache
     }
 
@@ -10472,7 +9818,7 @@ impl<'a> GwCdGradEngine<'a> {
     ///
     /// For a `target` inside a symmetry-protected degenerate shell the
     /// gradient is the basis-independent **shell average** — see
-    /// [`GwGradEngine::analytic_gradient`].
+    /// [`GwGradEngine::analytic_gradient_ac_wac`].
     pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
         let shell = self.base.degenerate_shell(target);
         let caches: Vec<CdQpCache> =
@@ -10542,32 +9888,10 @@ impl<'a> GwCdGradEngine<'a> {
         grad
     }
 
-    /// Free the geometry-fixed screening factors.  They are only needed
-    /// while QP caches are built ([`GwCdGradEngine::build_target_cache`]);
-    /// calling this before the gradient phase (`analytic_gradient_with_cache`)
-    /// lowers the peak memory.  Any further cache build afterwards would
-    /// panic.
-    pub fn release_screening(&mut self) {
-        self.screening.chol_imag = Vec::new();
-        self.screening.lu_static.lu = Vec::new();
-        self.screening.lu_static.ipiv = Vec::new();
-    }
-
     /// QP energy of one orbital (the scalar whose gradient is returned by
     /// [`GwCdGradEngine::analytic_gradient`]).
     pub fn qp_energy_of(&self, target: usize) -> f64 {
         self.build_target_cache(target).omega
-    }
-
-    /// Validation helper: the response cache (response vectors, `W(iu)`,
-    /// `W(0)` and the active residues) evaluated at a **fixed** external
-    /// frequency, without the QP root search.  Together with the public
-    /// cache fields this lets a test rebuild each phase of the self-energy
-    /// and finite-difference it independently.
-    pub fn cache_at(&self, omega: f64, n: usize) -> CdQpCache {
-        let (_sigma, dsigma, mut cache) = self.sigma_sub(omega, n);
-        cache.z_factor = 1.0 / (1.0 - dsigma);
-        cache
     }
 
     /// Validation helper: `Re Sigma_sub(omega)` and `d Re Sigma_sub/d omega`
@@ -10577,15 +9901,6 @@ impl<'a> GwCdGradEngine<'a> {
         (sigma, dsigma)
     }
 
-    /// Validation helper: the pullback of one cache **without** the `Z`
-    /// renormalisation, i.e. `d consts_n/dR + d Re Sigma_sub/dR` at the cache
-    /// frequency.  This is the quantity a finite difference of
-    /// `e_n(R) + Re Sigma_sub(omega_ref, R)` (fixed `omega_ref`) must
-    /// reproduce, so it isolates the pullback from the `Z` factor / the
-    /// omega-dependence of the QP equation.
-    pub fn fixed_omega_gradient(&self, cache: &CdQpCache) -> Vec<f64> {
-        self.cd_gradient_with_caches(&[cache], &[vec![1.0 / cache.z_factor]])
-    }
 }
 
 // ===========================================================================
@@ -10746,11 +10061,6 @@ pub struct CphfAdjoint {
     /// skeleton exchange is `-0.5 * k_scale * Kd`, so the `Theta`/`Psi` tensors
     /// built for unit exchange enter the gradient with this weight (`1` for HF).
     pub k_scale: f64,
-    /// `[naux, nao, nao]`: exchange skeleton adjoint tensor `Theta`, kept **only** for
-    /// verification of the piecewise identities when
-    /// [`GwGradConfig::keep_adjoint_pieces`] is set; empty otherwise, because it is folded
-    /// into [`Self::di_cov`] in place and the per-direction contraction never reads it.
-    pub theta: Vec<f64>,
     /// wall-clock of the sub-phases (seconds):
     /// [0] covectors Lambda + Vtil = vind(Lam_ao), [1] analdrv object setup,
     /// [2] make_response_preparation, [3] compute_dimless_cpscf_rhs,
@@ -11294,15 +10604,12 @@ impl GwGradEngine<'_> {
         // a second `naux * nao^2` tensor (874 MB at naphthalene/def2-TZVP) out of the resident
         // set of the whole adjoint build and of the per-direction loop that follows.
         let mut di_cov = std::mem::take(&mut fold.b_ao);
-        let keep_pieces = self.config.keep_adjoint_pieces;
-        let mut theta_pieces: Vec<f64> = if keep_pieces { vec![0.0f64; naux * n2] } else { Vec::new() };
         let wfac = if fold_rhs { 1.0 } else { 0.0 };
         // The exchange skeleton of the reference is `-0.5 * fock_hyb * Kd`
         // (`fock_hyb` = 1 for HF), so the adjoint tensors `Theta`/`Psi`, which
         // are built for the *unit* exchange (`4<Theta,dI> - 2<Psi,dJ> =
         // <x_ao,Kd>`, see the identity check in `test_gw_folded_qx`), enter the
-        // gradient with this factor.  `theta_pieces` keeps the unit tensors so
-        // that the piecewise identity stays checkable.
+        // gradient with this factor.
         let kscale = self.fock_hyb;
         let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> Vec<f64> {
             let xm = to_mat(x_theta, nao, nao);
@@ -11317,9 +10624,6 @@ impl GwGradEngine<'_> {
                 }
                 _dgemm_full(&xm, 'N', &gp, 'N', &mut xb, 1.0, 0.0);
                 _dgemm_full(&xb, 'N', &cm, 'T', &mut th, 1.0, 0.0);
-                if keep_pieces {
-                    theta_pieces[p * n2..(p + 1) * n2].copy_from_slice(&th.data);
-                }
                 // in-place: B_P -= 2 Theta_P, then add c_P Lam_ao (+ c_P W); the accumulated
                 // value is symmetric in (mu, nu) (`a + at` and `at + a` are the same
                 // floating-point number), so each unordered index pair is written once.
@@ -11436,7 +10740,6 @@ impl GwGradEngine<'_> {
             // `Theta` was folded into `di_cov` in place; it exists only when a verification run
             // asked for the individual pieces (`keep_adjoint_pieces`), because it duplicates an
             // `naux * nao^2` tensor that the gradient itself never reads.
-            theta: theta_pieces,
             lam_mo: lam,
             lams_mo: lams,
             vtil,
