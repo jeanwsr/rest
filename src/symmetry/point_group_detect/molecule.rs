@@ -78,7 +78,7 @@ impl Tmpl {
 
     /// Order of the highest proper rotation axis (principal axis): the maximal
     /// `n` of a Cn symmetry operation contained in the group. Linear groups
-    /// report 0 (∞-fold); groups with only the identity report 1. For a pure
+    /// report 0 (infinity-fold); groups with only the identity report 1. For a pure
     /// Sn group the highest proper axis is C(n/2) (S_n² = C_{n/2}).
     pub fn principal_order(self, n: u32) -> u32 {
         use Tmpl::*;

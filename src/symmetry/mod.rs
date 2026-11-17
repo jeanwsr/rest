@@ -50,8 +50,9 @@ pub enum Engine {
 /// Unified point-group detection result, identical in shape for every engine.
 #[derive(Debug, Clone)]
 pub struct PointGroupInfo {
-    /// Schoenflies label in the Psi4 convention: `"C1"`, `"C2v"`, `"Td"`,
-    /// `"S4"`, `"D_inf_h"`, `"C_inf_v"`; single atoms report `"ATOM"`.
+    /// Schoenflies label in the Psi4 convention, guaranteed pure **ASCII**
+    /// (print/log safe): `"C1"`, `"C2v"`, `"Td"`, `"S4"`, `"D_inf_h"`,
+    /// `"C_inf_v"`; single atoms report `"ATOM"`.
     pub label: String,
     /// Rotational symmetry number σ (fractional `n/2` for Sn groups).
     pub sigma: f64,
@@ -150,6 +151,7 @@ mod tests {
         for engine in [Engine::Psi4, Engine::Classical] {
             let pg = detect_with_engine(&pos, &elems, engine, POS_TOL);
             assert_eq!(pg.engine, engine);
+            assert!(pg.label.is_ascii(), "non-ASCII label {:?} from engine {engine:?}", pg.label);
             assert_eq!(pg.label, want_label, "label mismatch for engine {engine:?}");
             assert!(
                 (pg.sigma - want_sigma).abs() < 1.0e-12,

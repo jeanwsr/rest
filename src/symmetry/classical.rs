@@ -30,7 +30,8 @@ const DIR_TOL: f64 = 1.0e-3;
 /// σ). The facade adapter maps this into the unified [`PointGroupInfo`].
 #[derive(Debug, Clone)]
 pub(super) struct ClassicalPointGroup {
-    /// Best-effort Schoenflies label, e.g. "Td", "C2v", "D6h", "D∞h".
+    /// Best-effort Schoenflies label (ASCII, Psi4 convention), e.g. "Td",
+    /// "C2v", "D6h", "D_inf_h".
     pub label: String,
     /// Rotational symmetry number = number of proper rotations in the group.
     pub sigma: u32,
@@ -65,7 +66,7 @@ pub(super) fn detect_raw(position: &MatrixFull<f64>, elems: &[String], tol: f64)
     let has_inv = is_symmetry(&inv_op, &pos, elems, tol);
 
     if is_linear {
-        let (label, sigma) = if has_inv { ("D∞h", 2u32) } else { ("C∞v", 1u32) };
+        let (label, sigma) = if has_inv { ("D_inf_h", 2u32) } else { ("C_inf_v", 1u32) };
         return ClassicalPointGroup {
             label: label.into(), sigma, principal_order: 0,
             is_linear: true, has_inversion: has_inv,
@@ -154,11 +155,13 @@ pub(super) fn detect_classical(position: &MatrixFull<f64>, elems: &[String], tol
     }
 }
 
-/// Map the classical engine's label set onto the unified (Psi4) convention.
+/// Map the classical engine's residual label divergences onto the unified
+/// (Psi4, ASCII) convention. Linear labels are emitted in the unified form
+/// directly; only the single-atom case needs remapping here (a single atom is
+/// spherically symmetric, not C1: C1 means "identity only", while an atom is
+/// invariant under all rotations).
 fn normalize_label(label: &str, natm: usize) -> String {
     match label {
-        "D∞h" => "D_inf_h".into(),
-        "C∞v" => "C_inf_v".into(),
         // single atoms report "ATOM" in the unified convention
         "C1" if natm == 1 => "ATOM".into(),
         _ => label.to_string(),
@@ -393,7 +396,7 @@ mod tests {
         let pg = detect_raw(&pos, &elems, 1.0e-2);
         assert_eq!(pg.sigma, 2);
         assert!(pg.is_linear);
-        assert_eq!(pg.label, "D∞h");
+        assert_eq!(pg.label, "D_inf_h");
     }
 
     #[test]
