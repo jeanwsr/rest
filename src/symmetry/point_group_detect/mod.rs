@@ -37,7 +37,5 @@ pub mod matrix;
 pub mod molecule;
 pub mod vec3;
 
-pub mod interface_to_rest;
-
 pub use detect::PointGroup;
 pub use molecule::SymmMolecule;
