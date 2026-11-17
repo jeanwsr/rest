@@ -32,9 +32,6 @@
 //!   reviewed by human.
 //!   - TR/V (translation-rotation and vibration classification) is different to Psi4. We will use
 //!     rotor-type to determine number of degrees of freedom (TR mode).
-//! - `point_group_detect`: Point group detection from Psi4, translated by AI, not reviewed by human
-//!   but have been tested.
-//!   - Note some point group detection is minorly different (such as C3v).
 //! - `krylov_block.rs`: Krylov solver (used in CP-SCF) from PySCF, translated with help by AI,
 //!   reviewed by extensive testing.
 
@@ -51,7 +48,6 @@ pub mod vibration;
 
 // utilities
 pub mod krylov_block;
-pub mod point_group_detect;
 pub mod trait_util;
 
 // hessian property

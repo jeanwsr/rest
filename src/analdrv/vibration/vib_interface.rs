@@ -59,7 +59,7 @@ pub fn vibration_analysis_interface(
         let e0 = scf_data.scf_energy;
         let multiplicity = scf_data.mol.ctrl.spin;
 
-        use crate::analdrv::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
+        use crate::symmetry::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
         let tol_pg = cfg.tol_point_group / (1.0 + natm as f64).sqrt();
         let (pg_name, pg_sigma) = get_full_point_group_for_vib(&elems, &mass, &geom, tol_pg);
 

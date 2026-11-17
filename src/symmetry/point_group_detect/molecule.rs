@@ -10,6 +10,7 @@ use super::geom::{atom_at_position, atom_present_in_geom, matrix_3d_rotation, ma
 use super::linalg::diagonalize3x3symmat;
 use super::matrix::{points_matmul, Matrix3};
 use super::vec3::{self, Vec3, ZERO};
+use std::collections::HashMap;
 
 pub const DEFAULT_SYM_TOL: f64 = 1.0e-8;
 pub const FULL_PG_TOL: f64 = 1.0e-8;
@@ -74,6 +75,23 @@ impl Tmpl {
             Sn => n as f64 / 2.0,
         }
     }
+
+    /// Order of the highest proper rotation axis (principal axis): the maximal
+    /// `n` of a Cn symmetry operation contained in the group. Linear groups
+    /// report 0 (∞-fold); groups with only the identity report 1. For a pure
+    /// Sn group the highest proper axis is C(n/2) (S_n² = C_{n/2}).
+    pub fn principal_order(self, n: u32) -> u32 {
+        use Tmpl::*;
+        match self {
+            Atom | C1 | Cs | Ci => 1,
+            DinfH | CinfV => 0,
+            Td => 3,
+            Oh => 4,
+            Ih => 5,
+            Cn | Cnv | Cnh | Dn | Dnd | Dnh => n,
+            Sn => (n / 2).max(1),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,8 +123,42 @@ pub struct SymmMolecule {
 impl SymmMolecule {
     pub fn new(symbols: Vec<String>, geom: Vec<[f64; 3]>) -> Self {
         assert_eq!(symbols.len(), geom.len(), "symbols and geom length mismatch");
-        let z: Vec<u8> = symbols.iter().map(|s| elements::symbol_to_z(s).unwrap_or(0)).collect();
-        let masses = z.iter().map(|&z| elements::z_to_mass(z)).collect();
+        // Symbols absent from the element table are interned to distinct
+        // pseudo-Z (from `Z_UNKNOWN_BASE`) so that two different unknown
+        // elements (e.g. "Au" vs "Pt" on an old table) never compare equal
+        // in the Z+mass equivalence test.
+        let mut z: Vec<u8> = Vec::with_capacity(symbols.len());
+        let mut unknown_ids: HashMap<String, u8> = HashMap::new();
+        let mut next_unknown = elements::Z_UNKNOWN_BASE;
+        for s in &symbols {
+            let zval = match elements::symbol_to_z(s) {
+                Some(z) => z,
+                None => {
+                    let key = s.to_ascii_lowercase();
+                    let id = match unknown_ids.get(&key) {
+                        Some(&id) => id,
+                        None => {
+                            let id = next_unknown;
+                            next_unknown += 1;
+                            unknown_ids.insert(key, id);
+                            id
+                        },
+                    };
+                    id
+                },
+            };
+            z.push(zval);
+        }
+        let mut masses: Vec<f64> = z.iter().map(|&z| elements::z_to_mass(z)).collect();
+        // Elements without a table entry (unknown symbols, dummies) have no
+        // physical mass; a unit mass keeps the center of mass and inertia
+        // well-defined. The equivalence test uses Z, so this cannot merge
+        // distinct elements.
+        for m in masses.iter_mut() {
+            if *m <= 0.0 {
+                *m = 1.0;
+            }
+        }
         Self { symbols, z, geom, masses, tol: DEFAULT_SYM_TOL }
     }
 
@@ -203,9 +255,23 @@ impl SymmMolecule {
         } else if degen == 2 {
             Rotor::Spherical
         } else if degen == 1 {
-            if (rot_const[1] - rot_const[2]) < 1.0e-6 {
+            // Reference (Psi4 1.10.2) uses absolute 1e-6 tests here, which is
+            // only safe because Psi4 symmetrizes the coordinates before
+            // detection. REST detects on raw (unsymmetrized) geometry, so the
+            // same relative criterion as the degeneracy test above is used:
+            // with a loose tolerance this keeps near-symmetric tops (e.g. a
+            // slightly perturbed NH3) in the symmetric-top branch.
+            let rel = |a: f64, b: f64| -> f64 {
+                let tmp = a.max(b);
+                if tmp > ZERO {
+                    (a - b).abs() / tmp
+                } else {
+                    0.0
+                }
+            };
+            if rel(rot_const[1], rot_const[2]) < self.tol {
                 Rotor::Prolate
-            } else if (rot_const[0] - rot_const[1]) < 1.0e-6 {
+            } else if rel(rot_const[0], rot_const[1]) < self.tol {
                 Rotor::Oblate
             } else {
                 Rotor::Asymmetric
@@ -348,8 +414,11 @@ impl SymmMolecule {
                 if !self.equiv(ia, ib) {
                     continue;
                 }
-                // mirror images are equidistant from the z-axis
-                if (r2_a - r2_b).abs() > 1.0e-6 {
+                // mirror images are equidistant from the z-axis; the gate is
+                // tolerance-relative because raw geometries are not
+                // symmetrized (the candidate is re-tested rigorously in
+                // `is_vertical_plane`)
+                if (r2_a - r2_b).abs() > tol * r2_a.max(r2_b).max(1.0e-12) {
                     continue;
                 }
                 cands.push(0.5 * (ang_a + ang_b)); // bisector candidate
@@ -412,7 +481,9 @@ impl SymmMolecule {
                     continue;
                 }
                 let b = positions[j];
-                if (adota - vec3::dot(&b, &b)).abs() > 1.0e-6 {
+                // tolerance-relative pair gate (see note in `has_vertical_mirror`);
+                // the candidate axis is re-tested rigorously in `is_axis`
+                if (adota - vec3::dot(&b, &b)).abs() > tol * adota.max(1.0e-12) {
                     continue;
                 }
                 let axis = vec3::add(&a, &b);
@@ -765,7 +836,7 @@ impl SymmMolecule {
     /// `set_full_point_group`. `g` must already be COM-recentered and
     /// symmetry-frame rotated (the state of `self.geometry()` after
     /// `update_geometry`).
-    fn set_full_point_group(&self, g: &[[f64; 3]], tol: f64) -> (Tmpl, u32) {
+    fn set_full_point_group(&self, g: &[[f64; 3]], tol: f64) -> (Tmpl, u32, bool, bool) {
         // local recentered copy (g is already COM-recentered; com ~ 0)
         let com = self.center_of_mass(g);
         let mut geom: Vec<[f64; 3]> = g.iter().map(|p| vec3::sub(p, &com)).collect();
@@ -777,18 +848,21 @@ impl SymmMolecule {
 
         let z_axis = [0.0, 0.0, 1.0];
 
+        // returns (template, n, is_linear, has_inversion); `op_i` is computed
+        // directly from the geometry and is the ground truth for every rotor
+        // class, including the Dnd/Dnh ambiguity (D3d has i, D2d does not).
         match rotor {
-            Rotor::Atom => (Tmpl::Atom, 0),
+            Rotor::Atom => (Tmpl::Atom, 0, false, false),
             Rotor::Linear => {
                 if op_i {
-                    (Tmpl::DinfH, 0)
+                    (Tmpl::DinfH, 0, true, op_i)
                 } else {
-                    (Tmpl::CinfV, 0)
+                    (Tmpl::CinfV, 0, true, op_i)
                 }
             },
             Rotor::Spherical => {
                 if !op_i {
-                    (Tmpl::Td, 3)
+                    (Tmpl::Td, 3, false, op_i)
                 } else {
                     // Oh has a C4 axis (anywhere); Ih does not (its highest is
                     // C5). Test for a C4 axis in any direction rather than S4
@@ -797,9 +871,9 @@ impl SymmMolecule {
                     // generically-oriented molecules.
                     let origin = [0.0, 0.0, 0.0];
                     if self.has_rotation_axis(g, &origin, 4, tol) {
-                        (Tmpl::Oh, 4)
+                        (Tmpl::Oh, 4, false, op_i)
                     } else {
-                        (Tmpl::Ih, 5)
+                        (Tmpl::Ih, 5, false, op_i)
                     }
                 }
             },
@@ -815,7 +889,7 @@ impl SymmMolecule {
                     "d2h" => (Tmpl::Dnh, 2),
                     _ => (Tmpl::C1, 1),
                 };
-                (tmpl, n)
+                (tmpl, n, false, op_i)
             },
             Rotor::Prolate | Rotor::Oblate => {
                 // symmetric top
@@ -873,6 +947,9 @@ impl SymmMolecule {
 
                 // perpendicular C2's (pair by Z only, per reference). This scan
                 // is invariant under rotations about z, so it needs no pivot.
+                // Pair gates are tolerance-relative (raw, unsymmetrized
+                // input); the candidate axis is re-tested rigorously by
+                // `matrix_3d_rotation_cn` with the same tolerance.
                 let mut is_d = false;
                 'pair: for i in 0..self.natom() {
                     let a = geom[i];
@@ -882,7 +959,7 @@ impl SymmMolecule {
                             continue;
                         }
                         let b = geom[j];
-                        if (adota - vec3::dot(&b, &b)).abs() > 1.0e-6 {
+                        if (adota - vec3::dot(&b, &b)).abs() > tol * adota.max(1.0e-12) {
                             continue;
                         }
                         let axis = vec3::add(&a, &b);
@@ -890,7 +967,7 @@ impl SymmMolecule {
                             continue;
                         }
                         let axis = vec3::normalize(&axis);
-                        if vec3::dot(&axis, &z_axis).abs() > 1.0e-6 {
+                        if vec3::dot(&axis, &z_axis).abs() > tol * vec3::norm(&axis) {
                             continue;
                         }
                         if matrix_3d_rotation_cn(&geom, &axis, false, tol, 2) == 2 {
@@ -903,31 +980,32 @@ impl SymmMolecule {
                 let cn = cn_z as u32;
                 let sn = sn_z as u32;
                 if sn == 2 * cn && !is_d {
-                    return (Tmpl::Sn, sn);
+                    return (Tmpl::Sn, sn, false, op_i);
                 }
                 if is_d {
                     if op_sigma_h && op_sigma_v {
-                        return (Tmpl::Dnh, cn);
+                        return (Tmpl::Dnh, cn, false, op_i);
                     } else if sn == 2 * cn {
-                        return (Tmpl::Dnd, cn);
+                        return (Tmpl::Dnd, cn, false, op_i);
                     } else {
-                        return (Tmpl::Dn, cn);
+                        return (Tmpl::Dn, cn, false, op_i);
                     }
                 } else {
                     if op_sigma_h && sn == cn {
-                        return (Tmpl::Cnh, cn);
+                        return (Tmpl::Cnh, cn, false, op_i);
                     } else if op_sigma_v {
-                        return (Tmpl::Cnv, cn);
+                        return (Tmpl::Cnv, cn, false, op_i);
                     } else {
-                        return (Tmpl::Cn, cn);
+                        return (Tmpl::Cn, cn, false, op_i);
                     }
                 }
             },
         }
     }
 
-    /// Run the full detection pipeline. Returns `(template, n)`.
-    pub(crate) fn detect_inner(&self) -> (Tmpl, u32) {
+    /// Run the full detection pipeline. Returns
+    /// `(template, n, is_linear, has_inversion)`.
+    pub(crate) fn detect_inner(&self) -> (Tmpl, u32, bool, bool) {
         let tol = self.tol;
         // 1. COM recenter
         let com = self.center_of_mass(&self.geom);

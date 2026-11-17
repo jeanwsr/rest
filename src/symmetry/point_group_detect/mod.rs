@@ -15,7 +15,7 @@
 //!
 //! # Example
 //! ```ignore
-//! use rest::analdrv::point_group_detect::SymmMolecule;
+//! use rest::symmetry::point_group_detect::SymmMolecule;
 //!
 //! // H2O (Bohr) -> C2v
 //! let mol = SymmMolecule::new(
