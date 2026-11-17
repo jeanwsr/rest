@@ -34,10 +34,6 @@ pub mod bse_grad;
 pub mod cvs;
 pub mod sharc;
 
-
-#[cfg(target_os = "linux")]
-use libc::seccomp_notif;
-
 pub struct BseOutput {
     pub first_excitation: Option<f64>,
     pub excitation_energies: Vec<f64>,

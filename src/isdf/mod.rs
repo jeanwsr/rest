@@ -39,20 +39,33 @@ pub fn cvt_classification(rgrids: &Vec<[f64;3]>, lambda_r: &Vec<f64>, c_mu: &Vec
     let mut dist_r:Vec<f64> = vec![0.0;num_grids];
     let num_mu = c_mu.len();
 
-    let (sender , receiver) = channel();
-    rgrids.par_iter().enumerate().for_each_with(sender , |s, (i,rgrids_i)|{
-        let mut r_c_mu:Vec<f64> = vec![0.0; num_mu];
-        for j in 0..c_mu.len(){
-            r_c_mu[j] = rgrids_i.iter().zip(c_mu[j].iter()).fold(0.0,|r,(ac,gc)| {r + (ac-gc).powf(2.0)}).sqrt();
-        }
-        let ind = index_of_min(&mut r_c_mu);
-        let dist = r_c_mu[ind];
-        s.send((i,ind, dist)).unwrap();
-    });
-    receiver.into_iter().for_each(|(i, ind, dist)|{
+    // One result per grid point, collected by index: no per-point channel message and
+    // no per-point scratch vector. The nearest centre is tracked inline (the original
+    // stored all distances and took the argmin; comparing squared distances selects the
+    // same centre because sqrt is monotone).
+    let nearest: Vec<(usize, f64)> = rgrids
+        .par_iter()
+        .map(|rgrids_i| {
+            let mut best_d2 = f64::INFINITY;
+            let mut best_j = 0usize;
+            for (j, c) in c_mu.iter().enumerate() {
+                let d2 = rgrids_i
+                    .iter()
+                    .zip(c.iter())
+                    .fold(0.0, |r, (ac, gc)| r + (ac - gc) * (ac - gc));
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_j = j;
+                }
+            }
+            (best_j, best_d2.sqrt())
+        })
+        .collect();
+    for (i, (ind, dist)) in nearest.into_iter().enumerate() {
         ind_r[i] = ind;
-        dist_r[i] =dist;
-    });
+        dist_r[i] = dist;
+    }
+    let _ = num_mu;
 
     (ind_r, dist_r)
 }
@@ -69,23 +82,35 @@ pub fn cvt_update_cmu(rgrids: &Vec<[f64;3]>, lambda_r: &Vec<f64>, c_mu_old: &Vec
     let mut c_mu_save = c_mu_old.clone();
 
     //Added together
-    let mut c_mu_tmp:Vec<[f64; 3]> = vec![[0.0;3];num_mu];
-    let mut weight_sum: Vec<f64> = vec![0.0; num_mu];
-
-    let (sender, receiver) = channel();
-    rgrids.par_iter().zip(lambda_r.par_iter()).zip(ind_r.par_iter())
-        .for_each_with(sender, |s,((rgrids_i,lambda_i),ind_r_i)| {
-        let mut c_mu_tmp = [0.0_f64;3];
-        c_mu_tmp.iter_mut().zip(rgrids_i.iter()).for_each(|(x,y)| {
-            *x += lambda_i * y;
-        });
-        s.send((c_mu_tmp, lambda_i, ind_r_i)).unwrap()
-
-    });
-    receiver.into_iter().for_each(|(c_mu_tmp_i, lambda_i, ind_r_i)| {
-        c_mu_tmp[*ind_r_i].iter_mut().zip(c_mu_tmp_i.iter()).for_each(|(x,y)| {*x += y});
-        weight_sum[*ind_r_i] += lambda_i;
-    });
+    // Per-chunk partial sums reduced once: no per-point channel message. Allocation
+    // happens per rayon task (init/reduce closures), not per grid point.
+    let (c_mu_tmp, weight_sum) = rgrids
+        .par_iter()
+        .zip(lambda_r.par_iter())
+        .zip(ind_r.par_iter())
+        .fold(
+            || (vec![[0.0_f64; 3]; num_mu], vec![0.0_f64; num_mu]),
+            |mut acc, ((rgrids_i, lambda_i), ind_r_i)| {
+                let i = *ind_r_i;
+                for x in 0..3 {
+                    acc.0[i][x] += lambda_i * rgrids_i[x];
+                }
+                acc.1[i] += lambda_i;
+                acc
+            },
+        )
+        .reduce(
+            || (vec![[0.0_f64; 3]; num_mu], vec![0.0_f64; num_mu]),
+            |mut a, b| {
+                for i in 0..num_mu {
+                    for x in 0..3 {
+                        a.0[i][x] += b.0[i][x];
+                    }
+                    a.1[i] += b.1[i];
+                }
+                a
+            },
+        );
 
     //Renew c_mu
     let non_zero_ind = weight_sum.iter()

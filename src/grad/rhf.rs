@@ -555,7 +555,7 @@ impl RIRHFGradient<'_> {
                 tsr_int3c2e_ip2 = {
                     let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
                         Some((engine, thr)) => {
-                            engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr)
+                            engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr, None)
                         }
                         None => merged_ijk
                             .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)

@@ -183,7 +183,7 @@ pub fn generate_rimatr_bare_on_cint(
 }
 
 /// Same as [`generate_rimatr_bare_on_cint`], with the AO-pair rows restricted to `keep` **before**
-/// the metric transformation.
+/// the three-centre integration.
 ///
 /// `keep` lists full packed AO-pair indices, ascending, and has to be a conservative superset of
 /// the rows the storage-level pruning of the same tensor will retain
@@ -191,13 +191,20 @@ pub fn generate_rimatr_bare_on_cint(
 /// the pruning would have kept changes the energy, so the caller must not use a tighter cut here
 /// than the mask it runs afterwards.
 ///
-/// The elimination sits between the three-centre integration and the metric solve. The
-/// metric transformation only touches `keep.len()` rows instead of the full
-/// `nao(nao+1)/2`, and so does the row-max sweep of the storage-level pruning that follows.
+/// The elimination sits **inside** the three-centre evaluation: shell pairs without a single kept
+/// AO pair are not integrated at all, and the kept ones scatter directly into a
+/// `[keep.len(), naux]` buffer ([`super::schwartz_c3::CompactRowMap`]), so neither the full
+/// `nao(nao+1)/2 × naux` tensor nor the post-hoc compaction copy of it is ever materialized.
+/// The metric transformation, the row-max sweep of the storage-level pruning and the stored tensor
+/// then all live on the `keep.len()` rows. The values of the kept rows are identical to the
+/// evaluate-then-compact path — same integrator, same blocks, same per-row metric solve.
 ///
 /// `schwartz_threshold > 0` additionally screens the three-centre **evaluation** at
-/// the (shell pair, aux shell) level ([`super::schwartz_c3`]). `<= 0` evaluates
-/// every shell triple (the previous behaviour).
+/// the (shell pair, aux shell) level ([`super::schwartz_c3`]); `<= 0` evaluates every kept
+/// shell triple (the previous behaviour). With `keep` given the evaluation always runs on the
+/// [`super::schwartz_c3::ScreenedC3Engine`] — without a (shell, aux) screen when
+/// `schwartz_threshold <= 0` — because that is the producer that can write the compact row
+/// space directly.
 pub fn generate_rimatr_bare_on_cint_prescreened(
     mol: &CInt,
     aux: &CInt,
@@ -220,26 +227,34 @@ pub fn generate_rimatr_bare_on_cint_prescreened(
     let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
 
     let j3c = {
-        let (out, shape): (Vec<f64>, Vec<usize>) = if schwartz_threshold > 0.0 {
-            let engine =
-                super::schwartz_c3::ScreenedC3Engine::build(&mol, &aux, overlap_tol2);
-            let log_thresh = (schwartz_threshold / super::schwartz_c3::RIMATR_AMP).ln();
-            engine.evaluate_s2ij("int3c2e", [0, aux.nbas()], log_thresh)
-        } else {
-            CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s2ij", None).into()
-        };
+        let (out, shape): (Vec<f64>, Vec<usize>) =
+            if schwartz_threshold > 0.0 || keep.is_some() {
+                let engine =
+                    super::schwartz_c3::ScreenedC3Engine::build(&mol, &aux, overlap_tol2);
+                let log_thresh = if schwartz_threshold > 0.0 {
+                    (schwartz_threshold / super::schwartz_c3::RIMATR_AMP).ln()
+                } else {
+                    // no (shell pair, aux shell) screening: every triple of the
+                    // kept shell pairs is evaluated (the previous
+                    // `CInt::integrate_cross` behaviour, element for element)
+                    f64::NEG_INFINITY
+                };
+                let nao = mol.ao_loc().last().copied().unwrap_or(0);
+                let npair = nao * (nao + 1) / 2;
+                let rows = keep
+                    .map(|keep| super::schwartz_c3::CompactRowMap::from_keep(keep, npair));
+                engine.evaluate_s2ij("int3c2e", [0, aux.nbas()], log_thresh, rows.as_ref())
+            } else {
+                CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s2ij", None).into()
+            };
         rt::asarray((out, shape.f(), &device))
     };
 
-    let cderi = match keep {
-        None => get_solved_j3c(j3c, &j2c_decomp, false),
-        Some(keep) => {
-            let shape: [usize; 2] = j3c.shape().to_vec().try_into().unwrap();
-            let j3c_mat = MatrixFull::from_vec(shape, j3c.into_shape(-1).into_vec()).unwrap();
-            let j3c_mat = super::compact_rimatr_rows(j3c_mat, keep);
-            get_solved_j3c(j3c_mat.into_rstsr(&device), &j2c_decomp, false)
-        }
-    };
+    // With `keep` the rows already live on the compact space, and without it
+    // they live on the full packed pair space; either way the metric solve can
+    // run on the buffer as it is (both the Cholesky solve and the eigen path
+    // act on one row at a time), so no compaction copy is needed here.
+    let cderi = get_solved_j3c(j3c, &j2c_decomp, false);
 
     let shape: [usize; 2] = cderi.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, cderi.into_shape(-1).into_vec()).unwrap()

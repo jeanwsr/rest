@@ -31,9 +31,6 @@ use num_complex::Complex64;
 use std::time::Instant;
 use std::cmp;
 
-#[cfg(target_os = "linux")]
-use libc::seccomp_notif;
-
 pub fn g0w0(
     scf_data: &mut SCF,
     num_freq: usize,

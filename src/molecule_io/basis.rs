@@ -78,8 +78,25 @@ pub fn build_fdqc(
 pub fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintType) -> Vec<Basis4Elem> {
     let mut basis_total: Vec<Basis4Elem> = vec![];
 
+    let rest_basis_dir = crate::ctrl_io::path_util::get_rest_basis_dir();
+    let num_atm_total = geom.elem.len() + geom.ghost_bs_elem.len();
+    if let Some((tmp_last, _)) = ctrl.basis_map.last() {
+        if *tmp_last > num_atm_total {
+            panic!("basis_map: atom index {} is out of range (only {} atoms)", tmp_last, num_atm_total);
+        }
+    }
+    let dir_for_atm = |atm_index_1based: usize| -> String {
+        match ctrl.basis_map.binary_search_by_key(&atm_index_1based, |(tmp_i, _)| *tmp_i) {
+            Ok(tmp_pos) => {
+                let tmp_name = &ctrl.basis_map[tmp_pos].1;
+                crate::ctrl_io::path_util::get_valid_basis_path(tmp_name, &rest_basis_dir, "basis")
+            },
+            Err(_) => ctrl.basis_path.clone(),
+        }
+    };
+
     for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
-        let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+        let tmp_path = format!("{}/{}.json", &dir_for_atm(atm_index + 1), &formated_element_name(atm_elem));
         let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
         let num_basis_per_atm = shell_nao(&tmp_basis.electron_shells, &cint_type);
         if atm_index != 0 {
@@ -96,7 +113,7 @@ pub fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &Ci
         let atm_index_start = geom.elem.len();
         for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
             let atm_index = local_atm_index + atm_index_start;
-            let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+            let tmp_path = format!("{}/{}.json", &dir_for_atm(atm_index + 1), &formated_element_name(atm_elem));
             let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
             let num_basis_per_atm = shell_nao(&tmp_basis.electron_shells, &cint_type);
             if atm_index != 0 {

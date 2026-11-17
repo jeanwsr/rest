@@ -1,3 +1,5 @@
+pub mod opt_flags;
+pub mod ovlp_probe;
 pub mod memory_batch;
 pub mod memory_monitor;
 pub mod rstsr_util;
@@ -200,6 +202,64 @@ pub fn balancing(num_tasks:usize, num_threads: usize) -> Vec<Range<usize>> {
     distribute_vec
 }
 
+/// Apply a spatially clustered permutation (kd-tree median split) to grid data.
+/// Consecutive blocks of `leaf` points then cover one small spatial cell, so the
+/// per-batch AO union shrinks toward the per-point significance set (measured on
+/// Au55: mean 485 rows vs 775 for the round-robin interleave). All per-grid
+/// arrays must be permuted together. Call before ao/aop tabulation.
+pub fn apply_spatial_order_permutation(
+    coordinates: &mut Vec<[f64; 3]>,
+    weights: &mut Vec<f64>,
+    atm_idx: &mut Vec<usize>,
+    quadrature_weights: &mut Vec<f64>,
+    leaf: usize,
+) {
+    let n = coordinates.len();
+    if leaf < 8 || n <= leaf {
+        return;
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    fn rec(order: &mut [u32], coords: &[[f64; 3]], leaf: usize) {
+        if order.len() <= leaf {
+            return;
+        }
+        let (mut mn, mut mx) = ([f64::MAX; 3], [f64::MIN; 3]);
+        for &i in order.iter() {
+            let c = &coords[i as usize];
+            for k in 0..3 {
+                if c[k] < mn[k] { mn[k] = c[k]; }
+                if c[k] > mx[k] { mx[k] = c[k]; }
+            }
+        }
+        let mut axis = 0;
+        let mut w = mx[0] - mn[0];
+        for k in 1..3 {
+            if mx[k] - mn[k] > w { w = mx[k] - mn[k]; axis = k; }
+        }
+        order.sort_unstable_by(|&a, &b| {
+            coords[a as usize][axis]
+                .partial_cmp(&coords[b as usize][axis])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mid = order.len() / 2;
+        let (l, r) = order.split_at_mut(mid);
+        rec(l, coords, leaf);
+        rec(r, coords, leaf);
+    }
+    rec(&mut order, coordinates, leaf);
+    let old_c = std::mem::take(coordinates);
+    let old_w = std::mem::take(weights);
+    let old_a = std::mem::take(atm_idx);
+    let old_q = std::mem::take(quadrature_weights);
+    *coordinates = order.iter().map(|&i| old_c[i as usize]).collect();
+    *weights = order.iter().map(|&i| old_w[i as usize]).collect();
+    *atm_idx = order.iter().map(|&i| old_a[i as usize]).collect();
+    *quadrature_weights = order.iter().map(|&i| old_q[i as usize]).collect();
+    if std::env::var("REST_XC_TIME").is_ok() {
+        println!(" [grid-order] kd spatial order applied (leaf {}, {} points)", leaf, n);
+    }
+}
+
 /// Apply round-robin permutation to grid data, so that contiguous ranges
 /// in `parallel_balancing` give each thread a uniform mix of grid points
 /// from all spatial regions. All per-grid arrays must be permuted together.
@@ -215,6 +275,16 @@ pub fn apply_round_robin_permutation(
     if num_threads <= 1 {
         return;
     }
+    // Prototype (REST_XC_PERM_STRIDE): decouple the permutation stride from the
+    // rayon pool size. The per-batch AO union — hence the per-iteration XC work —
+    // is set by this stride alone (measured on Au55: 841 rows at 16, 954 at 32,
+    // 1145 at 64), while the thread ranges stay equal-length contiguous slabs of
+    // the permuted array. Fixed stride => thread-count-independent work.
+    let num_threads = std::env::var("REST_XC_PERM_STRIDE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&s| s > 1 && s <= n)
+        .unwrap_or(num_threads);
 
     let base = n / num_threads;
     let rem = n % num_threads;

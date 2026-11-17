@@ -345,6 +345,9 @@ pub struct InputKeywords {
     pub basis_path: String,
     #[pyo3(get, set)]
     pub basis_type: String,
+    pub basis_map: Vec<(usize, String)>,
+    pub auxbas_map: Vec<(usize, String)>,
+    pub grid_level_map: Vec<(usize, usize)>,
     #[pyo3(get, set)]
     pub auxbas_path: String,
     #[pyo3(get, set)]
@@ -546,6 +549,17 @@ pub struct InputKeywords {
     pub grid_prune_compact: bool,
     #[pyo3(get, set)]
     pub ao_cutoff: f64,
+    /// Order in which the grid points are laid out before the AO tables are built.
+    /// `"kd"` (default) sorts them by recursive spatial bisection so that each
+    /// compressed batch covers a compact region and its AO union stays small;
+    /// `"round_robin"` keeps the legacy thread-interleaved order.
+    #[pyo3(get, set)]
+    pub grid_order: String,
+    /// Drop stored AO/AOP rows whose density-weighted magnitude
+    /// `max|phi| * sqrt(D_mu_mu)` is below this value, once after the initial guess
+    /// (`dm_mask`, default 3e-6; 0 disables the pruning). See README.
+    #[pyo3(get, set)]
+    pub xc_dm_mask: f64,
     #[pyo3(get, set)]
     pub non0tab_blksize: usize,
     #[pyo3(get, set)]
@@ -724,6 +738,83 @@ pub struct InputKeywords {
     pub analdrv_tasks: Vec<AnalDrvTask>,
 }
 
+fn parse_atm_range_key(tmp_key: &str, tmp_keyword: &str) -> (usize, usize) {
+    let tmp_spec: Vec<&str> = tmp_key.split('-').map(|s| s.trim()).collect();
+    let (tmp_start, tmp_end) = match tmp_spec.as_slice() {
+        [tmp_a] => {
+            let tmp_i: usize = tmp_a.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            (tmp_i, tmp_i)
+        },
+        [tmp_a, tmp_b] => {
+            let tmp_i: usize = tmp_a.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            let tmp_j: usize = tmp_b.parse().unwrap_or_else(|_| panic!("{}: invalid atom index '{}'", tmp_keyword, tmp_key));
+            (tmp_i, tmp_j)
+        },
+        _ => panic!("{}: invalid atom spec '{}', use 'i' or 'i-j' (1-based, inclusive)", tmp_keyword, tmp_key),
+    };
+    if tmp_start == 0 || tmp_end < tmp_start {
+        panic!("{}: invalid atom range '{}', indices are 1-based with start <= end", tmp_keyword, tmp_key);
+    }
+    (tmp_start, tmp_end)
+}
+
+fn dedup_atm_map<T>(mut out: Vec<(usize, T)>, tmp_keyword: &str) -> Vec<(usize, T)> {
+    out.sort_by_key(|(tmp_i, _)| *tmp_i);
+    if out.windows(2).any(|w| w[0].0 == w[1].0) {
+        panic!("{}: duplicated atom index (overlapping keys/ranges)", tmp_keyword);
+    }
+    out
+}
+
+pub fn parse_atm_basis_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, String)> {
+    match tmp_val {
+        serde_json::Value::Object(tmp_map) => {
+            let mut out: Vec<(usize, String)> = Vec::new();
+            for (tmp_key, tmp_v) in tmp_map.iter() {
+                let tmp_name = match tmp_v {
+                    serde_json::Value::String(tmp_s) => tmp_s.clone(),
+                    other => panic!("{}: the value for atom spec '{}' must be a string basis-set name, got {}", tmp_keyword, tmp_key, other),
+                };
+                let (tmp_start, tmp_end) = parse_atm_range_key(tmp_key, tmp_keyword);
+                for tmp_i in tmp_start..=tmp_end {
+                    out.push((tmp_i, tmp_name.clone()));
+                }
+            }
+            dedup_atm_map(out, tmp_keyword)
+        },
+        serde_json::Value::Null => Vec::new(),
+        other => panic!("{} must be a table mapping atom indices to basis-set names, got {}", tmp_keyword, other),
+    }
+}
+
+pub fn parse_atm_grid_map(tmp_val: &serde_json::Value, tmp_keyword: &str) -> Vec<(usize, usize)> {
+    match tmp_val {
+        serde_json::Value::Object(tmp_map) => {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            for (tmp_key, tmp_v) in tmp_map.iter() {
+                let tmp_lv = match tmp_v {
+                    serde_json::Value::Number(tmp_n) => {
+                        let tmp_u = tmp_n.as_u64().unwrap_or_else(|| panic!("{}: grid level must be a non-negative integer, got {}", tmp_keyword, tmp_v));
+                        tmp_u as usize
+                    },
+                    serde_json::Value::String(tmp_s) => tmp_s.trim().parse().unwrap_or_else(|_| panic!("{}: invalid grid level '{}'", tmp_keyword, tmp_s)),
+                    other => panic!("{}: grid level must be an integer, got {}", tmp_keyword, other),
+                };
+                if tmp_lv > 9 {
+                    panic!("{}: grid level {} out of range (0-9)", tmp_keyword, tmp_lv);
+                }
+                let (tmp_start, tmp_end) = parse_atm_range_key(tmp_key, tmp_keyword);
+                for tmp_i in tmp_start..=tmp_end {
+                    out.push((tmp_i, tmp_lv));
+                }
+            }
+            dedup_atm_map(out, tmp_keyword)
+        },
+        serde_json::Value::Null => Vec::new(),
+        other => panic!("{} must be a table mapping atom indices to grid levels, got {}", tmp_keyword, other),
+    }
+}
+
 impl Default for InputKeywords {
     fn default() -> Self {
         InputKeywords::init_ctrl()
@@ -745,6 +836,9 @@ impl InputKeywords {
             // Keywords for (aux)-basis sets
             basis_path: String::from("def2-SVP"),
             basis_type: String::from("spheric"),
+            basis_map: Vec::new(),
+            auxbas_map: Vec::new(),
+            grid_level_map: Vec::new(),
             auxbas_path: String::from("def2-SV(P)-JKFIT"),
             auxbas_type: String::from("spheric"),
             use_auxbas: true,
@@ -830,7 +924,9 @@ impl InputKeywords {
             vxc_screen_threshold: 0.0, // 0.0 = 关闭格点密度筛选（见 README）
             grid_prune_threshold: 0.0,  // 0.0 = 不剪枝（见 README）
             grid_prune_compact: true,   // true = 就地压缩（省时间、多一份表的峰值内存）
-            ao_cutoff: 1.0e-9,
+            ao_cutoff: 1.0e-8,
+            grid_order: String::from("kd"),
+            xc_dm_mask: 5.0e-7,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
@@ -1366,6 +1462,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level> 0 {println!("The {}-GTO basis set is taken from {}", tmp_input.basis_type,tmp_input.basis_path)};
 
+            tmp_input.basis_map = parse_atm_basis_map(tmp_ctrl.get("basis_map").unwrap_or(&serde_json::Value::Null), "basis_map");
+            if !tmp_input.basis_map.is_empty() && tmp_input.basis_path == "chkfile" {
+                panic!("basis_map is not supported together with basis_path = \"chkfile\"");
+            }
+
             tmp_input.pruning = match tmp_ctrl.get("pruning").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
                 other => {String::from("nwchem")} //default prune method: sg1
@@ -1489,6 +1590,8 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             //if tmp_input.use_auxbas && tmp_input.print_level>0 {
             //    println!("The {}-GTO auxiliary basis set is taken from {}", tmp_input.auxbas_type,tmp_input.auxbas_path)
             //};
+
+            tmp_input.auxbas_map = parse_atm_basis_map(tmp_ctrl.get("auxbas_map").unwrap_or(&serde_json::Value::Null), "auxbas_map");
             // ===============================================
             //  Keywords for Gradient calculation
             // ==============================================
@@ -1770,6 +1873,8 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
                 other => {3_usize},
             };
+
+            tmp_input.grid_level_map = parse_atm_grid_map(tmp_ctrl.get("grid_level_map").unwrap_or(&serde_json::Value::Null), "grid_level_map");
 
             tmp_input.even_tempered_basis = match tmp_ctrl.get("even_tempered_basis").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
@@ -2069,9 +2174,18 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => true,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-9),
-                _ => 1.0e-9,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-8),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
+            };
+            tmp_input.grid_order = match tmp_ctrl.get("grid_order").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("kd"),
+            };
+            tmp_input.xc_dm_mask = match tmp_ctrl.get("xc_dm_mask").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(tmp_input.xc_dm_mask),
+                serde_json::Value::String(s) => s.parse().unwrap_or(tmp_input.xc_dm_mask),
+                _ => tmp_input.xc_dm_mask,
             };
             tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),

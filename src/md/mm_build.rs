@@ -738,6 +738,7 @@ pub fn build_system_from_top(
     out_xml: &str,
     out_gro: &str,
     gro_path: &str,
+    water: &super::mm::WaterModel,
 ) -> anyhow::Result<usize> {
     let keep_order = !gro_path.is_empty();
     let struct_ = if keep_order { parse_gro(Path::new(gro_path)) } else { parse_pdb(Path::new(pdb_path)) };
@@ -756,7 +757,7 @@ pub fn build_system_from_top(
         }
     }
     if !mols.contains_key("SOL") {
-        mols.insert("SOL".to_string(), make_tip3p());
+        mols.insert("SOL".to_string(), make_water(water));
     }
 
     let order_spec = sec(&read_sections(Path::new(top_path), false), "molecules")
@@ -991,25 +992,25 @@ pub fn build_system_from_top(
     Ok(n)
 }
 
-fn make_tip3p() -> Molecule {
+fn make_water(water: &super::mm::WaterModel) -> Molecule {
     Molecule {
         name: "SOL".into(),
         types: vec!["OT".into(), "HT".into(), "HT".into()],
-        charges: vec![super::mm::TIP3P_Q_O, super::mm::TIP3P_Q_H, super::mm::TIP3P_Q_H],
+        charges: vec![water.q_o, water.q_h, water.q_h],
         masses: vec![super::mm::MASS_O_AMU, super::mm::MASS_H_AMU, super::mm::MASS_H_AMU],
         resnames: vec!["SOL".into(); 3],
         atomnames: vec!["OW".into(), "HW1".into(), "HW2".into()],
         resids: vec![1; 3],
         bonds: vec![
-            (0, 1, super::mm::TIP3P_R_OH_NM, super::mm::TIP3P_K_OH_KJMOL_NM2),
-            (0, 2, super::mm::TIP3P_R_OH_NM, super::mm::TIP3P_K_OH_KJMOL_NM2),
+            (0, 1, water.r_oh_nm, water.k_oh_kjmol_nm2),
+            (0, 2, water.r_oh_nm, water.k_oh_kjmol_nm2),
         ],
         angles: vec![(
             1,
             0,
             2,
-            super::mm::TIP3P_THETA_HOH_DEG,
-            super::mm::TIP3P_K_HOH_KJMOL_RAD2,
+            water.theta_hoh_deg,
+            water.k_hoh_kjmol_rad2,
             0.0,
             0.0,
         )],

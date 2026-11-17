@@ -183,14 +183,57 @@ pub fn parse_openmm_system_xml(path: &str) -> anyhow::Result<MmSystem> {
     Ok(sys)
 }
 
-pub(crate) const TIP3P_Q_O: f64 = -0.834;
-pub(crate) const TIP3P_Q_H: f64 = 0.417;
-pub(crate) const TIP3P_R_OH_NM: f64 = 0.09572;
-pub(crate) const TIP3P_K_OH_KJMOL_NM2: f64 = 376560.0;
-pub(crate) const TIP3P_THETA_HOH_DEG: f64 = 104.52;
-pub(crate) const TIP3P_K_HOH_KJMOL_RAD2: f64 = 460.24;
-const TIP3P_SIGMA_O_NM: f64 = 0.315061;
-const TIP3P_EPS_O_KJMOL: f64 = 0.635976;
+#[derive(Clone, Copy)]
+pub(crate) struct WaterModel {
+    pub name: &'static str,
+    pub q_o: f64,
+    pub q_h: f64,
+    pub sigma_o_nm: f64,
+    pub eps_o_kjmol: f64,
+    pub r_oh_nm: f64,
+    pub r_oh_a: f64,
+    pub theta_hoh_deg: f64,
+    pub k_oh_kjmol_nm2: f64,
+    pub k_hoh_kjmol_rad2: f64,
+}
+
+pub(crate) const WATER_TIP3P: WaterModel = WaterModel {
+    name: "tip3p",
+    q_o: -0.834,
+    q_h: 0.417,
+    sigma_o_nm: 0.315061,
+    eps_o_kjmol: 0.635976,
+    r_oh_nm: 0.09572,
+    r_oh_a: 0.9572,
+    theta_hoh_deg: 104.52,
+    k_oh_kjmol_nm2: 376560.0,
+    k_hoh_kjmol_rad2: 460.24,
+};
+
+pub(crate) const WATER_OPC3: WaterModel = WaterModel {
+    name: "opc3",
+    q_o: -0.895170,
+    q_h: 0.447585,
+    sigma_o_nm: 0.31742703509365927,
+    eps_o_kjmol: 0.683690704,
+    r_oh_nm: 0.0978882,
+    r_oh_a: 0.978882,
+    theta_hoh_deg: 109.47115884,
+    k_oh_kjmol_nm2: 502416.0,
+    k_hoh_kjmol_rad2: 628.02,
+};
+
+pub(crate) fn water_model(name: &str) -> anyhow::Result<&'static WaterModel> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "tip3p" => Ok(&WATER_TIP3P),
+        "opc3" => Ok(&WATER_OPC3),
+        other => Err(anyhow::anyhow!(
+            "water model \"{}\" not supported (available: tip3p, opc3)",
+            other
+        )),
+    }
+}
+
 pub(crate) const MASS_O_AMU: f64 = 15.9994;
 pub(crate) const MASS_H_AMU: f64 = 1.008;
 
@@ -224,32 +267,35 @@ pub fn build_solute_water_box(
     spacing_ang: f64,
     max_waters: usize,
     seed: u64,
+    water: &WaterModel,
 ) -> (String, usize) {
     const BOHR_ANG: f64 = crate::constants::BOHR;
     let n = symbols.len();
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
+    let mut cen = [0.0f64; 3];
     for a in pos_bohr.chunks(3) {
         for c in 0..3 {
-            let v = a[c] * BOHR_ANG;
-            lo[c] = lo[c].min(v);
-            hi[c] = hi[c].max(v);
+            cen[c] += a[c] * BOHR_ANG;
         }
     }
-    let side = [
-        (hi[0] - lo[0]) + 2.0 * margin_ang,
-        (hi[1] - lo[1]) + 2.0 * margin_ang,
-        (hi[2] - lo[2]) + 2.0 * margin_ang,
-    ];
-    let center = [
-        (lo[0] + hi[0]) * 0.5,
-        (lo[1] + hi[1]) * 0.5,
-        (lo[2] + hi[2]) * 0.5,
-    ];
+    for c in 0..3 {
+        cen[c] /= n as f64;
+    }
+    let mut r_max = 0.0f64;
+    for a in pos_bohr.chunks(3) {
+        let d = ((a[0] * BOHR_ANG - cen[0]).powi(2)
+            + (a[1] * BOHR_ANG - cen[1]).powi(2)
+            + (a[2] * BOHR_ANG - cen[2]).powi(2))
+        .sqrt();
+        if d > r_max {
+            r_max = d;
+        }
+    }
+    let side = [2.0 * (r_max + margin_ang); 3];
+    let center = cen;
     let origin = [center[0] - side[0] * 0.5, center[1] - side[1] * 0.5, center[2] - side[2] * 0.5];
 
-    let th = 104.52f64.to_radians();
-    let r = 0.9572;
+    let th = water.theta_hoh_deg.to_radians();
+    let r = water.r_oh_a;
     let h1 = [r * (th / 2.0).sin(), r * (th / 2.0).cos(), 0.0];
     let h2 = [-r * (th / 2.0).sin(), r * (th / 2.0).cos(), 0.0];
 
@@ -283,10 +329,12 @@ pub fn build_solute_water_box(
         let rz = [[cc, -sc, 0.0], [sc, cc, 0.0], [0.0, 0.0, 1.0]];
         mul(rz, mul(ry, rx))
     }
-    let mut rng = Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed });
+    let seed = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
 
-    let clash = |x: f64, y: f64, z: f64, cutoff: f64| -> bool {
-        for a in pos_bohr.chunks(3) {
+    let is_h: Vec<bool> = symbols.iter().map(|s| s.eq_ignore_ascii_case("h")).collect();
+    let clash_elem = |x: f64, y: f64, z: f64, cutoff_heavy: f64, cutoff_h: f64| -> bool {
+        for (i, a) in pos_bohr.chunks(3).enumerate() {
+            let cutoff = if is_h[i] { cutoff_h } else { cutoff_heavy };
             let dx = a[0] * BOHR_ANG - x;
             let dy = a[1] * BOHR_ANG - y;
             let dz = a[2] * BOHR_ANG - z;
@@ -299,6 +347,7 @@ pub fn build_solute_water_box(
 
     let mut waters: Vec<[f64; 9]> = Vec::new();
     let spacing = spacing_ang.max(2.0);
+    let mut site_idx = 0u64;
     let mut gz = origin[2] + spacing * 0.5;
     while gz < origin[2] + side[2] - spacing * 0.25 {
         let mut gy = origin[1] + spacing * 0.5;
@@ -306,21 +355,31 @@ pub fn build_solute_water_box(
             let mut gx = origin[0] + spacing * 0.5;
             while gx < origin[0] + side[0] - spacing * 0.25 {
                 if max_waters == 0 || waters.len() < max_waters {
-                    let rot = random_rotation(&mut rng);
                     let o = [gx, gy, gz];
-                    let ah1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
-                               o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
-                               o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
-                    let ah2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
-                               o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
-                               o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
-                    if !clash(o[0], o[1], o[2], 3.2)
-                        && !clash(ah1[0], ah1[1], ah1[2], 3.0)
-                        && !clash(ah2[0], ah2[1], ah2[2], 3.0)
-                    {
-                        waters.push([o[0], o[1], o[2], ah1[0], ah1[1], ah1[2], ah2[0], ah2[1], ah2[2]]);
+                    if !clash_elem(o[0], o[1], o[2], 3.2, 2.4) {
+                        let mut rng = Rng(
+                            seed ^ (site_idx
+                                .wrapping_add(1)
+                                .wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                        );
+                        for _ in 0..64 {
+                            let rot = random_rotation(&mut rng);
+                            let ah1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
+                                       o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
+                                       o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
+                            let ah2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
+                                       o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
+                                       o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
+                            if !clash_elem(ah1[0], ah1[1], ah1[2], 3.0, 3.0)
+                                && !clash_elem(ah2[0], ah2[1], ah2[2], 3.0, 3.0)
+                            {
+                                waters.push([o[0], o[1], o[2], ah1[0], ah1[1], ah1[2], ah2[0], ah2[1], ah2[2]]);
+                                break;
+                            }
+                        }
                     }
                 }
+                site_idx += 1;
                 gx += spacing;
             }
             gy += spacing;
@@ -329,7 +388,7 @@ pub fn build_solute_water_box(
     }
 
     let mut out = String::new();
-    out.push_str("REST auto-built TIP3P water box\n");
+    out.push_str(&format!("REST auto-built {} water box\n", water.name));
     out.push_str(&format!("{:>5}\n", waters.len() * 3));
     for (w, atoms) in waters.iter().enumerate() {
         let names = ["OW", "HW1", "HW2"];
@@ -351,7 +410,7 @@ pub fn build_solute_water_box(
     (out, waters.len())
 }
 
-pub fn parse_gro(path: &str) -> anyhow::Result<MmTopology> {
+pub fn parse_gro(path: &str, water: &WaterModel) -> anyhow::Result<MmTopology> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("cannot read mm gro file '{}': {}", path, e))?;
     let mut lines = content.lines();
@@ -384,7 +443,7 @@ pub fn parse_gro(path: &str) -> anyhow::Result<MmTopology> {
         let y: f64 = field(line, 28, 36).parse().map_err(|e| anyhow::anyhow!("gro y: {}", e))?;
         let z: f64 = field(line, 36, 44).parse().map_err(|e| anyhow::anyhow!("gro z: {}", e))?;
 
-        let symbol = element_from_atomname(&atomname);
+        let symbol = element_from_atomname(&atomname, &resname);
         let is_water = WATER_RESNAMES.contains(&resname.as_str());
         let mass = match symbol.as_str() {
             "O" => MASS_O_AMU,
@@ -392,18 +451,18 @@ pub fn parse_gro(path: &str) -> anyhow::Result<MmTopology> {
             _ => crate::geom_io::get_mass_charge(&vec![symbol.clone()])[0].0,
         };
         let charge = if is_water {
-            if symbol.eq("O") { TIP3P_Q_O } else { TIP3P_Q_H }
+            if symbol.eq("O") { water.q_o } else { water.q_h }
         } else {
             0.0
         };
         let lj = if is_water && symbol.eq("O") {
-            (TIP3P_SIGMA_O_NM, TIP3P_EPS_O_KJMOL)
+            (water.sigma_o_nm, water.eps_o_kjmol)
         } else {
             (0.0, 0.0)
         };
 
         if cur_resid != Some(resid) {
-            flush_water(&mut top, &water_atoms);
+            flush_water(&mut top, &water_atoms, water);
             water_atoms.clear();
             cur_resid = Some(resid);
             if !is_water && !unknown_residues.iter().any(|r| r.eq(&resname)) {
@@ -425,7 +484,7 @@ pub fn parse_gro(path: &str) -> anyhow::Result<MmTopology> {
         top.pos_bohr.push(z * 10.0 / BOHR);
         top.n_mm += 1;
     }
-    flush_water(&mut top, &water_atoms);
+    flush_water(&mut top, &water_atoms, water);
     if !unknown_residues.is_empty() {
         eprintln!(
             "Warning: non-water MM residue(s) {:?} have no assigned force field; treated as charge-free LJ-free masses",
@@ -466,7 +525,7 @@ pub fn parse_gro(path: &str) -> anyhow::Result<MmTopology> {
     Ok(top)
 }
 
-fn flush_water(top: &mut MmTopology, water_atoms: &[(usize, bool)]) {
+fn flush_water(top: &mut MmTopology, water_atoms: &[(usize, bool)], water: &WaterModel) {
     let oxygens: Vec<usize> = water_atoms.iter().filter(|(_, o)| *o).map(|(i, _)| *i).collect();
     let hydrogens: Vec<usize> = water_atoms.iter().filter(|(_, o)| !*o).map(|(i, _)| *i).collect();
     if oxygens.len() != 1 || hydrogens.len() != 2 {
@@ -481,29 +540,20 @@ fn flush_water(top: &mut MmTopology, water_atoms: &[(usize, bool)]) {
     }
     let o = oxygens[0];
     for h in hydrogens.iter() {
-        top.bonds.push((o, *h, TIP3P_R_OH_NM, TIP3P_K_OH_KJMOL_NM2));
+        top.bonds.push((o, *h, water.r_oh_nm, water.k_oh_kjmol_nm2));
     }
     let (h1, h2) = (hydrogens[0], hydrogens[1]);
     top.angles.push((
         h1,
         o,
         h2,
-        TIP3P_THETA_HOH_DEG.to_radians(),
-        TIP3P_K_HOH_KJMOL_RAD2,
+        water.theta_hoh_deg.to_radians(),
+        water.k_hoh_kjmol_rad2,
     ));
 }
 
-fn element_from_atomname(name: &str) -> String {
-    let letters: String = name.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-    if letters.len() >= 2 {
-        let mut chars = letters.chars();
-        let first = chars.next().unwrap();
-        let second = chars.next().unwrap();
-        if second.is_lowercase() {
-            return format!("{}{}", first, second);
-        }
-    }
-    letters.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "X".to_string())
+fn element_from_atomname(name: &str, resname: &str) -> String {
+    super::io::element_from_name(name, resname)
 }
 
 pub struct OpenMmEngine {
@@ -555,6 +605,13 @@ class _RestOpenMM:
         platform = mm.Platform.getPlatformByName('CPU')
         self.context = mm.Context(sys, integ, platform)
 
+    def set_box(self, box_nm):
+        import openmm as mm
+        self.context.setPeriodicBoxVectors(
+            mm.Vec3(float(box_nm[0]), 0.0, 0.0),
+            mm.Vec3(0.0, float(box_nm[1]), 0.0),
+            mm.Vec3(0.0, 0.0, float(box_nm[2])))
+
     def evaluate(self, pos_nm_flat):
         u = self._u
         n = len(pos_nm_flat) // 3
@@ -590,6 +647,13 @@ class _RestOpenMMXml:
         integ = mm.VerletIntegrator(0.001)
         platform = mm.Platform.getPlatformByName('CPU')
         self.context = mm.Context(sys, integ, platform)
+
+    def set_box(self, box_nm):
+        import openmm as mm
+        self.context.setPeriodicBoxVectors(
+            mm.Vec3(float(box_nm[0]), 0.0, 0.0),
+            mm.Vec3(0.0, float(box_nm[1]), 0.0),
+            mm.Vec3(0.0, 0.0, float(box_nm[2])))
 
     def evaluate(self, pos_nm_flat):
         u = self._u
@@ -779,6 +843,14 @@ impl OpenMmEngine {
         let f_conv = 1.0 / (EV2KJMOL * 10.0 * AU_FORCE2_EV_PER_ANG);
         let f_au: Vec<f64> = f_kjmol_nm.iter().map(|x| x * f_conv).collect();
         Ok((e_ha, f_au))
+    }
+
+    pub fn set_box(&mut self, box_nm: [f64; 3]) -> anyhow::Result<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            self.driver.bind(py).call_method1("set_box", (box_nm.to_vec(),))?;
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("OpenMM set_box failed: {}", e))
     }
 }
 
@@ -1094,4 +1166,25 @@ pub fn build_system_from_pdb(
         Ok(n)
     })
     .map_err(|e| anyhow::anyhow!("OpenMM force-field system build failed: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn water_model_parameters() {
+        let t = water_model("TIP3P").unwrap();
+        assert_eq!(t.name, "tip3p");
+        assert_eq!(t.q_o, -0.834);
+        assert_eq!(t.r_oh_a, 0.9572);
+        let o = water_model("opc3").unwrap();
+        assert_eq!(o.name, "opc3");
+        assert!((o.q_o + 2.0 * o.q_h).abs() < 1e-12);
+        assert!((o.theta_hoh_deg.to_radians() - 1.9106321528999624).abs() < 1e-6);
+        assert_eq!(o.r_oh_nm, 0.0978882);
+        assert_eq!(o.eps_o_kjmol, 0.683690704);
+        assert!(water_model("tip4p").is_err());
+        assert!(water_model("").is_err());
+    }
 }
