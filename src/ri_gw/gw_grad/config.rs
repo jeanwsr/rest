@@ -330,6 +330,16 @@ pub struct GwGradConfig {
     /// same branch is taken whenever the root search itself fails to converge.
     /// `0.0` (or negative) disables the rule and restores the historical
     /// behaviour (root, or the static on-shell fallback on failure).
+    ///
+    /// The **full-CD engine** ([`crate::ri_gw::gw_grad::GwCdGradEngine`]) cannot
+    /// take the linearized branch (it has no `Z^2 * lin_shift * d_R d_omega
+    /// Sigma` pullback channel), so for `Z < z_min` it takes the **static
+    /// on-shell** (`Z = 1`) energy `consts_n + Re Sigma_sub(e_n)` instead --
+    /// see the branch-policy section of `cd_grad.rs`.  That branch is a
+    /// closed-form functional of the geometry, so its gradient is defined and
+    /// reproducible, which the raw root's is not: a root with `Z -> 0` sits on
+    /// a self-energy pole, where the QP equation is multi-rooted and Newton
+    /// hops between roots under a 1e-4 Bohr displacement.
     pub z_min: f64,
     /// Define the LR-CD self-energy through the **static-subtracted continuous**
     /// form of [`GwCdGradEngine`] (the default), evaluated with REST's low-rank

@@ -486,9 +486,26 @@ pub struct QuasiParticle {
     pub gradient_adjoint_cphf:bool,
     /// Spectral-weight floor of the quasiparticle root branch used by the
     /// analytic gradient.  When the converged root carries `Z < gradient_z_min`
-    /// (or the root search fails), the orbital is differentiated through the
-    /// **linearized (one-step Newton)** functional at the mean-field level
-    /// instead.  `0.0` disables the rule.  Default `0.3`.
+    /// (or the root search fails), the orbital is differentiated through a
+    /// smooth fallback functional at the mean-field level instead.  `0.0`
+    /// disables the rule.  Default `0.3`.
+    ///
+    /// The fallback depends on the engine, because they differentiate different
+    /// functionals:
+    ///
+    /// * `gw_variant = "ac"`/`"wac"` (the low-rank engine): the **linearized
+    ///   (one-step Newton)** branch `e_n + Z [consts_n + Re Sigma_c(e_n) - e_n]`,
+    ///   which keeps `Z` (the spectral weight);
+    /// * `gw_variant = "cd"`/`"fscd"` (the full-CD engine): the **static
+    ///   on-shell** branch `consts_n + Re Sigma_c(e_n)` with `Z = 1`.  The
+    ///   linearized branch is not available there (it needs the
+    ///   `omega`-derivative pullback channel).
+    ///
+    /// Either way the point is that a root with `Z < gradient_z_min` has
+    /// essentially no quasiparticle weight left (it sits on a self-energy
+    /// pole), the QP equation is multi-rooted there, and Newton's choice of
+    /// root is not a function of the geometry -- so its "analytic gradient" is
+    /// not reproducible and cannot be validated against finite differences.
     pub gradient_z_min:f64,
     pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
     /// Number of real-axis sampling points of the low-rank contour deformation.

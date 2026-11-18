@@ -26,6 +26,31 @@
 // HF, pure-DFA and global-hybrid references are supported (the v_xc part of
 // the static term flows through the shared `b_x` covector of
 // `canonical_response_batch`); range-separated hybrids are rejected.
+//
+// # Branch policy of the QP solve
+//
+// The QP equation of a high-lying virtual can have several roots inside one
+// self-energy pole cluster, and which one a Newton iteration from `e_n + 0.02`
+// lands on changes with the geometry (measured on NH3/def2-SVP: `Omega` of a
+// high virtual moves by 0.03-0.12 Ha -- and its analytic gradient by up to
+// 0.5 Ha/Bohr -- for a 1e-4 Bohr displacement, with no convergence warning).
+// Differentiating such a root produces a functional that is not a function of
+// the geometry, so three branches are possible and this engine takes them in
+// this order:
+//
+// * **deep occupied levels** (`e_n < 0` and `-e_n > static_fallback_threshold`):
+//   the static on-shell energy `consts_n + Re Sigma_sub(e_n)` (Z = 1);
+// * **a converged root with `Z = 1/(1 - dSigma/domega) < z_min`**: the same
+//   static on-shell energy -- the root has (almost) no quasiparticle weight
+//   left and is not a level, see `GwGradConfig::z_min`;
+// * otherwise the root itself.
+//
+// The static on-shell branch is a closed-form functional of the geometry (no
+// root search), and [`GwCdGradEngine::cd_qp_pullback`] differentiates it
+// exactly (`cache.static_fallback` adds the `dSigma/domega * de_n/dR` channel).
+// It is **not** the AC/WAC engine's linearized (one-step Newton) branch, which
+// keeps `Z` and needs the `omega`-derivative pullback channel
+// (`Z^2 * lin_shift * d_R d_omega Sigma`) that this engine does not implement.
 
 extern "C" {
     fn zgetrs_(
@@ -451,7 +476,22 @@ impl<'a> GwCdGradEngine<'a> {
             for p in 0..naux {
                 w_res += qcol[p] * (y_res[p] - Complex::new(y0m[m * naux + p], 0.0));
             }
-            sigma += s_m * (pole_factor * w_res - w0[m]);
+            // The softened (half-weight) residue scales the **whole**
+            // `W(zeta_m) - W(0)` subtraction, not just `W(zeta_m)`: at
+            // `zeta_m -> 0` the term then cancels exactly (`W(0) = W0_m` by
+            // construction), which is the continuity the static subtraction
+            // exists for.  Scaling only `W_res` (the historical form) leaves
+            // a `(1 - pole_factor) s_m W_m(0)` value whose pullback the
+            // engine does not reproduce: the residue bucket's `W(0)`
+            // coefficient in [`Self::cd_qp_pullback`] is `-s_m * pole_factor`
+            // (`Coeffs::staticc`), so with `pole_factor = 1` the two agree but
+            // at the threshold they differ by `0.5 s_m W_m(0)` -- in the
+            // value, in the `J^-1` channel (the residue bucket must contribute
+            // zero to it) and in the gradient.  `pole_factor = 0.5` is not a
+            // corner case: the static on-shell branch evaluates Sigma at
+            // `omega = e_n`, so the target's own residue always sits exactly
+            // at the threshold.
+            sigma += s_m * pole_factor * (w_res - w0[m]);
             // d Sigma/d omega through the moving zeta_m = |e_m - omega|
             let nov = base.de_ia.len();
             let mut wz = 0.0f64;
@@ -517,11 +557,15 @@ impl<'a> GwCdGradEngine<'a> {
         omega - self.consts(n) - self.sigma_sub_at(omega, n).0
     }
 
-    /// Solve the QP equation of the static-subtracted continuous energy
-    /// and assemble the full response cache at the root.  With
-    /// `GwGradConfig::qpe_graphical` the root comes from REST's production
-    /// graphical linear-interpolation solver instead of the
-    /// analytic-derivative Newton iteration (PySCF `qp_energy_subtracted`).
+    /// The **static on-shell** (`Z = 1`) branch: `consts_n + Re Sigma_sub(e_n)`
+    /// evaluated at the mean-field frequency, i.e. the MolGW `EVSC` /
+    /// `se%nomega = 0` rule.
+    ///
+    /// A closed-form functional of the geometry (no root search), so it is
+    /// smooth in `R` and [`Self::cd_qp_pullback`] differentiates it exactly
+    /// (`cache.static_fallback` adds the `dSigma/domega * de_n/dR` channel).
+    /// Taken for deep occupied levels (`static_fallback_threshold`) and for a
+    /// converged root whose `Z` is below `z_min` (see the module header).
     fn static_fallback_cache(&self, n: usize) -> CdQpCache {
         let e_n = self.base.e[n];
         let consts = self.consts(n);
@@ -536,13 +580,25 @@ impl<'a> GwCdGradEngine<'a> {
         cache
     }
 
+    /// Solve the QP equation of the static-subtracted continuous energy and
+    /// assemble the full response cache on the branch selected by the policy in
+    /// the module header (root, or the static on-shell branch).  With
+    /// `GwGradConfig::qpe_graphical` the root comes from REST's production
+    /// graphical linear-interpolation solver instead of the
+    /// analytic-derivative Newton iteration (PySCF `qp_energy_subtracted`).
     pub fn build_target_cache(&self, n: usize) -> CdQpCache {
         let e_n = self.base.e[n];
         let side = if n < self.base.nocc { -1.0 } else { 1.0 };
         let consts = self.consts(n);
         let t0 = Instant::now();
-        // REST `gw_switch_fallback_threshold`: deep levels use the static
-        // on-shell energy `consts_n + Re Sigma_sub(e_n)` (`Z = 1`).
+        // Branch policy (see the module header):
+        //  * deep occupied level (`gw_switch_fallback_threshold`): static
+        //    on-shell `consts_n + Re Sigma_sub(e_n)`, `Z = 1`;
+        //  * converged root with `Z < z_min`: the same static on-shell branch;
+        //  * otherwise the root.
+        // The static on-shell branch is the only smooth branch this engine can
+        // differentiate exactly (the linearized one needs the omega-derivative
+        // pullback channel).
         let deeply_occupied =
             e_n < 0.0 && -e_n > self.base.config.static_fallback_threshold;
         if deeply_occupied {
@@ -612,19 +668,60 @@ impl<'a> GwCdGradEngine<'a> {
         let (_sigma, dsigma, mut cache) = self.sigma_sub(x, n);
         let z_root = 1.0 / (1.0 - dsigma);
         if self.base.config.z_min > 0.0 && z_root < self.base.config.z_min {
-            // The `gradient_z_min` rule asks for the linearized (one-step
-            // Newton) functional, whose analytic derivative needs the
-            // omega-derivative pullback channel that only the low-rank engine
-            // implements.  Rather than differentiate a branch this engine does
-            // not support, keep the converged root (whose gradient **is**
-            // implemented) and say so.
+            // The converged root is not a quasiparticle: `Z -> 0` means it sits
+            // on top of a self-energy pole, where the QP equation has several
+            // roots and this Newton iteration picks one that depends on the
+            // geometry -- measured on NH3/def2-SVP: `Omega_26` moves by 0.12 Ha
+            // and the analytic gradient by 0.5 Ha/Bohr for a 1e-4 Bohr
+            // displacement.  `Omega_n(R)` is then not a function of R, so
+            // neither its analytic derivative nor a finite difference of it
+            // means anything.
+            //
+            // Take the **static on-shell** (`Z = 1`) branch instead:
+            //
+            //     E_n = consts_n(R) + Re Sigma_sub(e_n(R); R),
+            //
+            // a closed-form functional of the geometry with no root search, so
+            // it is smooth in R; [`Self::static_fallback_cache`] builds it and
+            // the pullback already differentiates it exactly (the extra
+            // `dSigma/domega * de_n/dR` channel of `cache.static_fallback`).
+            // This is deliberately **not** the AC/WAC engine's linearized
+            // (one-step Newton) branch `e_n + Z [consts + Sigma(e_n) - e_n]`:
+            // that one keeps `Z` and needs the `omega`-derivative pullback
+            // channel (`Z^2 * lin_shift * d_R d_omega Sigma`) which this
+            // engine does not implement.  The static branch trades the
+            // spectral weight for differentiability, which is the right trade
+            // for orbitals that have essentially no quasiparticle weight left.
             println!(
                 "warning!!! cd_gw_grad orbital {n}: converged Z = {z_root:.4} is below \
-                 z_min = {:.3}, but the full-CD gradient does not implement the \
-                 linearized (one-step Newton) branch; keeping the root.  Use \
-                 gradient_engine = \"lr\" for the linearized branch.",
+                 z_min = {:.3} (the root sits on a self-energy pole); using the static \
+                 on-shell (Z = 1) energy consts_n + Re Sigma_sub(e_n) instead of the root.",
                 self.base.config.z_min
             );
+            let cache = self.static_fallback_cache(n);
+            let shift = cache.omega - e_n;
+            println!(
+                "    cd_gw_grad orbital {n}: on-shell energy = {:.9} Ha (shift {shift:+.3e} \
+                 Ha from e_n)",
+                cache.omega
+            );
+            // A quasiparticle-like shift is at most a fraction of a Hartree
+            // (valence levels: 0.05-0.3 Ha; the largest single-particle shift
+            // in a molecule is bounded by its bandwidth).  A shift above 1 Ha
+            // means `e_n` itself sits next to a self-energy pole: the on-shell
+            // value is then still deterministic and smooth, but it is not a
+            // level, and its gradient -- though exact for this functional -- is
+            // steep and of no physical use.  Such orbitals should stay out of
+            // the BSE transition space.
+            if shift.abs() > 1.0 {
+                println!(
+                    "warning!!! cd_gw_grad orbital {n}: the static on-shell point lies {shift:+.2} \
+                     Ha away from e_n -- it sits next to a self-energy pole, so this level is not \
+                     a quasiparticle; keep it out of the BSE transition space (bse_cutoff_energy \
+                     / bse_active_vir_end) rather than differentiating it on its own."
+                );
+            }
+            return cache;
         }
         cache.omega = x;
         cache.freq = x;
@@ -661,16 +758,19 @@ impl<'a> GwCdGradEngine<'a> {
         for w in weights {
             assert_eq!(w.len(), caches.len(), "cd_qp_pullback: weight row length mismatch");
         }
-        // The full-CD gradient has no omega-derivative channel yet: a linearized
-        // cache would silently produce a wrong gradient, so refuse loudly.
+        // Guard: this engine never builds a linearized cache (it takes the
+        // static on-shell branch for `Z < z_min`, see the module header), and a
+        // linearized cache handed in from elsewhere would silently produce a
+        // wrong gradient because the `Z^2 * lin_shift * d_R d_omega Sigma`
+        // channel is not implemented here.
         for c in caches.iter() {
             assert!(
                 !c.linearized,
                 "gw_grad: the full-CD GW analytic gradient does not implement the \
                  omega-derivative channel of the linearized (one-step Newton) QP \
-                 branch (orbital {} fell back to it).  Set \
-                 [quasiparticle_methods] gradient_z_min = 0 to disable that branch, \
-                 or use gradient_engine = \"lr\".",
+                 branch (orbital {} was built on it); the CD engine uses the static \
+                 on-shell branch for Z < gradient_z_min instead.  Use \
+                 gw_variant = \"ac\" when the linearized branch is required.",
                 c.target
             );
         }
