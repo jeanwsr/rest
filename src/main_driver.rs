@@ -320,7 +320,7 @@ pub fn main_driver() -> anyhow::Result<()> {
             println!("Dipole Moment in A.U. : {:16.8}, {:16.8}, {:16.8}", dp_au[0], dp_au[1], dp_au[2]);
             println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
         },
-        JobType::GeomOpt => {
+        JobType::GeomOpt | JobType::ExcitedStateOpt => {
             //let opt_engine = scf_data.mol.ctrl.opt_engine.clone().unwrap_or("lbfgs".to_string());
             let opt_engine = scf_data.mol.ctrl.opt_engine.clone().expect("Optimization engine is not specified");
             if opt_engine == "lbfgs" {
@@ -534,13 +534,23 @@ pub fn main_driver() -> anyhow::Result<()> {
         time_mark.count("RRS-PBC");
     }    
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
-        print!("Now starts quasiparticle method computation!\n");
-        let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
-        if qp_output.first_excitation.is_some() || !qp_output.excitation_energies.is_empty() {
-            json_extra.insert("bse".to_string(), json!({
-                "first_excitation": qp_output.first_excitation,
-                "excitation_energies": qp_output.excitation_energies,
-            }));
+        if matches!(scf_data.mol.ctrl.job_type, JobType::ExcitedStateOpt) {
+            // The last optimization step already ran the full GW-BSE gradient at
+            // this geometry; repeating it here would add a whole BSE pass to the
+            // end of the job for no new number.
+            println!(
+                "Skipping the post-optimization GW-BSE recomputation: the final \
+                 geometry was already evaluated by the excited-state optimizer."
+            );
+        } else {
+            print!("Now starts quasiparticle method computation!\n");
+            let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
+            if qp_output.first_excitation.is_some() || !qp_output.excitation_energies.is_empty() {
+                json_extra.insert("bse".to_string(), json!({
+                    "first_excitation": qp_output.first_excitation,
+                    "excitation_energies": qp_output.excitation_energies,
+                }));
+            }
         }
     }
 
@@ -903,7 +913,7 @@ fn initialize_time_record(mol: &Molecule) -> utilities::TimeRecords {
     time_mark.new_item("SCF", "the scf procedure");
     let jobtype = mol.ctrl.job_type.clone();
     match jobtype {
-        JobType::GeomOpt => {
+        JobType::GeomOpt | JobType::ExcitedStateOpt => {
             time_mark.new_item("geom_opt", "geometry optimization");
         },
         JobType::Force => {
@@ -987,7 +997,24 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         );
     }
 
-    let (energy, gradient) = if scf_data.mol.ctrl.numerical_force {
+    // `job_type = "excited_state_opt"` puts the geometry optimizer on the
+    // potential-energy surface `E_SCF(R) + Omega_S(R)`.  The BSE step has
+    // already run for this geometry in `eval_force_with_position` and stored
+    // its response gradient (`dOmega_S/dR`); here we add it to the ordinary
+    // ground-state gradient and add Omega to the energy.  Everything else --
+    // SCF, dispersion, solvent, TDDFT -- goes through the same code path.
+    let is_excited_state_opt = matches!(
+        scf_data.mol.ctrl.job_type,
+        JobType::ExcitedStateOpt
+    );
+    if is_excited_state_opt && scf_data.mol.ctrl.numerical_force {
+        panic!(
+            "job_type = \"excited_state_opt\" requires the analytic GW-BSE gradient; \
+             numerical_force = true is not supported."
+        );
+    }
+
+    let (mut energy, mut gradient) = if scf_data.mol.ctrl.numerical_force {
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
         }
@@ -1210,6 +1237,56 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         (collect_total_energy(scf_data), gradient)
     };
 
+    // Excited-state PES: `E_SCF(R) + Omega_S(R)`.  The BSE step stored Omega and its analytic
+    // response gradient (`dOmega_S/dR`) for this geometry, so the optimizer's force is the
+    // ground-state gradient plus that response term.
+    if is_excited_state_opt {
+        let omega = *scf_data
+            .energies
+            .get("bse_excited_state_omega")
+            .unwrap_or_else(|| panic!(
+                "excited_state_opt: the BSE step did not store an excitation energy. \
+                 Check that gw_or_bse = \"bse_gradient\" ran successfully."
+            ))
+            .first()
+            .expect("empty bse_excited_state_omega");
+        let response = scf_data
+            .energies
+            .get("bse_excited_state_response_gradient")
+            .unwrap_or_else(|| panic!(
+                "excited_state_opt: the BSE step did not store a response gradient."
+            ))
+            .clone();
+        let state = scf_data
+            .energies
+            .get("bse_excited_state_index")
+            .and_then(|v| v.first())
+            .map(|v| *v as usize)
+            .unwrap_or(0);
+        assert_eq!(
+            response.len(),
+            gradient.data.len(),
+            "excited_state_opt: BSE response gradient has {} components, expected {}",
+            response.len(),
+            gradient.data.len()
+        );
+        gradient
+            .data
+            .iter_mut()
+            .zip(response.iter())
+            .for_each(|(to, from)| *to += from);
+        energy += omega;
+        println!(
+            "Excited-state PES (job_type = excited_state_opt, BSE root {state}):"
+        );
+        println!("  E_SCF          = {:18.10} Ha", energy - omega);
+        println!("  Omega          = {:18.10} Ha = {:.6} eV", omega, omega * 27.211386245988);
+        println!("  E total        = {:18.10} Ha", energy);
+        println!("------ Total excited-state gradient [a.u.] ------");
+        println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
+        println!("-------------------------------------------------");
+    }
+
     // 力阶段峰值（监控线程 20 ms 一次采样），随后关掉监控线程
     let force_peak_mb = mem_monitor.stage_peak_mb();
     if scf_data.mol.ctrl.print_level > 0 {
@@ -1234,9 +1311,33 @@ pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utili
         println!("{}", scf_data.mol.geom.formated_geometry());
     }
     scf_data.free_large_tensors();
-    scf_data.mol.ctrl.initial_guess = String::from("inherit");
+    // An excited-state optimization must find the *ground-state* reference at
+    // every trial geometry.  Inheriting the previous density (the default for a
+    // ground-state relaxation) can keep the SCF on a metastable/higher-energy
+    // solution, which makes Omega(R) collapse (observed on DA1/PBE0: E_SCF rose
+    // from -704.916 to -704.881 Ha while Omega fell from 2.69 to 1.47 eV).
+    // Restart the SCF from the atomic SAD guess instead; the expensive part of
+    // the step is the GW-BSE gradient, not the ~10 SCF iterations.  A card-level
+    // guessfile/chkfile is still used for the initial SCF before the optimizer
+    // starts, but is deliberately cleared here so it is not re-read at every
+    // geometry.
+    if matches!(scf_data.mol.ctrl.job_type, JobType::ExcitedStateOpt) {
+        scf_data.mol.ctrl.initial_guess = String::from("sad");
+        scf_data.mol.ctrl.external_init_guess = None;
+    } else {
+        scf_data.mol.ctrl.initial_guess = String::from("inherit");
+    }
     initialize_scf(scf_data, mpi_operator);
     performance_essential_calculations(scf_data, time_mark, mpi_operator);
+    // An excited-state optimization must run the GW-BSE step at *every* trial
+    // geometry, not only once after the whole job: `eval_force` needs the BSE
+    // excitation energy and its analytic response gradient.  This is exactly
+    // the same `quasiparticle_methods` entry point that a single-point
+    // `gw_or_bse = "bse_gradient"` card uses.
+    if matches!(scf_data.mol.ctrl.job_type, JobType::ExcitedStateOpt) {
+        println!("Now starts quasiparticle method computation for this optimization step!");
+        let _ = crate::post_scf_analysis::quasiparticle_methods(scf_data, mpi_operator);
+    }
     let (energy, gradient) = eval_force(scf_data, time_mark, mpi_operator);
     return (energy, gradient);
 }

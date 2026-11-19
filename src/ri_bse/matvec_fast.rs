@@ -92,7 +92,10 @@ use rayon::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
 use rest_tensors::matrix::matrixfullslice::{MatrixFullSlice, MatrixFullSliceMut};
 use rest_tensors::matrix::MatrixFull;
+use std::sync::Arc;
 use std::time::Instant;
+
+use crate::ri_gw::ao_local::{window_weights, AoLocalIndex, LocalFoldScratch};
 
 // --------------------------------------------------------------- BLAS access --
 //
@@ -184,6 +187,19 @@ use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use crate::ri_gw::{get_occ_params_per_spin, get_occupation_parameters};
 use crate::scf_io::SCF;
 
+/// Number of auxiliary functions (`q`) handed to one Rayon job in the BSE
+/// matvec reductions.
+///
+/// The **partition must not depend on the worker count**: the matvec
+/// accumulates `O(naux)` partial results whose floating-point association order
+/// decides the last bits of the BSE eigenvalue, and the analytic gradient of a
+/// near-degenerate state amplifies that into a visible difference.  With a
+/// fixed chunk the reduction is bit-identical for every `num_threads` (a
+/// `fold(..).reduce(..)` instead combines in whatever order Rayon happens to
+/// split the range).
+const AUX_CHUNK: usize = 16;
+
+
 /// The AO-basis BSE matvec context.
 pub struct FastBseContext {
     n_bas: usize,
@@ -204,6 +220,10 @@ pub struct FastBseContext {
     ///
     /// `None` when no screening was requested.
     pair_keep: Option<Vec<bool>>,
+    /// Per-auxiliary-function AO support: the fold for `q` runs on the
+    /// compressed `|S_q| x |S_q|` block, which is what actually removes
+    /// floating-point work.  `None` when `screening_tol = 0`.
+    local: Option<Arc<AoLocalIndex>>,
     spins: Vec<SpinChannel>,
     exchange_rescaling: f64,
     /// Seconds spent in [`FastBseContext::build`].
@@ -371,6 +391,30 @@ fn fold2_sym_block(t: &[f64], x: &[f64], n_bas: usize, n_aux: usize, n: usize, o
     }
 }
 
+/// Unpack **one** column of the packed RI tensor into a contiguous
+/// `[n_bas, n_bas]` slab (`nu` fastest), honouring the screening mask.
+fn unpack_one(
+    slab: &mut [f64],
+    rdata: &[f64],
+    n_packed: usize,
+    n_bas: usize,
+    q: usize,
+    keep: &Option<Vec<bool>>,
+) {
+    debug_assert_eq!(slab.len(), n_bas * n_bas);
+    let col = q * n_packed;
+    for hi in 0..n_bas {
+        for lo in 0..=hi {
+            let k = hi * (hi + 1) / 2 + lo;
+            if keep.as_ref().map_or(true, |m| m[k]) {
+                let v = rdata[col + k];
+                slab[hi * n_bas + lo] = v;
+                slab[lo * n_bas + hi] = v;
+            }
+        }
+    }
+}
+
 /// Unpack `this` columns of the packed RI tensor into `this` contiguous
 /// `[n_bas, n_bas]` slabs (`nu` fastest), honouring the screening mask.
 ///
@@ -387,17 +431,110 @@ fn unpack_block(
 ) {
     debug_assert_eq!(slab.len(), this * n_bas * n_bas);
     for qq in 0..this {
-        let col = (q0 + qq) * n_packed;
-        let sl = &mut slab[qq * n_bas * n_bas..(qq + 1) * n_bas * n_bas];
-        for hi in 0..n_bas {
-            for lo in 0..=hi {
-                let k = hi * (hi + 1) / 2 + lo;
-                if keep.as_ref().map_or(true, |m| m[k]) {
-                    let v = rdata[col + k];
-                    sl[hi * n_bas + lo] = v;
-                    sl[lo * n_bas + hi] = v;
+        unpack_one(
+            &mut slab[qq * n_bas * n_bas..(qq + 1) * n_bas * n_bas],
+            rdata,
+            n_packed,
+            n_bas,
+            q0 + qq,
+            keep,
+        );
+    }
+}
+
+/// Fill the square fold `dst[q, i, j] = sum_{mu,nu} J_q[mu,nu] X[mu,i] X[nu,j]`
+/// (`dst` column-major in `(i,j)`) for the auxiliary block `q0..q0+this`.
+///
+/// When [`AoLocalIndex`] is available each `q` runs on its own compressed
+/// support `S_q` (the pre-screening that removes floating-point work); dense
+/// `q`s and the no-screening case keep the historical kernels unchanged.
+#[allow(clippy::too_many_arguments)]
+fn build_sym_fold(
+    dst: &mut [f64],
+    rdata: &[f64],
+    n_packed: usize,
+    n_bas: usize,
+    q0: usize,
+    this: usize,
+    x: &[f64],
+    n: usize,
+    local: &Option<Arc<AoLocalIndex>>,
+    pair_keep: &Option<Vec<bool>>,
+    slab: &mut [f64],
+    scratch: &mut LocalFoldScratch,
+) {
+    debug_assert_eq!(dst.len(), this * n * n);
+    match local {
+        Some(li) if li.engage(n, n) => {
+            for qq in 0..this {
+                let q = q0 + qq;
+                let dst_q = &mut dst[qq * n * n..(qq + 1) * n * n];
+                if li.worth_local(q, n, n) {
+                    let sup = li.support(q).expect("worth_local implies a support");
+                    let jq = &rdata[q * n_packed..(q + 1) * n_packed];
+                    let g = scratch.fold(jq, n_bas, sup, x, n, x, n);
+                    dst_q.copy_from_slice(g);
+                } else {
+                    let sl = &mut slab[..n_bas * n_bas];
+                    unpack_one(sl, rdata, n_packed, n_bas, q, pair_keep);
+                    fold2_sym_block(sl, x, n_bas, 1, n, dst_q);
                 }
             }
+        }
+        _ => {
+            let sl = &mut slab[..this * n_bas * n_bas];
+            unpack_block(sl, rdata, n_packed, n_bas, q0, this, pair_keep);
+            fold2_sym_block(sl, x, n_bas, this, n, dst);
+        }
+    }
+}
+
+/// Rectangular counterpart of [`build_sym_fold`]:
+/// `dst[q, A, B] = sum_{mu,nu} J_q[mu,nu] Xr[mu,A] Xc[nu,B]`, `dst` column-major
+/// in `(A, B)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_rect_fold(
+    dst: &mut [f64],
+    rdata: &[f64],
+    n_packed: usize,
+    n_bas: usize,
+    q0: usize,
+    this: usize,
+    xr: &[f64],
+    n_a: usize,
+    xc: &[f64],
+    n_b: usize,
+    local: &Option<Arc<AoLocalIndex>>,
+    pair_keep: &Option<Vec<bool>>,
+    slab: &mut [f64],
+    scratch: &mut LocalFoldScratch,
+) {
+    debug_assert_eq!(dst.len(), this * n_a * n_b);
+    match local {
+        Some(li) if li.engage(n_a, n_b) => {
+            for qq in 0..this {
+                let q = q0 + qq;
+                let dst_q = &mut dst[qq * n_a * n_b..(qq + 1) * n_a * n_b];
+                if li.worth_local(q, n_a, n_b) {
+                    let sup = li.support(q).expect("worth_local implies a support");
+                    let jq = &rdata[q * n_packed..(q + 1) * n_packed];
+                    let g = scratch.fold(jq, n_bas, sup, xr, n_a, xc, n_b);
+                    dst_q.copy_from_slice(g);
+                } else {
+                    let sl = &mut slab[..n_bas * n_bas];
+                    unpack_one(sl, rdata, n_packed, n_bas, q, pair_keep);
+                    // `fold_q_block` writes `A*n_b_out + B` with `A` on its first
+                    // MO block, while the compressed kernel writes the
+                    // column-major `a + b*n_a`.  Passing `(xc, xr)` makes the two
+                    // layouts identical: `b*n_a + a`.
+                    fold_q_block(sl, xc, xr, n_bas, n_bas, 1, n_bas, n_bas, n_b, n_a, dst_q);
+                }
+            }
+        }
+        _ => {
+            let sl = &mut slab[..this * n_bas * n_bas];
+            unpack_block(sl, rdata, n_packed, n_bas, q0, this, pair_keep);
+            fold_q_block(sl, xc, xr, n_bas, n_bas, this, n_bas, n_bas, n_b, n_a, dst);
         }
     }
 }
@@ -591,14 +728,49 @@ impl FastBseContext {
 
         // ---- per-spin folds ----
         let occ = get_occ_params_per_spin(scf_data, 'N');
+        let windows: Vec<(usize, usize, usize, usize, usize, usize)> = (0..n_spin)
+            .map(|ispin| {
+                if n_spin == 1 {
+                    get_occupation_parameters(scf_data, 'N')
+                } else {
+                    let o = occ[ispin];
+                    (o.start_mo, o.num_state, o.occ_size, o.vir_size, o.homo, o.lumo)
+                }
+            })
+            .collect();
+
+        // ---- per-auxiliary AO support ----------------------------------------
+        //
+        // The historical `pair_keep` mask is a *global* decision and could only
+        // zero entries before the folds; the fold loops and the matvec slabs
+        // still ran over the full `[N, N]`.  `AoLocalIndex` is the per-`q`
+        // version: the fold for auxiliary function `q` is evaluated on the
+        // compressed `|S_q| x |S_q|` block, so the build (and, for the response
+        // matrix, the whole GW/BSE tensor layer) stops scaling with `n_bas`.
+        let local: Option<Arc<AoLocalIndex>> = if screening_tol > 0.0 {
+            let mut w = vec![0.0f64; n_bas];
+            for ispin in 0..n_spin {
+                let (start_mo, _n_state, _n_o, n_v, _homo, lumo) = windows[ispin];
+                let wi = window_weights(
+                    &scf_data.eigenvectors[ispin].data,
+                    n_bas,
+                    start_mo,
+                    lumo + n_v,
+                );
+                for mu in 0..n_bas {
+                    if wi[mu] > w[mu] {
+                        w[mu] = wi[mu];
+                    }
+                }
+            }
+            Some(Arc::new(AoLocalIndex::build(rdata, n_bas, n_aux, &w, screening_tol)))
+        } else {
+            None
+        };
+
         let mut spins = Vec::with_capacity(n_spin);
         for ispin in 0..n_spin {
-            let (start_mo, n_state, n_o, n_v, homo, lumo) = if n_spin == 1 {
-                get_occupation_parameters(scf_data, 'N')
-            } else {
-                let o = occ[ispin];
-                (o.start_mo, o.num_state, o.occ_size, o.vir_size, o.homo, o.lumo)
-            };
+            let (start_mo, n_state, n_o, n_v, homo, lumo) = windows[ispin];
             let eig = &scf_data.eigenvectors[ispin];
             if eig.size[0] != n_bas
                 || n_o == 0
@@ -628,54 +800,55 @@ impl FastBseContext {
             bq.par_chunks_mut(nb * n_v * n_v)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0f64; nb * n_bas * n_bas],
-                    |slab, (blk, ob)| {
+                    || (vec![0.0f64; nb * n_bas * n_bas], LocalFoldScratch::default()),
+                    |(slab, scratch), (blk, ob)| {
                         let q0 = blk * nb;
                         let this = (n_aux - q0).min(nb);
-                        let slab = &mut slab[..this * n_bas * n_bas];
-                        unpack_block(slab, rdata, n_packed, n_bas, q0, this, &pair_keep);
-                        fold2_sym_block(slab, xv, n_bas, this, n_v, ob);
+                        build_sym_fold(
+                            ob, rdata, n_packed, n_bas, q0, this, xv, n_v, &local, &pair_keep,
+                            slab, scratch,
+                        );
                     },
                 );
             r.par_chunks_mut(nb * n_v * n_o)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0f64; nb * n_bas * n_bas],
-                    |slab, (blk, ob)| {
+                    || (vec![0.0f64; nb * n_bas * n_bas], LocalFoldScratch::default()),
+                    |(slab, scratch), (blk, ob)| {
                         let q0 = blk * nb;
                         let this = (n_aux - q0).min(nb);
-                        let slab = &mut slab[..this * n_bas * n_bas];
-                        unpack_block(slab, rdata, n_packed, n_bas, q0, this, &pair_keep);
-                        // `(Xv, Xo)` order so that the occupied index `i` is the
-                        // fastest one: `r[q*V*O + b*O + i] = ri_ov[q, i + b*O]`.
-                        fold_q_block(
-                            slab, xv, xo, n_bas, n_bas, this, n_bas, n_bas, n_v, n_o, ob,
+                        // `(Xo, Xv)` order so that the natural column-major
+                        // output `i + b*O` is exactly `r[q*V*O + b*O + i]`.
+                        build_rect_fold(
+                            ob, rdata, n_packed, n_bas, q0, this, xo, n_o, xv, n_v, &local,
+                            &pair_keep, slab, scratch,
                         );
                     },
                 );
             aqq.par_chunks_mut(nb * n_o * n_o)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0f64; nb * n_bas * n_bas],
-                    |slab, (blk, ob)| {
+                    || (vec![0.0f64; nb * n_bas * n_bas], LocalFoldScratch::default()),
+                    |(slab, scratch), (blk, ob)| {
                         let q0 = blk * nb;
                         let this = (n_aux - q0).min(nb);
-                        let slab = &mut slab[..this * n_bas * n_bas];
-                        unpack_block(slab, rdata, n_packed, n_bas, q0, this, &pair_keep);
-                        fold2_sym_block(slab, xo, n_bas, this, n_o, ob);
+                        build_sym_fold(
+                            ob, rdata, n_packed, n_bas, q0, this, xo, n_o, &local, &pair_keep,
+                            slab, scratch,
+                        );
                     },
                 );
             ztq.par_chunks_mut(nb * n_o * n_v)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0f64; nb * n_bas * n_bas],
-                    |slab, (blk, ob)| {
+                    || (vec![0.0f64; nb * n_bas * n_bas], LocalFoldScratch::default()),
+                    |(slab, scratch), (blk, ob)| {
                         let q0 = blk * nb;
                         let this = (n_aux - q0).min(nb);
-                        let slab = &mut slab[..this * n_bas * n_bas];
-                        unpack_block(slab, rdata, n_packed, n_bas, q0, this, &pair_keep);
-                        fold_q_block(
-                            slab, xo, xv, n_bas, n_bas, this, n_bas, n_bas, n_o, n_v, ob,
+                        // `(Xv, Xo)` order -> natural output `a + j*V`.
+                        build_rect_fold(
+                            ob, rdata, n_packed, n_bas, q0, this, xv, n_v, xo, n_o, &local,
+                            &pair_keep, slab, scratch,
                         );
                     },
                 );
@@ -717,7 +890,8 @@ impl FastBseContext {
             .map(|c| (c.bq.len() + c.r.len() + c.aq.len() + c.zt.len()) * 8)
             .sum::<usize>();
         let t_bytes = jdiag.as_ref().map_or(0, |j| j.len() * 8);
-        let bytes: usize = fold_bytes + t_bytes + inverse_dielectric.data.len() * 8;
+        let bytes: usize =
+            fold_bytes + t_bytes + inverse_dielectric.data.len() * 8 + local.as_ref().map_or(0, |l| l.bytes);
         let build_seconds = start.elapsed().as_secs_f64();
         println!(
             "BSE matvec (memory-efficient): {} spin channel(s), {:.3} MB of AO folds{} (no ri3mo, \
@@ -738,6 +912,7 @@ impl FastBseContext {
             jdiag,
             d: inverse_dielectric.data.clone(),
             pair_keep,
+            local,
             spins,
             exchange_rescaling: qp_ctrl.bse_exchange_rescaling,
             build_seconds,
@@ -910,29 +1085,27 @@ impl FastBseContext {
         // are allocated once per job instead of once per `q`.
         let w = (0..m)
             .into_par_iter()
-            .fold(
-                || {
-                    omp_set_num_threads_wrapper(1);
-                    (vec![0.0f64; nov], vec![0.0f64; v * o])
-                },
-                |(mut acc, mut tz), q| {
+            .chunks(AUX_CHUNK)
+            .map(|qs| {
+                omp_set_num_threads_wrapper(1);
+                let mut acc = vec![0.0f64; nov];
+                let mut tz = vec![0.0f64; v * o];
+                for q in qs.iter().copied() {
                     let bqq = &c.bq[q * v * v..(q + 1) * v * v];
                     let aqq = &c.aq[q * o * o..(q + 1) * o * o];
                     dgemm_nt(v, o, v, 1.0, bqq, v, z, o, 0.0, &mut tz, v);
                     dgemm_nt(o, v, o, 1.0, aqq, o, &tz, v, 1.0, &mut acc, o);
-                    (acc, tz)
-                },
-            )
-            .map(|(acc, _tz)| acc)
-            .reduce(
-                || vec![0.0f64; nov],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += y;
-                    }
-                    a
-                },
-            );
+                }
+                acc
+            })
+            .collect::<Vec<Vec<f64>>>()
+            .into_iter()
+            .fold(vec![0.0f64; nov], |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            });
         // Rayon may let the *calling* thread run part of the job, so restore the
         // configured BLAS thread count for it (`molecule_io` uses the same
         // set-1-then-restore convention around its parallel regions).
@@ -975,29 +1148,27 @@ impl FastBseContext {
         // `w_contribution_b_block_dgemm` contracts against `Z_q`.
         let w = (0..m)
             .into_par_iter()
-            .fold(
-                || {
-                    omp_set_num_threads_wrapper(1);
-                    (vec![0.0f64; nov], vec![0.0f64; o * o])
-                },
-                |(mut acc, mut t2), q| {
+            .chunks(AUX_CHUNK)
+            .map(|qs| {
+                omp_set_num_threads_wrapper(1);
+                let mut acc = vec![0.0f64; nov];
+                let mut t2 = vec![0.0f64; o * o];
+                for q in qs.iter().copied() {
                     let rq = &c.r[q * v * o..(q + 1) * v * o];
                     let ztq = &c.zt[q * o * v..(q + 1) * o * v];
                     dgemm_nt(o, o, v, 1.0, rq, o, z, o, 0.0, &mut t2, o);
                     dgemm_nt(o, v, o, 1.0, &t2, o, ztq, v, 1.0, &mut acc, o);
-                    (acc, t2)
-                },
-            )
-            .map(|(acc, _t2)| acc)
-            .reduce(
-                || vec![0.0f64; nov],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += y;
-                    }
-                    a
-                },
-            );
+                }
+                acc
+            })
+            .collect::<Vec<Vec<f64>>>()
+            .into_iter()
+            .fold(vec![0.0f64; nov], |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            });
         omp_set_num_threads_wrapper(self.blas_threads);
         w
     }

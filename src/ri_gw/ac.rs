@@ -206,15 +206,56 @@ pub fn get_ac_idx(nw: usize, npts: usize, step_ratio: f64) -> Vec<usize> {
         cumsum.push(acc);
     }
     let offset = 1.0_f64 - cumsum[0];
-    cumsum.iter().map(|c| (c + offset).round() as usize).collect()
+    // Strictly increasing indices: rounding onto a grid of only `nw` points
+    // produces duplicate sample frequencies whenever `npts` is a sizeable
+    // fraction of `nw`, and the Pade builder rejects duplicates.  If the grid
+    // runs out before `npts` distinct nodes are available, use the nodes that
+    // do exist (the requested `ac_num_samples` is an upper bound).
+    let mut out: Vec<usize> = Vec::with_capacity(npts);
+    for &c in &cumsum {
+        let mut v = (c + offset).round() as usize;
+        if let Some(&last) = out.last() {
+            if v <= last {
+                v = last + 1;
+            }
+        }
+        if v > nw {
+            break;
+        }
+        out.push(v);
+    }
+    if out.is_empty() {
+        out.push(1);
+    }
+    out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn known_rational_function(z: Complex64) -> Complex64 {
         (Complex64::new(1.0, 0.0) + 0.5 * z) / (Complex64::new(1.0, 0.0) + 0.25 * z)
+    }
+
+    #[test]
+    fn ac_indices_are_strictly_increasing() {
+        for &(nw, npts) in &[
+            (51usize, 24usize),
+            (51, 30),
+            (201, 24),
+            (201, 40),
+            (1000, 100),
+            (20, 24),
+        ] {
+            let idx = get_ac_idx(nw, npts, 2.0 / 3.0);
+            assert!(idx.len() <= nw, "too many: {idx:?} for nw={nw}");
+            assert!(!idx.is_empty());
+            assert!(idx[0] >= 1 && *idx.last().unwrap() <= nw, "range: {idx:?} for nw={nw}");
+            assert!(idx.windows(2).all(|w| w[0] < w[1]), "duplicate: {idx:?} for nw={nw}");
+            if npts <= nw {
+                assert_eq!(idx.len(), npts);
+            }
+        }
     }
 
     #[test]

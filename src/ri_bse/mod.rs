@@ -1,5 +1,6 @@
 //use std::simd::num;
 use std::ops::Range;
+use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use crate::scf_io::SCF;
 use rayon::result;
 use rest_tensors::{RIFull};
@@ -16,10 +17,12 @@ use std::fs::OpenOptions;
 use crate::solvers::davidson::{lr_davidson_solver, tda_davidson_solver, DavidsonConfig, generate_initial_guess};
 use crate::solvers::feast;
 use std::time::Instant;
-use std::{fs::File, io::Write};
+use std::{f64, fs::File, io::Write};
+pub mod state_tracking;
 pub mod dipoles;
 pub mod matvec;
 pub mod matvec_fast;
+pub mod pair_kernel;
 pub mod response;
 pub mod feast_solver;
 pub mod nonlinbse_matvec;
@@ -28,6 +31,8 @@ pub mod matvec_trace;
 pub mod dynamicbse;
 pub mod pysoc_export;
 pub mod bse_grad;
+pub mod cvs;
+pub mod sharc;
 
 pub struct BseOutput {
     pub first_excitation: Option<f64>,
@@ -108,6 +113,10 @@ pub fn save_bse_amplitudes(excitations:&Vec<(f64,Vec<f64>)>,occ_size:usize,vir_s
         Err(err)=>println!("Warning: could not create {}: {}",path,err),
     }
 }
+fn qp_ctrl_energy(scf_data:&SCF)->f64{
+    scf_data.mol.ctrl.quasiparticle_methods.clone().map(|q|q.bse_cutoff_energy).unwrap_or(0.0)
+}
+
 pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     if scf_data.mol.spin_channel == 2 {
         return bse_main_unrestricted(scf_data);
@@ -115,6 +124,17 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     report_orbital_representation(scf_data);
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    {
+        // Report the transition space: with `bse_cutoff_energy` set, both
+        // manifolds are truncated to the window, which is what the tables list.
+        let cutoff = qp_ctrl_energy(scf_data);
+        println!(
+            "BSE active space: occupied #{}..#{} ({} of {}), virtual #{}..#{} ({} of {}), dim {} \
+             (bse_cutoff_energy = {})",
+            start_mo, homo, occ_size, homo + 1, lumo, num_state - 1, vir_size, scf_data.mol.num_state - lumo,
+            occ_size * vir_size, cutoff
+        );
+    }
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -192,9 +212,21 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
         if !qp_ctrl.bse_davidson_solver && qp_ctrl.bse_feast_solver {
             eprintln!("Warning: Using FEAST solver for BSE (experimental). \
                        To use the Davidson solver instead, set bse_davidson_solver=true.");
-            if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style) {
-                eprintln!("Warning: bse_matvec_style = \"ao\" is not wired into the FEAST solver \
-                           yet; the FEAST path still uses the MO-basis matvec.");
+            // The FEAST matvec goes through `BseMatvec` (`feast_solve_bse_tda` /
+            // `_nontda`), so the AO-family backends *are* used there.  What does
+            // not carry over is the s-only inner-GMRES preconditioner, which is
+            // assembled from MO-basis RI tensors; `build_s_only_precond_data`
+            // falls back to the diagonal preconditioner for those styles and
+            // prints its own note.
+            if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style)
+                || crate::ctrl_io::quasiparticle_methods::style_is_pair(&qp_ctrl.bse_matvec_style)
+            {
+                eprintln!(
+                    "Note: bse_matvec_style = \"{}\" runs the FEAST matvec on the AO-family \
+                     path, but the s-only inner-GMRES preconditioner falls back to the diagonal \
+                     one (see the message printed when it is built).",
+                    qp_ctrl.bse_matvec_style
+                );
             }
             let excitations = match bse_spin.as_str() {
                 "singlet" => feast_solver::feast_solve_bse_singlet(scf_data),
@@ -298,39 +330,32 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     }
     BseOutput { first_excitation: None, excitation_energies: Vec::new() }
 }
-pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
-    let mut vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)>=Vec::new();
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
-    let range_oo=(start_mo..homo+1, start_mo..homo+1);
-    let range_vv=(lumo..num_state, lumo..num_state);
-    let range_ov=(start_mo..homo+1, lumo..num_state);
-    let range_ff=(start_mo..num_state,start_mo..num_state);
-
+/// Three-centre MO integrals of one orbital block, `[naux, na*nb]`.
+///
+/// `range_a`/`range_b` are the two orbital ranges of the block; the column index
+/// of the returned matrix is `a + b*na` (first range fastest), the layout every
+/// `ri_bse` contraction assumes.
+///
+/// This is the single implementation behind [`get_submatrix`]: the latter only
+/// decides *which* ranges the card's keywords select, while callers that need a
+/// different window (the analytic BSE gradient, which may pin its active space
+/// independently of `bse_cutoff_energy`) pass the ranges explicitly.
+pub fn get_submatrix_window(
+    scf_data:&SCF,
+    choice_a:char,
+    choice_b:char,
+    range_a:Range<usize>,
+    range_b:Range<usize>,
+    response_or_not:char,
+)->MatrixFull<f64>{
+    assert!(!range_a.is_empty() && !range_b.is_empty(),
+        "get_submatrix_window: empty orbital range ({choice_a}{choice_b})");
     // Check if BSE-specific RI integrals are available
     let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
-
-    if choice_a=='F'&&choice_b=='F'{
-        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1);
-    }else if choice_a=='O'&&choice_b=='O'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_oo.0, range_oo.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0, range_oo.1)
-        };
-    }else if choice_a=='V'&&choice_b=='V'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_vv.0, range_vv.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0, range_vv.1)
-        };
-    }else if choice_a=='O'&&choice_b=='V'{
-        vector = if use_bse_integrals {
-            scf_data.generate_ri3mo_bse(range_ov.0, range_ov.1)
-        } else {
-            scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0, range_ov.1)
-        };
-    }else {
-        panic!("invalid choice of ri subspace!")
+    let vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)> = if use_bse_integrals {
+        scf_data.generate_ri3mo_bse(range_a.clone(), range_b.clone())
+    } else {
+        scf_data.generate_ri3mo_rayon_for_multiple_times(range_a.clone(), range_b.clone())
     };
 
     let auxbas_type = if use_bse_integrals { "BSE-specific" } else { "Regular" };
@@ -339,6 +364,23 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
 
     let matrix:MatrixFull<f64>=vector.into_iter().next().unwrap().0.into_matfull_i_jk();
     matrix
+}
+
+pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
+    let (start_mo,num_state,_occ_size,_vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
+    let range_ff=(start_mo..num_state,start_mo..num_state);
+    let ranges = if choice_a=='F'&&choice_b=='F'{
+        range_ff
+    }else if choice_a=='O'&&choice_b=='O'{
+        (start_mo..homo+1, start_mo..homo+1)
+    }else if choice_a=='V'&&choice_b=='V'{
+        (lumo..num_state, lumo..num_state)
+    }else if choice_a=='O'&&choice_b=='V'{
+        (start_mo..homo+1, lumo..num_state)
+    }else {
+        panic!("invalid choice of ri subspace!")
+    };
+    get_submatrix_window(scf_data, choice_a, choice_b, ranges.0, ranges.1, response_or_not)
 }
 pub fn get_submatrix_spin(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char,spin:usize)->MatrixFull<f64>{
     let op = get_occ_params_per_spin(scf_data, response_or_not)[spin];
@@ -450,10 +492,19 @@ pub fn identity_matrix(n: usize) -> MatrixFull<f64> {
     mat
 }
 pub fn construct_energy_diag_for_a(quasiparticle_energies:&Vec<f64>,occ_size:usize,vir_size:usize)->Vec<f64>{
+    construct_energy_diag_for_a_window(quasiparticle_energies,0,occ_size,occ_size,vir_size)
+}
+
+/// [`construct_energy_diag_for_a`] for an explicit transition window: compact
+/// occupied `i` is orbital `occ_start + i`, compact virtual `a` is orbital
+/// `vir_start + a` (with `vir_start = occ_start + occ_size`).
+pub fn construct_energy_diag_for_a_window(
+    quasiparticle_energies:&Vec<f64>,occ_start:usize,occ_size:usize,vir_start:usize,vir_size:usize,
+)->Vec<f64>{
     let mut energy_diag = Vec::new();
     for a in 0..vir_size{
         for i in 0..occ_size{
-            let energy_gap=quasiparticle_energies[occ_size+a]-quasiparticle_energies[i];
+            let energy_gap=quasiparticle_energies[vir_start+a]-quasiparticle_energies[occ_start+i];
             energy_diag.push(energy_gap);
         }
     }
@@ -522,7 +573,8 @@ pub fn construct_submat_a(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,quas
     let raw_w=construct_raw_w(&ri_oo,&ri_vv,&inverse_dielectric);
     let mut w=reorganize_w(raw_w, 'A', occ_size, vir_size);
     w.self_multiple(-1.0);
-    let mut energy_diag=construct_energy_diag_for_a(quasiparticle_energies,occ_size,vir_size);
+    let mut energy_diag=construct_energy_diag_for_a_window(
+        quasiparticle_energies,start_mo,occ_size,lumo,vir_size);
     let mut a=w;
     a.iter_diagonal_mut().unwrap().zip(energy_diag.iter_mut()).for_each(|(x,e)|{(*x,*e)=(*x+*e,*e)});
     if xlet=='S'{
@@ -596,7 +648,8 @@ pub fn construct_tdhf_tda_hamiltonian(scf_data:&SCF,xlet:char,quasiparticle_ener
     let raw_exchange=construct_coulomb(&ri_oo,&ri_vv);
     let mut exchange=reorganize_w(raw_exchange, 'A', occ_size, vir_size);
     exchange.self_multiple(-1.0);
-    let mut energy_diag=construct_energy_diag_for_a(quasiparticle_energies,occ_size,vir_size);
+    let mut energy_diag=construct_energy_diag_for_a_window(
+        quasiparticle_energies,start_mo,occ_size,lumo,vir_size);
     let mut a=exchange;
     a.iter_diagonal_mut().unwrap().zip(energy_diag.iter_mut()).for_each(|(x,e)| {(*x,*e)=(*x+*e,*e)});
     if xlet=='S'{
@@ -664,14 +717,18 @@ struct MoBseTensors {
 /// then clears `rimatr_bse` (and `ri3fn_bse`), and the Rayleigh-Ritz refinement
 /// consequently builds its matvec from the regular `rimatr`.
 pub struct BseMatvec {
+    pair: Option<pair_kernel::PairBseContext>,
     ao: Option<matvec_fast::FastBseContext>,
     mo: Option<MoBseTensors>,
 }
 
 impl BseMatvec {
     pub fn new(scf_data: &SCF, inverse_dielectric: &MatrixFull<f64>, need_b: bool) -> Self {
+        if let Some(ctx) = build_pair_matvec_context(scf_data, inverse_dielectric) {
+            return Self { pair: Some(ctx), ao: None, mo: None };
+        }
         if let Some(ctx) = build_ao_matvec_context(scf_data, inverse_dielectric) {
-            return Self { ao: Some(ctx), mo: None };
+            return Self { pair: None, ao: Some(ctx), mo: None };
         }
         let (_start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
             get_occupation_parameters(scf_data, 'N');
@@ -697,6 +754,7 @@ impl BseMatvec {
             (None, None)
         };
         Self {
+            pair: None,
             ao: None,
             mo: Some(MoBseTensors { ri_vv, ri_oo_tilde, ri_ov, ri_ov_b, ri_ov_tilde }),
         }
@@ -704,7 +762,7 @@ impl BseMatvec {
 
     /// `true` when the AO backend is in use.
     pub fn is_ao(&self) -> bool {
-        self.ao.is_some()
+        self.ao.is_some() || self.pair.is_some()
     }
 
     /// `A z`.
@@ -714,9 +772,10 @@ impl BseMatvec {
         qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
         z: &Vec<f64>,
     ) -> Vec<f64> {
-        match (&self.ao, &self.mo) {
-            (Some(ctx), _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
-            (None, Some(mo)) => {
+        match (&self.pair, &self.ao, &self.mo) {
+            (Some(ctx), _, _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(ctx), _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
+            (None, None, Some(mo)) => {
                 matvec::a_block_matvec(scf_data, qp_ctrl, &mo.ri_vv, &mo.ri_ov, &mo.ri_oo_tilde, z)
             }
             _ => unreachable!("BseMatvec has no backend"),
@@ -730,9 +789,10 @@ impl BseMatvec {
         qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
         z: &Vec<f64>,
     ) -> Vec<f64> {
-        match (&self.ao, &self.mo) {
-            (Some(ctx), _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
-            (None, Some(mo)) => matvec::b_block_matvec(
+        match (&self.pair, &self.ao, &self.mo) {
+            (Some(ctx), _, _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(ctx), _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
+            (None, None, Some(mo)) => matvec::b_block_matvec(
                 scf_data,
                 qp_ctrl,
                 &mo.ri_ov,
@@ -769,6 +829,90 @@ impl BseMatvec {
     }
 }
 
+/// The `a`/`b` matvec backend the Davidson drivers build directly, when
+/// `bse_matvec_style` asks for one of the AO-family routes.
+///
+/// Both variants own their whole state (no MO-basis RI tensor exists), and both
+/// memoise the `z`-dependent terms, so the `a`-then-`b` pattern of a Davidson
+/// sweep is cheap on either.
+pub enum FastBseBackend {
+    Pair(pair_kernel::PairBseContext),
+    Ao(matvec_fast::FastBseContext),
+}
+
+impl FastBseBackend {
+    pub fn a(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &QuasiParticle,
+        z: &[f64],
+    ) -> Vec<f64> {
+        match self {
+            Self::Pair(c) => c.a_block_matvec(scf_data, qp_ctrl, z),
+            Self::Ao(c) => c.a_block_matvec(scf_data, qp_ctrl, z),
+        }
+    }
+    pub fn b(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &QuasiParticle,
+        z: &[f64],
+    ) -> Vec<f64> {
+        match self {
+            Self::Pair(c) => c.b_block_matvec(scf_data, qp_ctrl, z),
+            Self::Ao(c) => c.b_block_matvec(scf_data, qp_ctrl, z),
+        }
+    }
+}
+
+/// Build whichever AO-family backend `bse_matvec_style` selects (`"pair"` first,
+/// then `"ao"`), or `None` when the MO-basis tensors are wanted.
+pub fn build_fast_bse_backend(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+) -> Option<FastBseBackend> {
+    if let Some(c) = build_pair_matvec_context(scf_data, inverse_dielectric) {
+        return Some(FastBseBackend::Pair(c));
+    }
+    build_ao_matvec_context(scf_data, inverse_dielectric).map(FastBseBackend::Ao)
+}
+
+/// Build the pair-list matvec context when
+/// `[quasiparticle_methods] bse_matvec_style = "pair"`, else `None`.
+///
+/// See [`pair_kernel`] for the operator identity, the screening criterion and
+/// the cost model.
+pub fn build_pair_matvec_context(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+) -> Option<pair_kernel::PairBseContext> {
+    let qp = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap_or_default();
+    if !crate::ctrl_io::quasiparticle_methods::style_is_pair(&qp.bse_matvec_style) {
+        return None;
+    }
+    if scf_data.mol.spin_channel > 1 {
+        println!(
+            "bse_matvec_style = \"pair\": the pair-list matvec is implemented for the restricted \
+             (spin_channel = 1) reference only; keeping the other backend."
+        );
+        return None;
+    }
+    println!(
+        "BSE matvec style: \"pair\" (pair-list AO kernel, bse_matvec_style = {})",
+        qp.bse_matvec_style
+    );
+    match pair_kernel::PairBseContext::build_from_ctrl(scf_data, inverse_dielectric) {
+        Some(ctx) => Some(ctx),
+        None => {
+            println!(
+                "bse_matvec_style = \"pair\": the pair-list context could not be built (see the \
+                 message above); falling back."
+            );
+            None
+        }
+    }
+}
+
 /// Build the AO-basis ("memory-efficient") matvec context when
 /// `[quasiparticle_methods] bse_matvec_style = "ao"`, else `None`.
 ///
@@ -794,7 +938,11 @@ pub fn build_ao_matvec_context(
         "BSE matvec style: \"ao\" (memory-efficient AO-basis matvec, bse_matvec_style = {})",
         qp.bse_matvec_style
     );
-    match matvec_fast::FastBseContext::build(scf_data, inverse_dielectric) {
+    match matvec_fast::FastBseContext::build_with_screening(
+        scf_data,
+        inverse_dielectric,
+        qp.bse_ao_screening_tol,
+    ) {
         Some(ctx) => Some(ctx),
         None => {
             println!(
@@ -819,7 +967,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_davidson_solver==true{
         // ---- AO ("ao") or MO ("mo") matvec ----
-        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let ao_ctx = build_fast_bse_backend(scf_data, &inverse_dielectric);
         let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> =
             if ao_ctx.is_some() {
                 drop(inverse_dielectric);
@@ -859,7 +1007,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         };
         let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.a(scf_data,&qp_ctrl,z),
                 (None,Some((ri_vv,ri_ov,ri_oo_tilde,_,_))) =>
                     matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
                 _ => unreachable!("no matvec backend selected"),
@@ -867,7 +1015,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         };
         let b_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.b_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.b(scf_data,&qp_ctrl,z),
                 (None,Some((_,ri_ov,_,ri_ov_b,ri_ov_tilde))) =>
                     matvec::b_block_matvec(scf_data,&qp_ctrl,ri_ov,ri_ov_b,ri_ov_tilde,z),
                 _ => unreachable!("no matvec backend selected"),
@@ -935,7 +1083,7 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     if qp_ctrl.bse_davidson_solver==true{
         let start=Instant::now();
         // ---- AO ("ao") or MO ("mo") matvec ----
-        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let ao_ctx = build_fast_bse_backend(scf_data, &inverse_dielectric);
         let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> = if ao_ctx.is_some() {
             drop(inverse_dielectric);
             None
@@ -974,7 +1122,7 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         };
         let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.a(scf_data,&qp_ctrl,z),
                 (None,Some((ri_vv,ri_ov,ri_oo_tilde))) =>
                     matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
                 _ => unreachable!("no matvec backend selected"),

@@ -207,6 +207,24 @@ pub struct SCF {
     /// makes `scgw::evgw` continue from the saved round with the restored DIIS
     /// history.
     pub gw_checkpoint_state: Option<crate::fileop::gw_checkpoint::GwCheckpointState>,
+    /// Root of the BSE spectrum selected by the previous excited-state
+    /// geometry-optimization step (0 = lowest root).  `None` before the first
+    /// step.
+    pub bse_tracked_state: Option<usize>,
+    /// BSE amplitudes `(X, Y)` of [`Self::bse_tracked_state`] at the previous
+    /// geometry, flattened in the active `nocc * nvir` ordering.
+    pub bse_tracked_x: Vec<f64>,
+    pub bse_tracked_y: Vec<f64>,
+    /// Active-space shape of the stored amplitudes: `(nocc, nvir)`.
+    pub bse_tracked_nocc: usize,
+    pub bse_tracked_nvir: usize,
+    /// AO-basis transition density `T_{mu nu}` of the tracked state at the
+    /// previous geometry (column-major `[nao, nao]`).
+    pub bse_tracked_t_ao: Vec<f64>,
+    /// `nao` of [`Self::bse_tracked_t_ao`] (0 when no AO state is stored).
+    pub bse_tracked_nao: usize,
+    /// Nuclear geometry (bohr) at which `bse_tracked_t_ao` was computed.
+    pub bse_tracked_geom_bohr: Vec<[f64; 3]>,
 }
 
 #[derive(Clone,Copy,PartialEq)]
@@ -289,6 +307,14 @@ impl SCF {
             tddft_excitations: None,
             dh_rdm1_resp: None,
             gw_checkpoint_state: None,
+            bse_tracked_state: None,
+            bse_tracked_x: Vec::new(),
+            bse_tracked_y: Vec::new(),
+            bse_tracked_nocc: 0,
+            bse_tracked_nvir: 0,
+            bse_tracked_t_ao: Vec::new(),
+            bse_tracked_nao: 0,
+            bse_tracked_geom_bohr: Vec::new(),
         };
 
         // at first check the scf type: RHF, ROHF or UHF

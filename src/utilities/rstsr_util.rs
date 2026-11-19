@@ -10,6 +10,28 @@ pub type TsrView<'a, T = f64> = TensorView<'a, T, DeviceBLAS, IxD>;
 pub type TsrMut<'a, T = f64> = TensorMut<'a, T, DeviceBLAS, IxD>;
 pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 
+/// Compatibility shim for the GW/BSE code that was written against a
+/// process-wide device.  It deliberately returns the same thing as
+/// `DeviceBLAS::default()`: the remote `rest` behaviour is one device/pool per
+/// call, and the GW-BSE changes must not alter how every other module builds
+/// its device.
+pub fn device() -> DeviceBLAS {
+    DeviceBLAS::default()
+}
+
+/// Current process-wide BLAS thread count, used only to save/restore the
+/// phase-local BLAS policy inside the BSE gradient.
+pub fn blas_get_num_threads() -> usize {
+    #[cfg(not(feature = "intel-mkl"))]
+    unsafe {
+        rest_tensors::matrix_blas_lapack::openblas_get_num_threads() as usize
+    }
+    #[cfg(feature = "intel-mkl")]
+    {
+        rest_tensors::matrix_blas_lapack::omp_get_num_threads_wrapper()
+    }
+}
+
 /* #region interchange between rstsr and rest_tensor */
 
 // In REST, we always use DeviceBLAS as backend in most cases.

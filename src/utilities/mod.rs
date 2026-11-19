@@ -6,6 +6,7 @@ pub mod rstsr_util;
 pub mod buffer_pool;
 pub mod log;
 pub mod basic_math;
+pub mod linalg;
 
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;

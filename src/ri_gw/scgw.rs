@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
+use rayon::prelude::*;
 use rayon::result;
 use reqwest::blocking::Response;
 use rest_tensors::{RIFull};
@@ -53,6 +54,12 @@ pub fn g0w0(
             }
             GwVariant::Ac => {
                 gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
+            }
+            GwVariant::Fscd => {
+                gw_near_fermi_surface_fscd(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold, gw_ctx)
+            }
+            GwVariant::Wac => {
+                gw_near_fermi_surface_wac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
             }
         }
     } else if gw_scheme == "no gw" {
@@ -107,7 +114,7 @@ pub fn single_orbital_gw_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let cdgw_eta = qp_ctrl.cdgw_eta;
@@ -164,7 +171,7 @@ fn single_orbital_gw_lowrank_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let res_tol = qp_ctrl.cdgw_res_tol;
@@ -265,7 +272,7 @@ pub fn gw_near_fermi_surface_spin(
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
         let op = ops[spin];
-        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let v_matrix = ri_gw::exchange_matrix_from_scf_spin(scf_data, spin);
         let ks_energies = scf_data.eigenvalues[spin].clone();
         let e_homo = ks_energies[op.homo];
         let e_lumo = ks_energies[op.lumo];
@@ -356,12 +363,12 @@ fn gw_near_fermi_surface_spin_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = ri_gw::low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
         let op = ops[spin];
-        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let v_matrix = ri_gw::exchange_matrix_from_scf_spin(scf_data, spin);
         let ks_energies = scf_data.eigenvalues[spin].clone();
         let e_homo = ks_energies[op.homo];
         let e_lumo = ks_energies[op.lumo];
@@ -389,15 +396,41 @@ fn gw_near_fermi_surface_spin_lowrank(
 
         let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[spin][calc_orbs[0].0];
         let vir_shift = calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[spin][calc_orbs[calc_orbs.len() - 1].0];
+        // `gw_extrapolation = false`: no orbital is extrapolated; the BSE
+        // window is asserted to lie inside the explicitly solved window.
+        let (mut lo_shift, mut hi_shift) = (occ_shift, vir_shift);
+        if !qp_ctrl.gw_extrapolation {
+            let (bse_occ_start, bse_num_state) =
+                ri_gw::bse_active_bounds(scf_data, op.homo, op.lumo);
+            let calc_lo = calc_orbs[0].0;
+            let calc_hi = calc_orbs[calc_orbs.len() - 1].0;
+            assert!(
+                bse_occ_start >= calc_lo && bse_num_state <= calc_hi + 1,
+                "gw_extrapolation = false, but the BSE window is not inside the explicitly \
+                 solved GW window (#{}..#{}); widen gw_extrapolate_*_threshold or tighten \
+                 bse_cutoff_energy",
+                calc_lo,
+                calc_hi
+            );
+            println!(
+                "[gw] extrapolation disabled: {} orbitals solved explicitly (#{}..#{}), the BSE \
+                 window lies inside it -- no quasiparticle energy is extrapolated",
+                calc_orbs.len(),
+                calc_lo,
+                calc_hi
+            );
+            lo_shift = 0.0;
+            hi_shift = 0.0;
+        }
         let mut gwqp: Vec<f64> = Vec::new();
         for i in 0..calc_orbs[0].0 {
-            gwqp.push(scf_data.eigenvalues[spin][i] + occ_shift)
+            gwqp.push(scf_data.eigenvalues[spin][i] + lo_shift)
         }
         for (_, e) in calc_orbs.iter() {
             gwqp.push(*e);
         }
         for i in calc_orbs[calc_orbs.len() - 1].0 + 1..op.num_state {
-            gwqp.push(scf_data.eigenvalues[spin][i] + vir_shift)
+            gwqp.push(scf_data.eigenvalues[spin][i] + hi_shift)
         }
         out[spin] = gwqp;
     }
@@ -654,9 +687,34 @@ impl EvgwDiis {
 /// the same two mechanisms through `evgw_damping` (scalar analogue of MolGW's
 /// Z-scaling) and `evgw_diis` (PySCF's DIIS), plus a convergence test with
 /// early exit so that "did evGW converge?" is answerable from the log.
+/// Eigenvalue self-consistent GW (evGW): both G and W are rebuilt from the
+/// updated quasiparticle-energy vector in every outer round.
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    evgw_impl(scf_data,num_freq,vxc_nn,iter_rounds,gw_ctx,false)
+}
+
+/// Eigenvalue self-consistent G0W0 (evGW0): the quasiparticle energies entering
+/// G are updated self-consistently, while the screening W is frozen at its
+/// initial (G0W0) value.
+///
+/// This is the `scgw = "evgw0"` entry point.  It shares the whole outer-loop
+/// machinery with [`evgw`] (per-round update rule, damping, DIIS, degeneracy
+/// projection, convergence test and checkpointing); the only difference is that
+/// the W energy vector (`scf_data.gwqp.1`) is never overwritten by the updated
+/// QP energies.
+pub fn evgw0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    evgw_impl(scf_data,num_freq,vxc_nn,iter_rounds,gw_ctx,true)
+}
+
+fn evgw_impl(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext,freeze_w:bool)->Vec<f64>{
     let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let mode_name=if freeze_w{"evGW0"}else{"evGW"};
+    // In evGW0 the W energy vector is the one produced by the initialization
+    // in `gw_main` (`initialize_qp_g_w`): KS energies by default, or the
+    // renormalized-singles energies when `w_rs = true`.  Capture it before the
+    // first round and restore it before every GW pass.
+    let w_reference=scf_data.gwqp.1.clone();
     let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
     let update_kind=evgw_update_kind(&qp_ctrl);
     let solver=match update_kind{
@@ -681,15 +739,18 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
     let diis_safeguard=qp_ctrl.evgw_diis_safeguard;
     let max_step_cap=qp_ctrl.evgw_max_step;
 
-    if qp_ctrl.scgw=="evgw" && report{
-        println!("evGW outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
-                 solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
+    if (qp_ctrl.scgw=="evgw"||qp_ctrl.scgw=="evgw0") && report{
+        println!("{} outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
+                 mode_name,solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
                  if max_step_cap>0.0{format!("{:.3e} Ha",max_step_cap)}else{String::from("unlimited")});
+        if freeze_w{
+            println!("{}: W is frozen at the initial (G0W0) energy vector; only the G quasiparticle energies are updated.",mode_name);
+        }
     }
 
     let degeneracy_tol=qp_ctrl.evgw_degeneracy_tol;
     if report && degeneracy_tol>0.0 {
-        println!("evGW degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", degeneracy_tol);
+        println!("{} degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", mode_name, degeneracy_tol);
     }
     let ks_reference=scf_data.eigenvalues[0].clone();
     let mut diis=EvgwDiis::new(diis_space,diis_start,diis_safeguard);
@@ -712,17 +773,17 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
             last_residual=state.last_residual;
             last_dg=state.last_dg;
             diis.restore(&state.diis_history,&state.diis_errors);
-            println!("[gw_checkpoint] evGW resume: {} of {} round(s) are already contained in the checkpoint; \
-                      the loop restarts at round {}.",start_round,iter_rounds,start_round+1);
-            println!("[gw_checkpoint] evGW resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
-                      state.diis_history.len(),last_residual,last_dg,converged);
+            println!("[gw_checkpoint] {} resume: {} of {} round(s) are already contained in the checkpoint; \
+                      the loop restarts at round {}.",mode_name,start_round,iter_rounds,start_round+1);
+            println!("[gw_checkpoint] {} resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
+                      mode_name,state.diis_history.len(),last_residual,last_dg,converged);
             if start_round>=iter_rounds{
-                println!("[gw_checkpoint] evGW resume: the checkpoint already holds all {} requested round(s) \
-                          (evgw_rounds); the evGW loop is skipped and the stored quasiparticle energies are used.",
-                          iter_rounds);
+                println!("[gw_checkpoint] {} resume: the checkpoint already holds all {} requested round(s) \
+                          (evgw_rounds); the {} loop is skipped and the stored quasiparticle energies are used.",
+                          mode_name,iter_rounds,mode_name);
             } else if converged && stop_on_conv {
-                println!("[gw_checkpoint] evGW resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
-                          and evgw_stop_on_convergence is true; the evGW loop is skipped.",conv_tol);
+                println!("[gw_checkpoint] {} resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
+                          and evgw_stop_on_convergence is true; the {} loop is skipped.",mode_name,conv_tol,mode_name);
                 start_round=iter_rounds;
             }
         }
@@ -731,14 +792,18 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
     let nstate=scf_data.gwqp.0.len();
 
     for i in start_round..iter_rounds{
-        println!("Now is round #{} of evGW calculation. There will be {} rounds in total.",i+1,iter_rounds);
+        println!("Now is round #{} of {} calculation. There will be {} rounds in total.",i+1,mode_name,iter_rounds);
         let cancel_dfa_xc=true;
-        // Energy vector fed into this round (G and W both built from it, as in
-        // MolGW's GnWn / PySCF's EVGW with W0 = False).
+        // Energy vector fed into this round.
+        //
+        // evGW  : G and W are both built from the current iterate
+        //         (MolGW GnWn / PySCF EVGW with W0 = False).
+        // evGW0 : only G is built from the iterate; W keeps the initial
+        //         G0W0 energy vector captured before the loop.
         let mut qp_in=scf_data.gwqp.0.clone();
         symmetrize_degenerate_subspaces(&mut qp_in,&ks_reference,degeneracy_tol);
         scf_data.gwqp.0=qp_in.clone();
-        scf_data.gwqp.1=qp_in.clone();
+        scf_data.gwqp.1=if freeze_w{w_reference.clone()}else{qp_in.clone()};
         // One full GW pass (root solve, single evaluation or Z-damped step,
         // depending on `evgw_solver`).
         let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc,gw_ctx);
@@ -776,14 +841,14 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
         if report{
             let homo_qp=qp_out.get(occ_size-1).copied().unwrap_or(f64::NAN);
             let lumo_qp=qp_out.get(occ_size).copied().unwrap_or(f64::NAN);
-            println!("evGW round {} summary: max|dE_qp|={:.4e} Ha (orbital #{}), |dG|={:.4e}, max|step|={:.4e} Ha",
-                     i+1,max_de,max_at,dg,max_step);
-            println!("evGW round {}: HOMO(#{} QP)={:.8} Ha, LUMO(#{} QP)={:.8} Ha, gap={:.8} Ha",
-                     i+1,occ_size-1,homo_qp,occ_size,lumo_qp,lumo_qp-homo_qp);
+            println!("{} round {} summary: max|dE_qp|={:.4e} Ha (orbital #{}), |dG|={:.4e}, max|step|={:.4e} Ha",
+                     mode_name,i+1,max_de,max_at,dg,max_step);
+            println!("{} round {}: HOMO(#{} QP)={:.8} Ha, LUMO(#{} QP)={:.8} Ha, gap={:.8} Ha",
+                     mode_name,i+1,occ_size-1,homo_qp,occ_size,lumo_qp,lumo_qp-homo_qp);
         }
 
         scf_data.gwqp.0=qp_next.clone();
-        scf_data.gwqp.1=qp_next.clone();
+        scf_data.gwqp.1=if freeze_w{w_reference.clone()}else{qp_next.clone()};
 
         let round_converged=max_de<conv_tol;
 
@@ -806,15 +871,15 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
             ckpt.diis_history=diis.history.clone();
             ckpt.diis_errors=diis.errors.clone();
             if let Err(e)=crate::fileop::gw_checkpoint::save_gw_checkpoint(scf_data,&ckpt){
-                println!("[gw_checkpoint] WARNING: could not write the evGW checkpoint after round {}: {:#}",i+1,e);
+                println!("[gw_checkpoint] WARNING: could not write the {} checkpoint after round {}: {:#}",mode_name,i+1,e);
             }
         }
 
         if round_converged{
             converged=true;
             if report{
-                println!("evGW converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",
-                         i+1,max_de,conv_tol);
+                println!("{} converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",
+                         mode_name,i+1,max_de,conv_tol);
             }
             if stop_on_conv{
                 break;
@@ -822,8 +887,8 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
         }
     }
     if !converged && iter_rounds>0{
-        println!("WARNING: evGW did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
-                 conv_tol,iter_rounds,last_residual,last_dg);
+        println!("WARNING: {} did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
+                 mode_name,conv_tol,iter_rounds,last_residual,last_dg);
         println!("         Consider reducing evgw_damping, keeping evgw_diis = true (solver=\"diis\"; for solver=\"z_update\" DIIS does not apply), or increasing evgw_rounds.");
     }
     let final_qp=scf_data.gwqp.0.clone();
@@ -966,10 +1031,22 @@ enum EvgwUpdate {
 }
 
 fn evgw_update_kind(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> EvgwUpdate {
-    if qp_ctrl.scgw != "evgw" {
+    if qp_ctrl.scgw != "evgw" && qp_ctrl.scgw != "evgw0" {
         return EvgwUpdate::Root;
     }
     match qp_ctrl.evgw_solver.to_lowercase().as_str() {
+        // `auto` keeps the historical evGW rule (MolGW's single evaluation)
+        // and selects the Z-damped step for evGW0.  The latter is markedly more
+        // stable when a deep core is inside the GW window: a single evaluation
+        // or a full root solve can jump between self-energy roots for the
+        // valence orbitals, whereas the Z-damped step converges monotonically.
+        "auto" => {
+            if qp_ctrl.scgw == "evgw0" {
+                EvgwUpdate::ZStep
+            } else {
+                EvgwUpdate::PlainEval
+            }
+        }
         "z_update" | "z-update" | "zupdate" => EvgwUpdate::ZStep,
         "molgw" | "molgw_update" | "plain_eval" | "eval" => EvgwUpdate::PlainEval,
         _ => EvgwUpdate::Root,
@@ -1011,7 +1088,7 @@ pub fn single_orbital_gw_ac(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let side = if n >= occ_size { 1.0 } else { -1.0 };
 
@@ -1041,15 +1118,23 @@ pub fn single_orbital_gw_ac(
     // skipping ω=0, with step_ratio=2/3 (PySCF default).
     let ac_step_ratio = 2.0 / 3.0;
     let ac_indices = ri_gw::ac::get_ac_idx(_num_freq, ac_num_samples, ac_step_ratio);
+    // `get_ac_idx` indexes the *quadrature grid*, so the sample frequencies must
+    // be read off a frequency-sorted copy of the W grid.  `w_c_at_freqs` is a
+    // bag of nodes (the historical driver returned it in channel completion
+    // order), and indexing it positionally would couple the Padé nodes to the
+    // producer's scheduling order — a latent, thread-count-dependent result.
+    let mut node_order: Vec<usize> = (0..w_c_at_freqs.len()).collect();
+    node_order.sort_by(|&a, &b| w_c_at_freqs[a].0.total_cmp(&w_c_at_freqs[b].0));
     let ac_freqs: Vec<f64> = ac_indices
         .iter()
         .map(|&idx| {
             // idx ranges from 1 to num_freq (1-based), mapping to quad_freqs[idx-1]
-            let idx0 = idx.saturating_sub(1).min(w_c_at_freqs.len().saturating_sub(1));
-            w_c_at_freqs[idx0].0
+            let idx0 = idx.saturating_sub(1).min(node_order.len().saturating_sub(1));
+            w_c_at_freqs[node_order[idx0]].0
         })
         .collect();
 
+    let t_samples = Instant::now();
     let samples: Vec<ImaginaryAxisSample> = ac_freqs
         .iter()
         .map(|&lambda| {
@@ -1057,7 +1142,9 @@ pub fn single_orbital_gw_ac(
             ImaginaryAxisSample::new_shifted(lambda, ef, sigma_c)
         })
         .collect();
+    let dt_samples = t_samples.elapsed().as_secs_f64();
 
+    let t_pade = Instant::now();
     let pade = match PadeApproximant::from_imaginary_axis(&samples) {
         Ok(p) => p,
         Err(e) => {
@@ -1068,6 +1155,7 @@ pub fn single_orbital_gw_ac(
         }
     };
 
+    let dt_pade = t_pade.elapsed().as_secs_f64();
     let qp_eq_func = |omega: f64| -> f64 {
         match pade.evaluate_retarded(omega, ac_eta) {
             Ok(sigma_c) => consts + sigma_c.re - omega,
@@ -1138,8 +1226,8 @@ pub fn single_orbital_gw_ac(
             num_state,
             w_c_at_freqs,
             e_ks_n,
-            0.00001,
-            50,
+            qp_ctrl.qpe_tol,
+            qp_ctrl.qpe_max_iter,
             side,
             scf_data.mol.ctrl.print_level,
         );
@@ -1184,8 +1272,8 @@ pub fn single_orbital_gw_ac(
                 num_state,
                 w_c_at_freqs,
                 e_ks_n,
-                0.00001,
-                50,
+                qp_ctrl.qpe_tol,
+                qp_ctrl.qpe_max_iter,
                 side,
                 scf_data.mol.ctrl.print_level,
             );
@@ -1210,6 +1298,15 @@ pub fn single_orbital_gw_ac(
         );
     }
 
+    println!(
+        "AC phases for orbital #{}: imag-axis sampling {:.4} s ({} samples), Padé construction {:.4} s, root finding {:.4} s, total {:.4} s",
+        n,
+        dt_samples,
+        ac_freqs.len(),
+        dt_pade,
+        start.elapsed().as_secs_f64() - dt_samples - dt_pade,
+        start.elapsed().as_secs_f64()
+    );
     println!("GW of orbital #{} (AC) took {:?}", n, start.elapsed());
     if scf_data.mol.ctrl.print_level > 1 {
         println!("Shift = {}", qp_energy_no_fse - e_ks_n);
@@ -1226,7 +1323,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
     for i in 0..homo+1{
         exchange-=v_matrix[[n,i]];
     }
-    let hybrid_param=scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param=ri_gw::static_exchange_fraction(scf_data);
     println!("Exchange={},V_xc={}",exchange,vxc_nn+hybrid_param*exchange);
     let side=if n>=occ_size{1.0}else{-1.0};
     let consts=scf_data.eigenvalues[0][n]+exchange*(1.0-hybrid_param)-vxc_nn;
@@ -1275,7 +1372,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
             |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
             n, consts, ri_ov_slot, ri_row_n,
             &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-            e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
+            e_ks_n, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level
         );
         println!("First round QP energy (no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -1289,7 +1386,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
                 |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
                 n, consts, ri_ov_slot, ri_row_n,
                 &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-                e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
+                e_ks_n, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -1408,7 +1505,7 @@ where
         crate::ri_gw::newton_solver(
             wrapped_f, n, consts, ri_ov, ri_row_n,
             gwqp_g, gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-            initial_guess, 0.00001, 50, side, print_level
+            initial_guess, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, print_level
         )
     } else if rootfinder == "interpolation".to_string() {
         println!("Orbital #{} (second round, with {} self-energy):", n, self_energy_type);
@@ -1429,7 +1526,7 @@ where
             qp_energy = crate::ri_gw::newton_solver(
                 wrapped_f, n, consts, ri_ov, ri_row_n,
                 gwqp_g, gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
-                initial_guess, 0.00001, 50, side, print_level
+                initial_guess, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, print_level
             );
         }
         qp_energy
@@ -1448,7 +1545,7 @@ pub fn gw_near_fermi_surface_ac(
     println!("RI-OV Shape={:?}", ri_ov.size);
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start = Instant::now();
-    let v_matrix = ri_gw::v_matrix_from_scf(scf_data);
+    let v_matrix = ri_gw::exchange_matrix_from_scf(scf_data);
     let time1 = start.elapsed();
     println!("V Matrix Constructed. This step took {:?}", time1);
     let ks_energies = scf_data.eigenvalues[0].clone();
@@ -1498,15 +1595,462 @@ pub fn gw_near_fermi_surface_ac(
     let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
         .iter()
         .map(|&n| {
-            let ri_row_n = ri_gw::compute_ri3mo_row(scf_data, n);
+            // `single_orbital_gw_ac` only forwards `ri_ov`/`ri_row_n` to the
+            // Newton driver, whose AC closure never reads them (the QP equation
+            // is built from `w_c_at_freqs`).  Building `ri_row_n` here would pay
+            // a full AO→MO transform per orbital for nothing, so reuse `ri_ov`.
             (
                 n,
                 single_orbital_gw_ac(
                     scf_data,
                     &v_matrix,
                     &ri_ov,
-                    &ri_row_n,
+                    &ri_ov,
                     &w_c_at_freqs,
+                    n,
+                    num_freq,
+                    vxc_nn[n],
+                ),
+            )
+        })
+        .collect();
+
+    let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift =
+        calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    // `gw_extrapolation = false`: no orbital is extrapolated.  The BSE window
+    // must then be a subset of the explicitly solved window -- it is asserted,
+    // not assumed, because a silent extrapolation is exactly what made the GW
+    // archive and the gradient refer to different Hamiltonians (2026-11-07).
+    if !qp_ctrl.gw_extrapolation {
+        let (bse_occ_start, bse_num_state) = ri_gw::bse_active_bounds(
+            scf_data,
+            homo,
+            homo + 1,
+        );
+        let calc_lo = calc_orbs[0].0;
+        let calc_hi = calc_orbs[calc_orbs.len() - 1].0;
+        assert!(
+            bse_occ_start >= calc_lo && bse_num_state <= calc_hi + 1,
+            "gw_extrapolation = false, but the BSE window (occupied #{}.., virtuals ..#{}) \
+             is not inside the explicitly solved GW window (#{}..#{}): \
+             widen gw_extrapolate_occ_threshold/gw_extrapolate_vir_threshold \
+             or tighten bse_cutoff_energy",
+            bse_occ_start,
+            bse_num_state.saturating_sub(1),
+            calc_lo,
+            calc_hi
+        );
+        println!(
+            "[gw] extrapolation disabled: {} orbitals solved explicitly (#{}..#{}), the BSE \
+             window lies inside it (occupied #{}.., virtuals ..#{}); the {} orbitals outside \
+             keep their KS energy and are used only inside the screening response -- no \
+             quasiparticle energy is extrapolated",
+            calc_orbs.len(),
+            calc_lo,
+            calc_hi,
+            bse_occ_start,
+            bse_num_state.saturating_sub(1),
+            num_state - calc_orbs.len()
+        );
+    }
+    let mut gwqp: Vec<f64> = Vec::new();
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("low extrapolations:{}", calc_orbs[0].0);
+        println!("calculated orbitals:{}", calc_orbs.len());
+        println!(
+            "high extrapolations:{}",
+            num_state - 1 - calc_orbs[calc_orbs.len() - 1].0
+        );
+        println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
+    }
+    let (lo_shift, hi_shift) = if qp_ctrl.gw_extrapolation {
+        (occ_shift, vir_shift)
+    } else {
+        (0.0, 0.0)
+    };
+    for i in 0..calc_orbs[0].0 {
+        gwqp.push(scf_data.eigenvalues[0][i] + lo_shift)
+    }
+    for i in 0..calc_orbs.len() {
+        gwqp.push(calc_orbs[i].1)
+    }
+    for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
+        gwqp.push(scf_data.eigenvalues[0][i] + hi_shift)
+    }
+    ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold, threshold);
+    scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    gwqp
+}
+
+/// Frequency-sampled contour-deformation G0W0 for one orbital.
+///
+/// The residue part of `Sigma_c` is read from a precomputed
+/// [`ri_gw::fscd::FscdTable`]; the imaginary-axis part is identical to the
+/// ordinary CD path.  The root-search logic mirrors [`single_orbital_gw`].
+#[allow(clippy::too_many_arguments)]
+pub fn single_orbital_gw_fscd(
+    scf_data: &mut SCF,
+    route: &ri_gw::GwTensorRoute,
+    ri_ov: &MatrixFull<f64>,
+    v_matrix: &MatrixFull<f64>,
+    ri_row_n: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    table: &ri_gw::fscd::FscdTable,
+    target_index: usize,
+    n: usize,
+    num_freq: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let start = Instant::now();
+    let gwqp_g = scf_data.gwqp.0.clone();
+    let gwqp_w = scf_data.gwqp.1.clone();
+    let e_ks_n = scf_data.eigenvalues[0][n];
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
+    let side = if n >= occ_size { 1.0 } else { -1.0 };
+    let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let res_tol = qp_ctrl.cdgw_res_tol;
+    let print_level = scf_data.mol.ctrl.print_level;
+
+    let qp_eq_func = |omega: f64| {
+        ri_gw::fscd::quasiparticle_equation_fscd(
+            table,
+            target_index,
+            omega,
+            n,
+            consts,
+            &gwqp_g,
+            &gwqp_w,
+            num_state,
+            w_c_at_freqs,
+            res_tol,
+        )
+    };
+
+    let rootfinder = qp_ctrl.gw_rootfinder.clone();
+    let qp_energy_no_fse;
+
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) =
+            one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!(
+                "  [z_update diag, FSCD] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                central_difference(&qp_eq_func, e_in, 1.0e-5),
+                central_difference(&qp_eq_func, e_in, 1.0e-3),
+                central_difference(&qp_eq_func, e_in, 1.0e-2),
+                central_difference(&qp_eq_func, e_in, 5.0e-2)
+            );
+        }
+        println!(
+            "Orbital #{} (FSCD, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+            n,
+            mode_label(kind),
+            e_in,
+            z,
+            g0,
+            dq,
+            e_out
+        );
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
+        println!(
+            "Orbital #{} (FSCD): |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
+            n,
+            e_ks_n.abs(),
+            qp_ctrl.gw_switch_fallback_threshold,
+            qp_energy_no_fse
+        );
+    } else if rootfinder == "newton".to_string() {
+        println!("Orbital #{} (FSCD, first round):", n);
+        let empty = MatrixFull::empty();
+        qp_energy_no_fse = ri_gw::newton_solver(
+            |om, _nn, _cc, _ov, _rn, _qg, _qw, _os, _vs, _ns, _wf| qp_eq_func(om),
+            n,
+            consts,
+            &empty,
+            ri_row_n,
+            &gwqp_g,
+            &gwqp_w,
+            occ_size,
+            vir_size,
+            num_state,
+            w_c_at_freqs,
+            e_ks_n,
+            qp_ctrl.qpe_tol,
+            qp_ctrl.qpe_max_iter,
+            side,
+            print_level,
+        );
+        println!("First round QP energy (FSCD): {}", qp_energy_no_fse);
+    } else if rootfinder == "interpolation".to_string() {
+        println!("Orbital #{} (FSCD, first round):", n);
+        let (have_crossing, mut qp_energy) = ri_gw::linear_interpolation_solver(
+            qp_eq_func,
+            e_ks_n,
+            side,
+            qp_ctrl.gw_search_grid,
+            qp_ctrl.gw_span_energy,
+        );
+        if !have_crossing {
+            println!(
+                "No graphical crossings found for n={} (FSCD), using Newton solver instead.",
+                n
+            );
+            let empty = MatrixFull::empty();
+            qp_energy = ri_gw::newton_solver(
+                |om, _nn, _cc, _ov, _rn, _qg, _qw, _os, _vs, _ns, _wf| qp_eq_func(om),
+                n,
+                consts,
+                &empty,
+                ri_row_n,
+                &gwqp_g,
+                &gwqp_w,
+                occ_size,
+                vir_size,
+                num_state,
+                w_c_at_freqs,
+                e_ks_n,
+                qp_ctrl.qpe_tol,
+                qp_ctrl.qpe_max_iter,
+                side,
+                print_level,
+            );
+        }
+        qp_energy_no_fse = qp_energy;
+        println!("First round QP energy (FSCD): {}", qp_energy_no_fse);
+    } else {
+        panic!("Invalid choice of GW rootfinder!");
+    }
+
+    if !qp_energy_no_fse.is_finite() {
+        panic!(
+            "FSCD-GW failed to produce a finite QP energy for orbital {}",
+            n
+        );
+    }
+
+    // One-point exact-CD guard.  The sampled self-energy differs from the
+    // dense one by the interpolation error, which is small in the smooth
+    // region but can move a quasiparticle root that sits close to a pole of
+    // W.  Evaluate the *dense* CD equation once at the FSCD root; if it is
+    // not a root of the exact equation, redo this orbital with the exact CD
+    // engine.  This costs one residue sum (n_poles response builds) instead
+    // of a full CD root search (n_scan * n_poles builds).
+    if qp_ctrl.fscd_fallback_residual > 0.0 {
+        let exact_residual = route.quasiparticle_equation(
+            scf_data,
+            Some(ri_ov),
+            qp_energy_no_fse,
+            n,
+            consts,
+            &gwqp_g,
+            &gwqp_w,
+            occ_size,
+            vir_size,
+            num_state,
+            ri_row_n,
+            w_c_at_freqs,
+            res_tol,
+            qp_ctrl.cdgw_eta,
+        );
+        if exact_residual.abs() > qp_ctrl.fscd_fallback_residual {
+            println!(
+                "FSCD orbital #{}: exact-CD residual at the FSCD root is {:.3e} Ha (> {:.1e}); \
+                 falling back to the exact CD engine for this orbital.",
+                n, exact_residual, qp_ctrl.fscd_fallback_residual
+            );
+            return single_orbital_gw(
+                scf_data,
+                route,
+                v_matrix,
+                Some(ri_ov),
+                ri_row_n,
+                w_c_at_freqs,
+                n,
+                num_freq,
+                vxc_nn,
+            );
+        }
+    }
+
+    if qp_ctrl.fourier_self_energy || qp_ctrl.hermite_self_energy {
+        println!(
+            "GW(FSCD) orbital #{}: Fourier/Hermite self-energy correction is not supported in the FSCD path; using the bare FSCD result.",
+            n
+        );
+    }
+
+    println!("GW of orbital #{} (FSCD) took {:?}", n, start.elapsed());
+    if print_level > 1 {
+        println!("Shift = {}", qp_energy_no_fse - e_ks_n);
+    }
+    qp_energy_no_fse
+}
+
+/// G0W0 with the frequency-sampled contour-deformation (FSCD) residue sum.
+///
+/// This is the third `gw_variant`, alongside `"cd"` and `"ac"`.  It uses the
+/// same frontier-orbital window and the same outside-window rigid-shift
+/// extrapolation as the ordinary `"cd"` driver; only the residue evaluation is
+/// frequency-sampled.
+///
+/// FSCD deliberately uses the MO-basis RI tensors (`ri_ov`, `ri_row`) because
+/// its response matrix must be identical to the one used by the CD reference.
+/// `gw_tensor_style = "ao"` is therefore ignored for this variant.
+pub fn gw_near_fermi_surface_fscd(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &Vec<f64>,
+    occ_threshold: f64,
+    vir_threshold: f64,
+    _gw_ctx: &mut ri_gw::GwContext,
+) -> Vec<f64> {
+    let t_start = Instant::now();
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    // The exact-CD guard and the MO tensor calls below use the historical
+    // MO route (no AO plan).
+    let route = ri_gw::GwTensorRoute { plan: None };
+    let ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
+    let v_matrix = ri_gw::exchange_matrix_from_scf(scf_data);
+    let ks_energies = scf_data.eigenvalues[0].clone();
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+
+    let w_c_at_freqs: Vec<(f64, f64, MatrixFull<f64>)> = if qp_ctrl.gw_imag_rayon {
+        ri_gw::generate_w_c(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    } else {
+        ri_gw::generate_w_c_serial(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    };
+
+    let e_homo = ks_energies[occ_size - 1];
+    let e_lumo = ks_energies[occ_size];
+    let calc_orbs_indices: Vec<usize> = ks_energies
+        .iter()
+        .enumerate()
+        .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+        .map(|(n, _)| n)
+        .collect();
+    println!("FSCD calculated orbital indices:{:?}", calc_orbs_indices);
+
+    let ri_rows: Vec<MatrixFull<f64>> = calc_orbs_indices
+        .iter()
+        .map(|&n| ri_gw::compute_ri3mo_row(scf_data, n))
+        .collect();
+
+    let cfg = ri_gw::fscd::FscdConfig {
+        domega: qp_ctrl.fscd_domega,
+        rel_tol: qp_ctrl.fscd_rel_tol,
+        // Diagnostic hook for the eta study: `REST_FSCD_ETA` overrides the
+        // regularisation of the sampled `W_np`, including `0.0` (which the card
+        // value cannot express, because a non-positive `cdgw_eta` falls back to
+        // the 1 mHa default below).  Unset -> the historical behaviour.
+        eta: std::env::var("REST_FSCD_ETA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(if qp_ctrl.cdgw_eta > 0.0 { qp_ctrl.cdgw_eta } else { 1.0e-3 }),
+        res_tol: qp_ctrl.cdgw_res_tol,
+        span: qp_ctrl.gw_span_energy.max(1.0),
+        interp: ri_gw::fscd::FscdInterp::from_str(&qp_ctrl.fscd_interp),
+        // Gradient-capable mode: when the real-axis range is pinned by
+        // `omega_chi_max`, reuse *exactly* the lattice the analytic-gradient
+        // engine builds (its nodes then have zero sensitivity to the geometry),
+        // so the FSCD energy and its derivative refer to the same grid.
+        freqs: if qp_ctrl.omega_chi_max > 0.0 && qp_ctrl.nomega_chi_real > 0 {
+            let nmo = scf_data.eigenvalues[0].len();
+            let nsemin = (occ_size.saturating_sub(1))
+                .saturating_sub(qp_ctrl.selfenergy_state_range);
+            let nsemax = (occ_size + qp_ctrl.selfenergy_state_range).min(nmo - 1);
+            let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
+            let g = ri_gw::gw_grad::build_real_axis_grid(
+                &scf_data.eigenvalues[0],
+                occ_size,
+                qp_ctrl.nomega_chi_real,
+                nsemin,
+                nsemax,
+                qp_ctrl.nomega_sigma,
+                qp_ctrl.step_sigma,
+                qp_ctrl.cdgw_res_tol,
+                grid_type,
+                qp_ctrl.omega_chi_max,
+                1.0e-8,
+            );
+            println!(
+                "FSCD: pinned geometry-independent grid ({} nodes, 0..{:.4} Ha) shared with the gradient engine",
+                g.nodes.len(),
+                g.nodes.last().copied().unwrap_or(0.0)
+            );
+            Some(g.nodes)
+        } else {
+            None
+        },
+    };
+    let table = ri_gw::fscd::build_fscd_table(
+        &ri_ov,
+        &ri_rows,
+        &calc_orbs_indices,
+        &scf_data.gwqp.0,
+        &scf_data.gwqp.1,
+        occ_size,
+        vir_size,
+        &cfg,
+    );
+    println!(
+        "FSCD: {} target orbitals, {} sampled frequencies, {} tabulated (target, pole) pairs, {} response builds (thresholds: {:.4} Ha / {:.2e}, interp={:?})",
+        calc_orbs_indices.len(),
+        table.n_grid(),
+        table.n_pairs(),
+        table.n_response_builds,
+        cfg.domega,
+        cfg.rel_tol,
+        cfg.interp
+    );
+
+    let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
+        .iter()
+        .enumerate()
+        .map(|(idx, &n)| {
+            (
+                n,
+                single_orbital_gw_fscd(
+                    scf_data,
+                    &route,
+                    &ri_ov,
+                    &v_matrix,
+                    &ri_rows[idx],
+                    &w_c_at_freqs,
+                    &table,
+                    idx,
                     n,
                     num_freq,
                     vxc_nn[n],
@@ -1537,14 +2081,24 @@ pub fn gw_near_fermi_surface_ac(
     for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
         gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
     }
-    ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold, threshold);
+    ri_gw::display::extrapolation_quasiparticles(
+        &gwqp,
+        occ_size,
+        &calc_orbs_indices,
+        occ_threshold,
+        vir_threshold,
+    );
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    println!("FSCD G0W0 driver finished in {:.2} s", t_start.elapsed().as_secs_f64());
     gwqp
 }
+
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
     let route=gw_ctx.route(scf_data);
+    let t_riov = Instant::now();
     let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
-    println!("RI-OV Shape={:?} (AO route: None = never materialised)",ri_ov.as_ref().map(|m| m.size));
+    println!("RI-OV Shape={:?} (AO route: None = never materialised); took {:.2} s",
+             ri_ov.as_ref().map(|m| m.size), t_riov.elapsed().as_secs_f64());
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start=Instant::now();
     let v_matrix=route.v_matrix(scf_data);
@@ -1572,7 +2126,24 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
 
-    let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
+    // evGW0 freezes W, so its low-rank representation can be built once and
+    // reused in every outer round.  The same cache also guarantees that the
+    // frozen W is interpolated on exactly the same real-axis grid each round.
+    let lowrank_evgw0_cache_enabled =
+        qp_ctrl.scgw == "evgw0" && qp_ctrl.use_low_rank_contour && imag_lr_enabled;
+    let mut cached_w = if lowrank_evgw0_cache_enabled {
+        gw_ctx.evgw0_lowrank_cache.clone()
+    } else {
+        None
+    };
+    if cached_w.is_some() {
+        println!("evGW0: reusing the cached low-rank W representation (imaginary- and real-axis).");
+    }
+
+    let t_wclr = Instant::now();
+    let mut w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if cached_w.is_some() {
+        None
+    } else if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
             scf_data, ri_ov.as_ref().unwrap(), &scf_data.gwqp.1,
@@ -1581,12 +2152,24 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     } else {
         None
     };
+    if cached_w.is_none() {
+        println!("Imaginary-axis W_c low-rank: {} nodes in {:.2} s", num_freq, t_wclr.elapsed().as_secs_f64());
+    }
 
     // Precompute low-rank real-axis v*chi*v if enabled
-    let real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if qp_ctrl.use_low_rank_contour {
+    let mut real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if cached_w.is_some() {
+        None
+    } else if qp_ctrl.use_low_rank_contour {
         println!("Low-rank contour: Precomputing real-axis sqrt(v)*chi*sqrt(v)...");
         let gwqp_g = scf_data.gwqp.0.clone();
         let gwqp_w = scf_data.gwqp.1.clone();
+        // In evGW0 W is frozen, so the real-axis grid that represents W must
+        // not move with the iterated G energies.  Sizing it from the frozen
+        // W energy vector (the initial G0W0 energies) keeps the entire W
+        // representation fixed across rounds; otherwise the same W would be
+        // re-interpolated on a slightly different grid every iteration and
+        // the fixed point would depend on the G trajectory.
+        let gwqp_g_grid = if qp_ctrl.scgw == "evgw0" { &gwqp_w } else { &gwqp_g };
         let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
         // Range of states used by the `de_max` scan that sizes the real-axis grid.
         //
@@ -1615,9 +2198,10 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             .min((occ_size_2 + qp_ctrl.selfenergy_state_range).min(num_state_2.saturating_sub(1)));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
-        Some({
+        let t_ra = Instant::now();
+        let ra_out = {
             let mut ra = ri_gw::generate_real_axis_vchiv(
-            &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
+            gwqp_g_grid, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
             ri_ov.as_ref().unwrap(),
             qp_ctrl.nomega_chi_real,
             nsemin_demax, nsemax_demax,
@@ -1630,11 +2214,42 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             qp_ctrl.cdgw_eta,
             qp_ctrl.cdgw_res_tol,
             );
-            ra.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+            ra.interp = ri_gw::low_rank_interp_code(&qp_ctrl.low_rank_interp);
             ra
-        })
+        };
+        println!("Real-axis v*chi*v precompute: {:.2} s", t_ra.elapsed().as_secs_f64());
+        Some(ra_out)
     } else {
         None
+    };
+
+    // On the first evGW0 round move the freshly built W data into the cache;
+    // later rounds reuse it.  The references below also cover the non-evGW0
+    // low-rank path, where the owned options are used directly.
+    if lowrank_evgw0_cache_enabled && cached_w.is_none() {
+        let w_c = w_c_lr
+            .take()
+            .expect("evGW0 low-rank cache: missing imaginary-axis W_c");
+        let ra = real_axis_vchiv
+            .take()
+            .expect("evGW0 low-rank cache: missing real-axis v*chi*v");
+        let cache = std::sync::Arc::new(ri_gw::Evgw0LowRankW {
+            w_c_lr: w_c,
+            real_axis_vchiv: ra,
+        });
+        gw_ctx.evgw0_lowrank_cache = Some(cache.clone());
+        cached_w = Some(cache);
+        println!("evGW0: cached the low-rank W representation for all outer rounds.");
+    }
+    let w_c_lr_ref: Option<&Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if let Some(cache) = &cached_w {
+        Some(&cache.w_c_lr)
+    } else {
+        w_c_lr.as_ref()
+    };
+    let real_axis_ref: Option<&ri_gw::RealAxisVChiV> = if let Some(cache) = &cached_w {
+        Some(&cache.real_axis_vchiv)
+    } else {
+        real_axis_vchiv.as_ref()
     };
 
     // [DBG] KS-eigenvalue diagnostics (electron count / homo / window), only at print_level >= 2
@@ -1651,11 +2266,11 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // the full naux×nov ri_ov is not read in the orbital loop. Drop it (free the
     // N³ resident) before entering the loop. Only the v0 path (contour_rayon
     // builds response matrices from ri_ov) keeps it alive.
-    let calc_orbs:Vec<(usize,f64)>=if let Some(ref ra) = real_axis_vchiv {
+    let calc_orbs:Vec<(usize,f64)>=if let Some(ra) = real_axis_ref {
         drop(ri_ov);
         calc_orbs_indices.iter().map(|&n|{
             let ri_row_n=route.ri_row(scf_data,n);
-            if let Some(ref wlr) = w_c_lr {
+            if let Some(wlr) = w_c_lr_ref {
                 // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
                 let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
                 (n, single_orbital_gw_lowrank_v2(scf_data, &v_matrix, &ri_row_n, &wc_rows, ra, n, num_freq, vxc_nn[n]))
@@ -1691,7 +2306,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // window are written back unchanged and never enter the self-consistent
     // loop.  Extrapolating them instead (REST) makes their rigid shift a slow
     // feedback channel into G and W.
-    let freeze_outside = qp_ctrl.evgw_freeze_outside && qp_ctrl.scgw == "evgw";
+    let freeze_outside = qp_ctrl.evgw_freeze_outside
+        && (qp_ctrl.scgw == "evgw" || qp_ctrl.scgw == "evgw0");
     let baseline = &scf_data.eigenvalues[0];
     for i in 0 .. calc_orbs[0].0{
         gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+occ_shift})
@@ -1752,7 +2368,7 @@ fn single_orbital_gw_lowrank(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
@@ -1800,7 +2416,7 @@ fn single_orbital_gw_lowrank(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             w_c_at_freqs, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+            qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -1836,7 +2452,7 @@ fn single_orbital_gw_lowrank(
             qp_energy = ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -1869,7 +2485,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -1889,7 +2505,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -1927,7 +2543,7 @@ fn single_orbital_gw_lowrank_v2(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
+    let hybrid_param = ri_gw::static_exchange_fraction(scf_data);
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
@@ -1975,7 +2591,7 @@ fn single_orbital_gw_lowrank_v2(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank_v2(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             wc_rows, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+            qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank v2, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -2002,7 +2618,7 @@ fn single_orbital_gw_lowrank_v2(
             qp_energy = ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_start, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -2035,7 +2651,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -2055,7 +2671,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
+                qp_energy_no_fse, qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -2066,4 +2682,82 @@ fn single_orbital_gw_lowrank_v2(
 
     println!("GW of orbital #{} (low-rank v2) took {:?}, QP={}", n, start.elapsed(), final_qp);
     final_qp
+}
+
+/// CD-WAC driver: contour deformation with an analytic continuation of `W`.
+///
+/// The self-energy is evaluated by [`ri_gw::gw_grad::GwGradEngine`] in
+/// `gw_variant = "wac"` mode: the imaginary-axis integral is the ordinary CD
+/// one and the residue term evaluates `W_c,nm(zeta_m)` through a Padé
+/// approximant built from reference `W` rows (imaginary axis + near real
+/// axis).  Using the gradient engine here keeps the energy and its analytic
+/// gradient on exactly the same functional.
+pub fn gw_near_fermi_surface_wac(
+    scf_data: &mut SCF,
+    _num_freq: usize,
+    _vxc_nn: &Vec<f64>,
+    occ_threshold: f64,
+    vir_threshold: f64,
+) -> Vec<f64> {
+    use crate::ri_gw::gw_grad::{GwGradConfig, GwGradEngine};
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let ks_energies = scf_data.eigenvalues[0].clone();
+    let (start_mo, num_state, occ_size, _vir_size, _homo, _lumo) =
+        ri_gw::get_occupation_parameters(scf_data, 'Y');
+    let e_homo = ks_energies[occ_size - 1];
+    let e_lumo = ks_energies[occ_size];
+    let calc_orbs_indices: Vec<usize> = ks_energies
+        .iter()
+        .enumerate()
+        .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+        .map(|(n, _)| n)
+        .collect();
+    println!("WAC calculated orbital indices:{:?}", calc_orbs_indices);
+
+    let cfg = GwGradConfig::from_scf(scf_data);
+    let vxc = GwGradEngine::precompute_vxc(scf_data);
+    let engine = GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+    let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
+        .iter()
+        .map(|&n| {
+            let energy = engine.qp_energy_of(n);
+            println!("  WAC QP energy of orbital {n}: {:.10} Ha", energy);
+            (n, energy)
+        })
+        .collect();
+    drop(engine);
+
+    let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift =
+        calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    let mut gwqp: Vec<f64> = Vec::new();
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("low extrapolations:{}", calc_orbs[0].0);
+        println!("calculated orbitals:{}", calc_orbs.len());
+        println!(
+            "high extrapolations:{}",
+            num_state - 1 - calc_orbs[calc_orbs.len() - 1].0
+        );
+        println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
+    }
+    for i in 0..calc_orbs[0].0 {
+        gwqp.push(scf_data.eigenvalues[0][i] + occ_shift)
+    }
+    for i in 0..calc_orbs.len() {
+        gwqp.push(calc_orbs[i].1)
+    }
+    for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
+        gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
+    }
+    ri_gw::display::extrapolation_quasiparticles(
+        &gwqp,
+        occ_size,
+        &calc_orbs_indices,
+        occ_threshold,
+        vir_threshold,
+    );
+    scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    let _ = (start_mo, &qp_ctrl);
+    gwqp
 }

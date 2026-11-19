@@ -54,12 +54,46 @@ pub fn compute_dipole_matrix(scf_data:&SCF)->MatrixFull<f64>{
     let eigenvectors=scf_data.eigenvectors[0].clone();
     //eigenvectors.formated_output(1000,"full");
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
-        let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,i,a+occ_size);
+        // compact occupied `i` -> orbital `start_mo + i`; compact virtual `a`
+        // -> orbital `lumo + a` (the virtual block spans `lumo..num_state`)
+        let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,start_mo+i,lumo+a);
         dipole_matrix[[0,i+a*occ_size]]=mu_ia[0];
         dipole_matrix[[1,i+a*occ_size]]=mu_ia[1];
         dipole_matrix[[2,i+a*occ_size]]=mu_ia[2];
     });
     //dipole_matrix.formated_output(1000,"full");
+    dipole_matrix
+}
+/// Transition-dipole matrix for a CVS transition space.
+///
+/// Columns are laid out exactly as the CVS amplitudes, `i_local + a*ncore`,
+/// where `i_local` indexes `core` and `a` indexes the virtual window
+/// `vir_start..vir_start+vir_size`.  Triplet CVS matrices are returned as
+/// zeros, matching the ordinary BSE convention (the transition is dark in the
+/// non-relativistic dipole approximation).
+pub fn compute_dipole_matrix_cvs(
+    scf_data:&SCF,
+    core:&[usize],
+    vir_start:usize,
+    vir_size:usize,
+    triplet:bool,
+)->MatrixFull<f64>{
+    let ncore=core.len();
+    if triplet{
+        return MatrixFull::new([3,vir_size*ncore],0.0)
+    }
+    let ao_dip=obtain_ao_dips(scf_data,None);
+    let eigenvectors=scf_data.eigenvectors[0].clone();
+    let mut dipole_matrix=MatrixFull::new([3,vir_size*ncore],0.0);
+    for (ii,&i) in core.iter().enumerate(){
+        for a in 0..vir_size{
+            let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,i,vir_start+a);
+            let idx=ii+a*ncore;
+            dipole_matrix[[0,idx]]=mu_ia[0];
+            dipole_matrix[[1,idx]]=mu_ia[1];
+            dipole_matrix[[2,idx]]=mu_ia[2];
+        }
+    }
     dipole_matrix
 }
 pub fn transition_dipole_square(dipole_matrix:&MatrixFull<f64>,vec:&Vec<f64>,tda:bool)->f64{

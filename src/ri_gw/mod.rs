@@ -14,11 +14,26 @@ use rayon::result;
 use reqwest::blocking::Response;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
+
+/// Number of response matrices built by the dense CD residue loop
+/// ([`contour_rayon`]).  Used by the FSCD regression/performance tests.
+pub static CD_RESIDUE_RESPONSE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reset the dense-CD response-build counter.
+pub fn reset_cd_counter() {
+    CD_RESIDUE_RESPONSE_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the dense-CD response-build counter.
+pub fn cd_response_builds() -> usize {
+    CD_RESIDUE_RESPONSE_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
 use rest_tensors::{RIFull};
 use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
-use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyev_inplace};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyevd};
 use crate::tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use rest_tensors::MatrixUpper;
 use crate::ri_bse;
@@ -34,6 +49,8 @@ use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 pub mod ac;
+pub mod ac_grad;
+pub mod fscd;
 pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
@@ -41,6 +58,9 @@ pub mod fourier_self_energy;
 pub mod qsgw;
 pub mod gw_grad;
 pub mod tensor_ao;
+pub mod ao_local;
+pub mod nonlingw;
+pub mod fully_analytic;
 use crate::mpi_io::MPIOperator;
 
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
@@ -90,6 +110,9 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
         }else if scgw=="evgw"{
             println!("You are doing evGW calculations of entire energy spectrum");
             scgw::evgw(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds,&mut gw_ctx)
+        }else if scgw=="evgw0"{
+            println!("You are doing evGW0 calculations (W frozen at the G0W0 level)");
+            scgw::evgw0(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds,&mut gw_ctx)
         }else if scgw=="g0w0"&&renormalized_singles==true{
             scgw::g0w0(scf_data,20,&vxc_nn,true,&mut gw_ctx)
         }else{panic!("invalid expression for scgw!")};
@@ -188,10 +211,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state_cutoff];
     save_energies_no_se=(0..num_state_cutoff).map(|n|{
         let consts=if cancel_dfa_xc==true{
-            let mut exchange=0.0;
-            for i in 0..homo+1{
-                exchange-=v_matrix[[n,i]];
-            }
+            let exchange = static_exchange(scf_data, &v_matrix, n, homo);
             scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
         }else{quasiparticle_energies_g[n]};
         let side=if n>=occ_size{1.0}else{-1.0};
@@ -225,10 +245,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         save_energies=(0..num_state_cutoff).map(|n|{
             let origin = save_energies_no_se[n];
             let consts=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
             }else{quasiparticle_energies_g[n]};
             let side=if n>=occ_size{1.0}else{-1.0};
@@ -251,10 +268,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         save_energies=(0..num_state_cutoff).map(|n|{
             let origin = save_energies_no_se[n];
             let consts=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
             }else{quasiparticle_energies_g[n]};
             let side=if n>=occ_size{1.0}else{-1.0};
@@ -277,6 +291,64 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
     quasiparticle_energies_g
 }
+/// Fraction of the exact (RI) exchange `Sigma_x,nn` that the reference's own
+/// orbital energies already contain.
+///
+/// For a range-separated hybrid this is the **short-range** coefficient
+/// `c_SR = dfa_hybrid_scf`; the static GW term does not use it directly because
+/// it needs the separate long-range coefficient as well (see
+/// [`static_exchange_fraction`] and [`exchange_matrix_from_scf`]).
+///
+/// The static term of the quasiparticle equation is
+/// `B_n = e_n + (1 - alpha) Sigma_x,nn - v_xc,nn`: the `(1 - alpha) Sigma_x`
+/// piece *completes* the exchange up to the full exact one, and `v_xc` is
+/// cancelled, so that the G0W0 starting point is the HF-like `h + J + Sigma_x`.
+///
+/// REST leaves `dfa_hybrid_scf = 0` for a plain Hartree-Fock reference, but an
+/// HF calculation already carries the **exact** exchange in `e_n`, so the
+/// fraction to complement there is one, not zero.  Reading `dfa_hybrid_scf`
+/// directly therefore adds `Sigma_x,nn` a second time — 4.87 Ha for the O 1s of
+/// H2O/STO-3G, which is what used to make an HF reference's G0W0 energies
+/// disagree with `GwGradEngine` (whose `fock_hyb` has always made this
+/// distinction).  Mirrors `dft::response` (`is_hf = dfa_compnt_scf.is_empty()`).
+pub fn exchange_fraction(scf_data:&SCF)->f64{
+    if !scf_data.mol.dfadef.is_dfa_scf() {
+        1.0
+    } else {
+        scf_data.mol.dfadef.dfa_hybrid_scf
+    }
+}
+
+/// Scalar factor multiplying the exchange matrix in the static term.
+///
+/// For HF/global hybrids this is `1 - alpha` (with `alpha` from
+/// [`exchange_fraction`]).  A range-separated hybrid has no single exchange
+/// fraction: [`exchange_matrix_from_scf`] returns the already assembled
+/// `K_full - K_ref`, so the factor is one (encoded here as `1 - 0`).
+pub fn static_exchange_fraction(scf_data:&SCF)->f64{
+    if scf_data.mol.dfadef.is_rsh() {
+        0.0
+    } else {
+        exchange_fraction(scf_data)
+    }
+}
+
+/// `(1 - alpha) * Sigma_x,nn` with `Sigma_x,nn = -sum_i (n i|n i)` and `alpha`
+/// from [`static_exchange_fraction`]: the exact-exchange part the static term
+/// adds on top of `e_n`.  Used by every energy path (`gw_calculations`,
+/// `linearized_gw` and their low-rank variants) so that an HF reference is
+/// handled like a hybrid with `alpha = 1`.
+///
+/// For RSH references `v_matrix` must be the completion matrix from
+/// [`exchange_matrix_from_scf`]; the factor is then one.
+pub fn static_exchange(scf_data:&SCF,v_matrix:&MatrixFull<f64>,n:usize,homo:usize)->f64{
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    exchange * (1.0 - static_exchange_fraction(scf_data))
+}
+
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
     let eigenvecs=scf_data.eigenvectors[0].clone();
     let vxc_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
@@ -477,6 +549,12 @@ pub fn v_matrix_old(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
     v_matrix
     //No need to worry about cutoff
 }
+/// Imaginary-axis `W_c` grid, returned in **ascending frequency order**.
+///
+/// The order is part of the contract: consumers such as the AC Padé sampling
+/// (`get_ac_idx` indexes the quadrature grid) read the node frequency out of
+/// this vector, so a producer-order-dependent result would be a latent,
+/// thread-scheduling-dependent bug.
 pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
     omp_get_num_threads_wrapper();
     let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
@@ -500,42 +578,194 @@ pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_
     }
 
     // Task E: Limit rayon concurrency for generate_w_c to cap per-worker memory.
-    // After Tasks B+C, each worker allocates ~1 GB (response + inverse in-place).
-    // With many frequency points this could still be significant.
     let max_workers = std::env::var("REST_GW_MAX_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     let n_threads = max_workers.min(omega_1.len()).max(1);
 
-    // Save OMP threads and set to 1 inside workers to prevent BLAS thread explosion
-    // (w_c_matrix_from_scf calls generate_ri3mo_rayon_for_multiple_times which uses
-    // rayon + BLAS internally — nested parallelism would create too many BLAS threads)
+    // Save OMP threads and set to 1 inside workers to prevent BLAS thread explosion.
     let saved_omp = omp_get_num_threads_wrapper();
 
-    let (sender,receiver) = channel();
+    let start_mo = scf_data.mol.start_mo;
+    let nmo = num_state - start_mo;
+    let num_auxbas = ri_ov.size[0];
+    let nfreq = omega_1.len();
+
     let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
-    pool.install(|| {
-        rayon::prelude::IndexedParallelIterator::zip(omega_1.par_iter(), weight.par_iter()).for_each_with(sender, |s, (omega_1, weight)| {
-            omp_set_num_threads_wrapper(1);
-            let start=Instant::now();
-            let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I',0.0);
-            let inverse_dielectric=inverse_dielectric_matrix(response,'I');
-            let w_c=w_c_matrix_from_scf(&inverse_dielectric,num_state,scf_data);
-            println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
-            s.send((*omega_1,*weight,w_c)).expect("unsuccessful collection of w_c")
+
+    // ---- one AO→MO pass per row block, shared by a tile of frequencies ----
+    // Historically the AO→MO transform of (μν|P) lived inside the frequency
+    // loop, so every one of the `nfreq` nodes paid the full `nmo/25`
+    // transforms — the dsymm inside `generate_ri3mo_rayon_for_multiple_times`
+    // is independent of the row count, which made that redundancy the dominant
+    // cost.  The block transform is frequency independent, so it is hoisted
+    // here and the per-node work becomes a dgemm with that node's inverse
+    // dielectric, exactly the structure of `low_rank_vchi_vsqrt`.
+    //
+    // Frequencies are processed in tiles: the tile's inverse dielectric
+    // matrices are the only per-node objects held at once, and the row block is
+    // shared by the whole tile.  The tile size is `min(n_threads, mem_tile)`,
+    // where `REST_GW_WC_MEM_MIB` bounds `mem_tile * naux^2 * 8` bytes (unset =
+    // no bound, i.e. one tile and exactly one transform pass per row block when
+    // the worker cap also allows `nfreq` workers).
+    let mem_tile = w_c_frequency_tile(num_auxbas, nfreq, w_c_memory_cap_mib());
+    let tile = n_threads.min(mem_tile).min(nfreq).max(1);
+    let mut w_c_all: Vec<MatrixFull<f64>> = Vec::with_capacity(nfreq);
+    let t_start = Instant::now();
+    for chunk_start in (0..nfreq).step_by(tile) {
+        let chunk_end = (chunk_start + tile).min(nfreq);
+        let inverses: Vec<MatrixFull<f64>> = pool.install(|| {
+            omega_1[chunk_start..chunk_end]
+                .par_iter()
+                .map(|&omega_1| {
+                    omp_set_num_threads_wrapper(1);
+                    let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,omega_1,'I',0.0);
+                    inverse_dielectric_matrix(response,'I')
+                })
+                .collect()
         });
-    });
-    let w_c_at_freqs:Vec<(f64,f64,MatrixFull<f64>)>=receiver.into_iter().collect();
+        let mut w_c_tile: Vec<MatrixFull<f64>> = (0..chunk_end - chunk_start)
+            .map(|_| MatrixFull::new([num_state,num_state],0.0))
+            .collect();
+        let block = 25_usize.min(nmo).max(1);
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = scf_data
+                .generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                )
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+                .into_matfull_i_jk();
+            pool.install(|| {
+                w_c_tile.par_iter_mut().zip(inverses.par_iter()).for_each(|(w_c, inv)| {
+                    omp_set_num_threads_wrapper(1);
+                    fill_w_c_rows_from_block(w_c, &ri_block, inv, row_start, block_n, nmo, num_auxbas);
+                });
+            });
+            row_start = row_end;
+        }
+        w_c_all.extend(w_c_tile);
+    }
     omp_set_num_threads_wrapper(saved_omp);
-    w_c_at_freqs
+    println!(
+        "Evaluation of W_c on {} frequency nodes (one AO→MO pass per row block, {} tile(s)) took {:?}",
+        nfreq,
+        nfreq.div_ceil(tile),
+        t_start.elapsed()
+    );
+
+    let out: Vec<(f64,f64,MatrixFull<f64>)> = omega_1.drain(..).zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect();
+    dump_w_c_if_requested(&out);
+    out
 }
+
+/// `REST_GW_WC_DUMP=<path>`: append one line per frequency node with the node
+/// frequency, its quadrature weight and two checksums of `W_c` (sum and sum of
+/// absolute values, over the full matrix).  This is the cheap A/B probe for
+/// "did the W grid change?": two builds must produce identical lines.
+fn dump_w_c_if_requested(out: &[(f64,f64,MatrixFull<f64>)]) {
+    let path = match std::env::var("REST_GW_WC_DUMP") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut rows: Vec<(f64, f64, f64, f64)> = out
+        .iter()
+        .map(|(omega, weight, w_c)| {
+            let sum: f64 = w_c.data.iter().sum();
+            let abs: f64 = w_c.data.iter().map(|x| x.abs()).sum();
+            (*omega, *weight, sum, abs)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut text = String::new();
+    for (omega, weight, sum, abs) in rows {
+        text.push_str(&format!("{omega:+.16e} {weight:+.16e} {sum:+.16e} {abs:+.16e}\n"));
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(text.as_bytes());
+        }
+        Err(e) => println!("REST_GW_WC_DUMP: cannot open {path}: {e}"),
+    }
+}
+
+/// How many frequency nodes' inverse dielectrics may be resident at once.
+///
+/// Each node contributes one `naux × naux` matrix, so the frequency-parallel
+/// working set is `tile * naux^2 * 8` bytes.  `REST_GW_WC_MEM_MIB` caps that
+/// (0 or unset = no cap); when the cap binds, the AO→MO row-block transform is
+/// repeated `ceil(nfreq/tile)` times instead of being paid once.
+fn w_c_frequency_tile(naux: usize, nfreq: usize, cap_mib: usize) -> usize {
+    let nfreq = nfreq.max(1);
+    if cap_mib == 0 || naux == 0 {
+        return nfreq;
+    }
+    let per_node = naux.saturating_mul(naux).saturating_mul(8).max(1);
+    (cap_mib.saturating_mul(1024 * 1024) / per_node).clamp(1, nfreq)
+}
+
+fn w_c_memory_cap_mib() -> usize {
+    std::env::var("REST_GW_WC_MEM_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Fill the rows `[row_start, row_start+block_n)` of `w_c` from one
+/// already MO-transformed block of `(P|n m)`.
+///
+/// `ri_block` is column-major `[num_auxbas, block_n*nmo]` with the column index
+/// `local_n + local_m*block_n` (the layout produced by the `row_dim × col_dim`
+/// AO→MO transform), so one row of `W_c` is gathered from `nmo` strided
+/// columns, contracted with `ε⁻¹`, and dotted back.
+fn fill_w_c_rows_from_block(
+    w_c: &mut MatrixFull<f64>,
+    ri_block: &MatrixFull<f64>,
+    inverse_dielectric: &MatrixFull<f64>,
+    row_start: usize,
+    block_n: usize,
+    nmo: usize,
+    num_auxbas: usize,
+) {
+    let mut ri_row_n = MatrixFull::new([num_auxbas, nmo], 0.0);
+    let mut tmp = MatrixFull::new([num_auxbas, nmo], 0.0);
+    for local_n in 0..block_n {
+        let global_n = row_start + local_n;
+        for local_m in 0..nmo {
+            let src = (local_n + local_m * block_n) * num_auxbas;
+            let dst = local_m * num_auxbas;
+            ri_row_n.data[dst..dst + num_auxbas]
+                .copy_from_slice(&ri_block.data[src..src + num_auxbas]);
+        }
+        tmp.data.iter_mut().for_each(|x| *x = 0.0);
+        _dgemm_full(inverse_dielectric, 'N', &ri_row_n, 'N', &mut tmp, 1.0, 0.0);
+        for local_m in 0..nmo {
+            let col_start = local_m * num_auxbas;
+            let dot: f64 = ri_row_n.data[col_start..col_start + num_auxbas]
+                .iter()
+                .zip(tmp.data[col_start..col_start + num_auxbas].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            w_c[[global_n, local_m]] = dot;
+            w_c[[local_m, global_n]] = dot;
+        }
+    }
+}
+
 pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
     omp_get_num_threads_wrapper();
     let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
     let max_freq = scf_data.mol.ctrl.freq_cut_off;
     let mut sp = format!("The frequency integration is tabulated by {:3} grids using", num_freq);
-    let (mut omega_1,weight) = if freq_grid_type==0 {
+    let (omega_1,weight) = if freq_grid_type==0 {
         sp = format!("{} the modified Gauss-Legendre grids",sp);
         ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
     } else if freq_grid_type==1 {
@@ -551,15 +781,71 @@ pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_en
     if scf_data.mol.ctrl.print_level>1 {
         println!("{}", sp);
     }
-    omega_1.iter().zip(weight.iter()).map(|(omega_1, weight)| {
-        let start=Instant::now();
-        let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I',0.0);
-        let inverse_dielectric=inverse_dielectric_matrix(response,'I');
-        let w_c=w_c_matrix_from_scf(&inverse_dielectric,num_state,scf_data);
-        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
-        (*omega_1,*weight,w_c)
-    }).collect()
+
+    let start_mo = scf_data.mol.start_mo;
+    let nmo = num_state - start_mo;
+    let num_auxbas = ri_ov.size[0];
+    let nfreq = omega_1.len();
+
+    // Same memory-bound tiling as the parallel driver: never hold more than
+    // `tile` inverse dielectrics (the row-block transform is repeated per tile
+    // when the cap binds).
+    let tile = w_c_frequency_tile(num_auxbas, nfreq, w_c_memory_cap_mib());
+    let mut w_c_all: Vec<MatrixFull<f64>> = Vec::with_capacity(nfreq);
+    let block = 25_usize.min(nmo).max(1);
+    let t_start = Instant::now();
+    for chunk_start in (0..nfreq).step_by(tile) {
+        let chunk_end = (chunk_start + tile).min(nfreq);
+        // inverses for this tile only (the memory-bounded working set)
+        let inverses: Vec<MatrixFull<f64>> = omega_1[chunk_start..chunk_end]
+            .iter()
+            .map(|&omega_1| {
+                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,omega_1,'I',0.0);
+                inverse_dielectric_matrix(response,'I')
+            })
+            .collect();
+        let mut w_c_tile: Vec<MatrixFull<f64>> = (0..chunk_end - chunk_start)
+            .map(|_| MatrixFull::new([num_state,num_state],0.0))
+            .collect();
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = scf_data
+                .generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                )
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+                .into_matfull_i_jk();
+            for (ifreq, w_c) in w_c_tile.iter_mut().enumerate() {
+                fill_w_c_rows_from_block(
+                    w_c,
+                    &ri_block,
+                    &inverses[ifreq],
+                    row_start,
+                    block_n,
+                    nmo,
+                    num_auxbas,
+                );
+            }
+            row_start = row_end;
+        }
+        w_c_all.extend(w_c_tile);
+    }
+    println!(
+        "Evaluation of W_c on {} frequency nodes (one AO→MO pass per row block) took {:?}",
+        nfreq,
+        t_start.elapsed()
+    );
+    let out: Vec<(f64,f64,MatrixFull<f64>)> = omega_1.into_iter().zip(weight).zip(w_c_all).map(|((omega,weight),w_c)| (omega,weight,w_c)).collect();
+    dump_w_c_if_requested(&out);
+    out
 }
+
 pub struct WcAtFreq {
     pub omega: f64,
     pub weight: f64,
@@ -585,17 +871,79 @@ pub fn generate_w_c_spin(
         ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
     };
     let nspin = scf_data.mol.spin_channel;
-    omega_1.into_iter().zip(weight.into_iter()).map(|(omega, weight)| {
-        let response = response_matrix_total(scf_data, quasiparticle_energies_w, occ_params, ri_ov, omega, 'I', 0.0);
-        let inverse_dielectric = inverse_dielectric_matrix(response, 'I');
-        let w_c_0 = w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[0].num_state, scf_data, 0);
-        let w_c_1 = if nspin == 2 {
-            w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[1].num_state, scf_data, 1)
-        } else {
-            w_c_0.clone()
-        };
-        WcAtFreq{ omega, weight, w_c:[w_c_0, w_c_1] }
-    }).collect()
+    let nfreq = omega_1.len();
+    let start_mo = scf_data.mol.start_mo;
+
+    // One inverse dielectric per frequency node (same `ri_ov` for all nodes).
+    let inverses: Vec<MatrixFull<f64>> = omega_1
+        .iter()
+        .map(|&omega| {
+            let response = response_matrix_total(
+                scf_data, quasiparticle_energies_w, occ_params, ri_ov, omega, 'I', 0.0,
+            );
+            inverse_dielectric_matrix(response, 'I')
+        })
+        .collect();
+
+    // The AO→MO transform is frequency independent: one pass per row block,
+    // shared by every node (see `generate_w_c`).
+    // the second spin block mirrors the first in the closed-shell case, so its
+    // dimension must follow `occ_params[0]` there
+    let n1 = if nspin == 2 {
+        occ_params[1].num_state
+    } else {
+        occ_params[0].num_state
+    };
+    let mut w_c_all: Vec<[MatrixFull<f64>; 2]> = (0..nfreq)
+        .map(|_| {
+            [
+                MatrixFull::new([occ_params[0].num_state, occ_params[0].num_state], 0.0),
+                MatrixFull::new([n1, n1], 0.0),
+            ]
+        })
+        .collect();
+    for spin in 0..nspin {
+        let num_state = occ_params[spin].num_state;
+        let nmo = num_state - start_mo;
+        let num_auxbas = inverses.first().map_or(0, |m| m.size[0]);
+        let block = 25_usize.min(nmo).max(1);
+        let mut row_start = 0_usize;
+        while row_start < nmo {
+            let row_end = (row_start + block).min(nmo);
+            let block_n = row_end - row_start;
+            let ri_block = select_ri3mo_spin(
+                scf_data.generate_ri3mo_rayon_for_multiple_times(
+                    start_mo + row_start..start_mo + row_end,
+                    start_mo..num_state,
+                ),
+                spin,
+            );
+            for (ifreq, w_c) in w_c_all.iter_mut().enumerate() {
+                fill_w_c_rows_from_block(
+                    &mut w_c[spin],
+                    &ri_block,
+                    &inverses[ifreq],
+                    row_start,
+                    block_n,
+                    nmo,
+                    num_auxbas,
+                );
+            }
+            row_start = row_end;
+        }
+    }
+    // Closed shell: both spin blocks are identical by construction.
+    if nspin == 1 {
+        for w_c in w_c_all.iter_mut() {
+            w_c[1] = w_c[0].clone();
+        }
+    }
+    omega_1
+        .into_iter()
+        .zip(weight.into_iter())
+        .zip(w_c_all)
+        .map(|((omega, weight), w_c)| WcAtFreq { omega, weight, w_c })
+        .collect()
 }
 
 pub fn calculate_imag_spin(
@@ -619,20 +967,37 @@ pub fn calculate_imag_spin(
     }).sum()
 }
 
+/// Deterministic sum of a parallel map, used by the GW energy path.
+fn par_map_sum<T, F>(xs: &[T], f: F) -> f64
+where
+    T: Sync,
+    F: Fn(&T) -> f64 + Sync + Send,
+{
+    xs.par_iter().map(f).collect::<Vec<f64>>().iter().sum()
+}
+
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
-    let (sender,receiver)=channel();
-    //println!("0th freq:  calculating imag: w_c size:{},{}; quasiparticles_g size:{}",w_c_at_freqs[0].2.size[0],w_c_at_freqs[0].2.size[1],quasiparticle_energies_g.len());
-    //println!("10th freq: calculating imag: w_c size:{},{}; quasiparticles_g size:{}",w_c_at_freqs[10].2.size[0],w_c_at_freqs[10].2.size[1],quasiparticle_energies_g.len());
-    w_c_at_freqs.par_iter().for_each_with(sender, |s, (omega_1,weight,w_c)|{
-        let imag_n_omega=(quasiparticle_energies_g.iter().enumerate().map(|(m,qp_m)|{
-            let rpod=omega-qp_m;
-            let gfc=rpod/(rpod.powf(2.0)+omega_1.powf(2.0));
-            2.0*gfc*(w_c[[n,m]])/(2.0*PI)
-        }).sum::<f64>())*weight;
-        s.send(imag_n_omega).expect("unsuccessful collection of imag_n_omega")
+    // Deterministic reduction.  `par_iter().map(..)` over a slice is an *indexed*
+    // parallel iterator, so `collect` preserves the frequency order and the
+    // final serial sum is bit-identical for every `num_threads`.  The previous
+    // `for_each_with(sender, ..)` + `receiver.into_iter().sum()` accumulated in
+    // **arrival** order, which made the GW self-energy -- and every quantity
+    // built on it -- depend on the thread count and on the scheduler.
+    let imag_n = par_map_sum(w_c_at_freqs, |t| {
+        let (omega_1, weight, w_c) = t;
+        let imag_n_omega = quasiparticle_energies_g
+            .iter()
+            .enumerate()
+            .map(|(m, qp_m)| {
+                let rpod = omega - qp_m;
+                let gfc = rpod / (rpod.powf(2.0) + omega_1.powf(2.0));
+                2.0 * gfc * (w_c[[n, m]]) / (2.0 * PI)
+            })
+            .sum::<f64>()
+            * weight;
+        imag_n_omega
     });
-    let imag_n=receiver.into_iter().sum();
     omp_get_num_threads_wrapper();
     imag_n
     //No need to worry about cutoff
@@ -730,30 +1095,85 @@ pub fn current_orbital_energies(scf_data:&SCF)->Vec<f64>{
         scf_data.eigenvalues[0].clone()
     }
 }
+/// The `bse_cutoff_energy` window of the BSE transition space.
+///
+/// `bse_cutoff_energy = x` keeps
+///
+/// ```text
+/// occupied:  e_i >= e_HOMO - x
+/// virtual:   e_a <= e_LUMO + x
+/// ```
+///
+/// i.e. `x` Hartree *below the HOMO* and `x` Hartree *above the LUMO*.  The
+/// occupied side is the whole point of the keyword — the deep core orbitals
+/// cannot contribute to low-lying excitations but enter the `O(nocc^2)`
+/// screening blocks and the `O(dim^2)` BSE matrices quadratically.
+///
+/// Values at or above [`BSE_CUTOFF_DISABLED`] (the 1e6 default) leave the
+/// space untouched, which keeps the historical `rest` cards unchanged.
+pub const BSE_CUTOFF_DISABLED: f64 = 1.0e5;
+
+/// `(occ_start, num_state)` of the active window, see [`BSE_CUTOFF_DISABLED`].
+///
+/// `occ_start` is the first occupied orbital in the window (never above the
+/// HOMO), `num_state` the exclusive upper bound of the virtual manifold.
+pub fn bse_active_bounds(scf_data:&SCF, homo:usize, lumo:usize)->(usize,usize){
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let cutoff=qp_ctrl.bse_cutoff_energy;
+    let start_mo = scf_data.mol.start_mo;
+    let num_state = scf_data.mol.num_state;
+    // Pinned range (see `bse_active_occ_start`): a fixed index window keeps the
+    // active space -- and hence E(R) and dE/dR -- smooth across a relaxation.
+    if qp_ctrl.bse_active_occ_start >= 0 && qp_ctrl.bse_active_vir_end > 0 {
+        let lo = (qp_ctrl.bse_active_occ_start as usize).clamp(start_mo, homo);
+        let hi = (qp_ctrl.bse_active_vir_end as usize).clamp(lumo + 1, num_state);
+        return (lo, hi);
+    }
+    if !(cutoff > 0.0) || cutoff >= BSE_CUTOFF_DISABLED {
+        return (start_mo, num_state);
+    }
+    let e = current_orbital_energies(scf_data);
+    if e.len() < num_state {
+        return (start_mo, num_state);
+    }
+    // `x` below the HOMO on the occupied side, `x` above the LUMO on the
+    // virtual side.  `lumo` is the first virtual orbital index.
+    let e_homo = e[homo];
+    let e_lumo = e[lumo.min(e.len() - 1)];
+    let occ_start = (start_mo..=homo).find(|&i| e[i] >= e_homo - cutoff).unwrap_or(homo);
+    // `lumo + 1` virtuals at least: an empty virtual window is not physical.
+    let vir_end = (lumo..num_state)
+        .filter(|&a| e[a] <= e_lumo + cutoff)
+        .last()
+        .map(|a| a + 1)
+        .unwrap_or(lumo + 1)
+        .max(lumo + 1);
+    (occ_start, vir_end)
+}
+
 pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usize,usize,usize,usize,usize){
-    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let mut num_state = scf_data.mol.num_state;
     let mut homo = 0_usize;
     let mut lumo = num_state;
-    let start_mo = scf_data.mol.start_mo;
     for i_spin in 0..scf_data.mol.spin_channel {
         let i_homo = scf_data.homo.get(i_spin).unwrap().clone();
         let i_lumo = scf_data.lumo.get(i_spin).unwrap().clone();
         homo = homo.max(i_homo);
         lumo = lumo.min(i_lumo);
     }
-    let occ_size=homo-start_mo+1;
-    let mut vir_size=0;
-    if response_or_not=='Y'{
-        vir_size=num_state-occ_size;
-    }
-    
-    else if response_or_not=='N'{
-        // The cutoff defines which orbitals enter the calculation, so it must be
+    let mut start_mo = scf_data.mol.start_mo;
+    if response_or_not=='N'{
+        // The cutoff defines which orbitals enter the calculation, so it is
         // applied to the energies of the orbitals that are actually in use.
-        num_state=current_orbital_energies(scf_data).iter().filter(|x|**x<cutoff).count();
-        vir_size=num_state-occ_size;
+        let (occ_start, vir_end) = bse_active_bounds(scf_data, homo, lumo);
+        start_mo = occ_start;
+        num_state = vir_end;
     }
+    let occ_size = homo - start_mo + 1;
+    // The virtual block spans `lumo..num_state` (see `ri_bse::get_submatrix`),
+    // so its size is `num_state - lumo`.  For `start_mo == 0` this coincides
+    // with the historical `num_state - occ_size`.
+    let vir_size = num_state - lumo;
     (start_mo,num_state,occ_size,vir_size,homo,lumo)
 }
 
@@ -769,21 +1189,35 @@ pub struct OccParams {
 }
 
 pub fn get_occ_params_per_spin(scf_data:&SCF,response_or_not:char)->[OccParams;2]{
-    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let start_mo = scf_data.mol.start_mo;
     let nspin = scf_data.mol.spin_channel.max(1);
     let mut out = [OccParams{start_mo, num_state:scf_data.mol.num_state, occ_size:0, vir_size:0, homo:0, lumo:scf_data.mol.num_state};2];
     for spin in 0..nspin {
         let homo = scf_data.homo[spin];
         let lumo = scf_data.lumo[spin];
-        let occ_size = homo.saturating_sub(start_mo) + 1;
+        let mut occ_start = start_mo;
         let mut num_state = scf_data.mol.num_state;
         if response_or_not=='N'{
-            num_state = scf_data.eigenvalues[spin].iter().filter(|x|**x<cutoff).count();
+            // same two-sided window as `get_occupation_parameters`, per spin
+            let cutoff = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
+            if cutoff > 0.0 && cutoff < BSE_CUTOFF_DISABLED {
+                let e = &scf_data.eigenvalues[spin];
+                if e.len() >= num_state {
+                    let e_lumo = e[lumo.min(e.len() - 1)];
+                    occ_start = (start_mo..=homo).find(|&i| e[i] >= e[homo] - cutoff).unwrap_or(homo);
+                    num_state = (lumo..num_state)
+                        .filter(|&a| e[a] <= e_lumo + cutoff)
+                        .last()
+                        .map(|a| a + 1)
+                        .unwrap_or(lumo + 1)
+                        .max(lumo + 1);
+                }
+            }
         }
+        let occ_size = homo.saturating_sub(occ_start) + 1;
         let lumo_eff = if response_or_not=='Y' { lumo } else { lumo.min(num_state) };
         let vir_size = num_state.saturating_sub(lumo_eff);
-        out[spin] = OccParams{start_mo, num_state, occ_size, vir_size, homo, lumo};
+        out[spin] = OccParams{start_mo:occ_start, num_state, occ_size, vir_size, homo, lumo};
     }
     if scf_data.mol.spin_channel==1 {
         out[1] = out[0];
@@ -871,11 +1305,23 @@ pub fn compute_ri3mo_row_spin(scf_data: &SCF, n: usize, spin: usize) -> MatrixFu
     select_ri3mo_spin(vector, spin)
 }
 
-/// Compute V[n,m] = Σ_Q (Q|nm)² directly from scf_data via blocked MO transformation.
-/// Replaces the old v_matrix that required the full ri_mat.
-pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
-    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
-    let start_mo = scf_data.mol.start_mo;
+/// Shared implementation of the RI exchange matrices `V[n,m] = sum_Q (Q|nm)^2`.
+///
+/// `get_blocks` supplies the AO-to-MO transformed three-centre RI tensor for one
+/// row block; the full-range (`rimatr`) and short-range (`rimatr_sr`) matrices
+/// differ only in that callback, so both are built here with identical blocking
+/// and indexing.  `spin = None` selects the (single) restricted channel.
+fn v_matrix_from_ri_blocks<F>(
+    scf_data: &SCF,
+    num_state: usize,
+    start_mo: usize,
+    spin: Option<usize>,
+    get_blocks: F,
+) -> MatrixFull<f64>
+where
+    F: Fn(&SCF, Range<usize>, Range<usize>)
+        -> Vec<(RIFull<f64>, Range<usize>, Range<usize>)>,
+{
     let nmo = num_state - start_mo;
     let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
 
@@ -884,7 +1330,8 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     while n_start < nmo {
         let n_end = (n_start + block_size).min(nmo);
         // Compute ri3mo[:, n_start..n_end, start_mo..num_state]
-        let ri_block_vec = scf_data.generate_ri3mo_rayon_for_multiple_times(
+        let ri_block_vec = get_blocks(
+            scf_data,
             start_mo + n_start..start_mo + n_end,
             start_mo..num_state,
         );
@@ -895,7 +1342,15 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
         // (local_m runs in the OUTER/slow strided direction). Using the wrong
         // stride (nmo instead of block_n) silently corrupts V whenever
         // block_n != nmo, i.e. whenever the row range is blocked.
-        let ri_block = ri_block_vec.into_iter().next().unwrap().0.into_matfull_i_jk();
+        let ri_block = match spin {
+            Some(s) => select_ri3mo_spin(ri_block_vec, s),
+            None => {
+                if ri_block_vec.is_empty() {
+                    panic!("v_matrix_from_ri_blocks: no RI channel was generated");
+                }
+                ri_block_vec.into_iter().next().unwrap().0.into_matfull_i_jk()
+            }
+        };
         let naux = ri_block.size[0];
         let block_n = n_end - n_start;
         for local_n in 0..block_n {
@@ -920,40 +1375,131 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     v_matrix
 }
 
+/// Full-range RI exchange matrix `V[n,m] = sum_Q (Q|nm)^2` (Coulomb operator).
+pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    v_matrix_from_ri_blocks(
+        scf_data,
+        num_state,
+        scf_data.mol.start_mo,
+        None,
+        |s, a, b| s.generate_ri3mo_rayon_for_multiple_times(a, b),
+    )
+}
+
+/// Short-range RI exchange matrix `V_SR[n,m] = sum_Q (Q^SR|nm)^2` built from the
+/// `erfc(omega r12)/r12` three-centre integrals (`rimatr_sr`).
+///
+/// This is the RSH counterpart of [`v_matrix_from_scf`].  It requires the
+/// short-range RI tensor that `SCF::prepare_necessary_integrals` builds for a
+/// range-separated reference with in-core RI integrals (`algorithm_jk =
+/// "ri-incore"`/`"ri-symm"` and `use_ri_symm = true`).
+pub fn v_matrix_sr_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    v_matrix_from_ri_blocks(
+        scf_data,
+        num_state,
+        scf_data.mol.start_mo,
+        None,
+        |s, a, b| s.generate_ri3mo_sr_rayon_for_multiple_times(a, b),
+    )
+}
+
 pub fn v_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
     let op = get_occ_params_per_spin(scf_data, 'Y')[spin];
-    let num_state = op.num_state;
-    let start_mo = op.start_mo;
-    let nmo = num_state - start_mo;
-    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    v_matrix_from_ri_blocks(
+        scf_data,
+        op.num_state,
+        op.start_mo,
+        Some(spin),
+        |s, a, b| s.generate_ri3mo_rayon_for_multiple_times(a, b),
+    )
+}
 
-    let block_size = 50_usize.min(nmo).max(1);
-    let mut n_start = 0_usize;
-    while n_start < nmo {
-        let n_end = (n_start + block_size).min(nmo);
-        let ri_block_vec = scf_data.generate_ri3mo_rayon_for_multiple_times(
-            start_mo + n_start..start_mo + n_end,
-            start_mo..num_state,
-        );
-        let ri_block = select_ri3mo_spin(ri_block_vec, spin);
-        let naux = ri_block.size[0];
-        let block_n = n_end - n_start;
-        for local_n in 0..block_n {
-            for local_m in 0..nmo {
-                let global_n = n_start + local_n;
-                let global_m = local_m;
-                let col = local_n + local_m * block_n;
-                let start = col * naux;
-                let sum: f64 = ri_block.data[start..start + naux].iter().map(|x| x * x).sum();
-                v_matrix[[global_n, global_m]] = sum;
-            }
-        }
-        n_start = n_end;
+/// Spin-resolved short-range RI exchange matrix (see [`v_matrix_sr_from_scf`]).
+pub fn v_matrix_sr_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
+    let op = get_occ_params_per_spin(scf_data, 'Y')[spin];
+    v_matrix_from_ri_blocks(
+        scf_data,
+        op.num_state,
+        op.start_mo,
+        Some(spin),
+        |s, a, b| s.generate_ri3mo_sr_rayon_for_multiple_times(a, b),
+    )
+}
+
+/// Coefficients of the exact-exchange **completion** `K_full - K_ref` used by
+/// the static term of the quasiparticle equation, written as
+/// `c_full * K_full + c_sr * K_SR`.
+///
+/// A range-separated hybrid reference carries
+/// `K_ref = c_LR K_LR + c_SR K_SR` (`c_LR = dfa_rsh_scf.1`,
+/// `c_SR = dfa_hybrid_scf = dfa_rsh_scf.2`).  Since
+/// `K_full = K_LR + K_SR`, the completion is
+/// `(1 - c_LR) K_full + (c_LR - c_SR) K_SR`.
+///
+/// For a global hybrid or a plain HF reference `c_sr = 0`; the scalar factor
+/// returned by [`static_exchange_fraction`] then supplies the usual
+/// `(1 - alpha)`.
+pub fn exchange_completion_coefficients(scf_data: &SCF) -> (f64, f64) {
+    if let Some((_omega, c_lr, c_sr)) = scf_data.mol.dfadef.rsh_params_scf() {
+        (1.0 - c_lr, c_lr - c_sr)
+    } else {
+        (1.0 - exchange_fraction(scf_data), 0.0)
     }
-    for i in 0..num_state {
-        for j in 0..i {
-            v_matrix[[i, j]] = v_matrix[[j, i]];
-        }
+}
+
+/// RI exchange matrix consumed by the static GW term.
+///
+/// For a non-RSH reference this is the plain full-range [`v_matrix_from_scf`].
+/// For a range-separated hybrid it is the already assembled completion
+/// `c_full * V_full + c_sr * V_SR`; the accompanying scalar factor
+/// [`static_exchange_fraction`] is zero in that case.
+pub fn exchange_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
+    let mut v_matrix = v_matrix_from_scf(scf_data);
+    if !scf_data.mol.dfadef.is_rsh() {
+        return v_matrix;
+    }
+    let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
+    v_matrix.data.iter_mut().for_each(|x| *x *= c_full);
+    if c_sr.abs() > 1.0e-14 {
+        assert!(
+            scf_data.rimatr_sr.is_some(),
+            "RSH GW needs the short-range RI tensor (`rimatr_sr`). Build it with \
+             `algorithm_jk = \"ri-incore\"` (or a separated variant) and \
+             `use_ri_symm = true`."
+        );
+        let v_sr = v_matrix_sr_from_scf(scf_data);
+        v_matrix
+            .data
+            .iter_mut()
+            .zip(v_sr.data.iter())
+            .for_each(|(full, sr)| *full += c_sr * sr);
+    }
+    v_matrix
+}
+
+/// Spin-resolved counterpart of [`exchange_matrix_from_scf`].
+pub fn exchange_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
+    let mut v_matrix = v_matrix_from_scf_spin(scf_data, spin);
+    if !scf_data.mol.dfadef.is_rsh() {
+        return v_matrix;
+    }
+    let (c_full, c_sr) = exchange_completion_coefficients(scf_data);
+    v_matrix.data.iter_mut().for_each(|x| *x *= c_full);
+    if c_sr.abs() > 1.0e-14 {
+        assert!(
+            scf_data.rimatr_sr.is_some(),
+            "RSH GW needs the short-range RI tensor (`rimatr_sr`). Build it with \
+             `algorithm_jk = \"ri-incore\"` (or a separated variant) and \
+             `use_ri_symm = true`."
+        );
+        let v_sr = v_matrix_sr_from_scf_spin(scf_data, spin);
+        v_matrix
+            .data
+            .iter_mut()
+            .zip(v_sr.data.iter())
+            .for_each(|(full, sr)| *full += c_sr * sr);
     }
     v_matrix
 }
@@ -1102,6 +1648,21 @@ pub struct GwTensorRoute {
 #[derive(Default)]
 pub struct GwContext {
     ao_plan: Option<Arc<tensor_ao::GwAoPlan>>,
+    /// Cached W representation for `scgw = "evgw0"` with
+    /// `use_low_rank_contour = true`.
+    ///
+    /// evGW0 keeps the W energy vector fixed, so the expensive low-rank W
+    /// construction (imaginary-axis W_c and the real-axis `v*chi*v` grid) is
+    /// identical in every outer round.  Building it once and reusing it both
+    /// saves the repeated grid diagonalisations and guarantees that the
+    /// frozen W is represented on exactly the same grid in all rounds.
+    pub evgw0_lowrank_cache: Option<Arc<Evgw0LowRankW>>,
+}
+
+/// Low-rank W data reused across all evGW0 outer rounds.
+pub struct Evgw0LowRankW {
+    pub w_c_lr: Vec<(f64, f64, LowRankVChiV)>,
+    pub real_axis_vchiv: RealAxisVChiV,
 }
 
 impl GwContext {
@@ -1120,6 +1681,18 @@ impl GwContext {
             }
         };
         if !crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.gw_tensor_style) {
+            self.ao_plan = None;
+            return GwTensorRoute { plan: None };
+        }
+        // The AO route's `V` is built from the full-range `rimatr` only.  The
+        // static term of a range-separated hybrid needs the short-range
+        // `rimatr_sr` matrix as well, which the AO plan does not own, so keep
+        // the MO-basis route for RSH references.
+        if scf_data.mol.dfadef.is_rsh() {
+            println!(
+                "gw_tensor_style = \"ao\": range-separated hybrid references use the \
+                 MO-basis GW tensors (the AO route has no short-range exchange matrix)."
+            );
             self.ao_plan = None;
             return GwTensorRoute { plan: None };
         }
@@ -1186,11 +1759,16 @@ impl GwTensorRoute {
         }
     }
 
-    /// `V[n,m] = sum_Q (Q|n m)^2`.
+    /// Exchange matrix of the static GW term, `V[n,m] = sum_Q (Q|n m)^2`.
+    ///
+    /// For a range-separated hybrid the AO route is disabled in
+    /// [`GwContext::route`] (it would need the short-range RI tensor), so the
+    /// `None` branch returns the RSH completion matrix from
+    /// [`exchange_matrix_from_scf`].
     pub fn v_matrix(&self, scf_data: &SCF) -> MatrixFull<f64> {
         match &self.plan {
             Some(p) => tensor_ao::v_matrix(scf_data, p),
-            None => v_matrix_from_scf(scf_data),
+            None => exchange_matrix_from_scf(scf_data),
         }
     }
 
@@ -1636,6 +2214,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let de=omega-quasiparticle_energies_g[occ_size+a];
             if de>-res_tol{
                 let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
+                CD_RESIDUE_RESPONSE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(occ_size+a).copied().collect::<Vec<f64>>();
@@ -1653,6 +2232,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let de=quasiparticle_energies_g[i]-omega;
             if de>-res_tol{
                 let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
+                CD_RESIDUE_RESPONSE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(i).copied().collect::<Vec<f64>>();
@@ -1773,6 +2353,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
     }
     (have_crossing,answer)
 }
+
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,res_tol:f64,eta:f64)->f64{
     let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_row_n,res_tol,eta);
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
@@ -1965,10 +2546,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
         let spectral_weight=(1.0-derivative).powf(-1.0);
         println!("spectral weight at n={}: {}",n,spectral_weight);
         let real_qp=if cancel_dfa_xc==true{
-            let mut exchange=0.0;
-            for i in 0..homo+1{
-                exchange-=v_matrix[[n,i]];
-            }
+            let exchange = static_exchange(scf_data, &v_matrix, n, homo);
             omega_shifted+(spectral_weight*(contour-imag_n+exchange-vxc_nn[n]))
         }else{omega_shifted+(spectral_weight*(contour-imag_n))};
         println!("for n={}, first round (no self-energy correction): linearized gw yields qp energy={}",n,real_qp);
@@ -2015,10 +2593,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             println!("spectral weight at n={} (with FSE): {}",n,spectral_weight);
 
             let real_qp=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
             }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
             println!("for n={}, second round (with FSE): linearized gw yields qp energy={}",n,real_qp);
@@ -2054,10 +2629,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             println!("spectral weight at n={} (with HSE): {}",n,spectral_weight);
 
             let real_qp=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
             }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
             println!("for n={}, second round (with HSE): linearized gw yields qp energy={}",n,real_qp);
@@ -2119,7 +2691,7 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
 }
 pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
-    let mut v_matrix=v_matrix_from_scf(scf_data);
+    let mut v_matrix=exchange_matrix_from_scf(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -2148,7 +2720,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     if qp_ctrl.rs_use_rs_orbitals{
         // The exchange matrix <n i|i n> is itself an RI AO2MO quantity: rebuild it
         // in the RS orbital basis installed above.
-        v_matrix=v_matrix_from_scf(scf_data);
+        v_matrix=exchange_matrix_from_scf(scf_data);
     }
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
@@ -2186,10 +2758,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let cdgw_eta = qp_ctrl.cdgw_eta;
     let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let n=homo;
-    let mut exchange=0.0;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts=eigenenergies[n]+exchange-vxc_nn[n];
     if scf_data.mol.ctrl.print_level>1{
         println!("for n={},exchange={}",n,exchange);
@@ -2197,14 +2766,11 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter,side,printlevel);
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
     let n=lumo;
-    let mut exchange=0.0;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts=eigenenergies[n]+exchange-vxc_nn[n];
     if scf_data.mol.ctrl.print_level>1{
         println!("for n={},exchange={}",n,exchange);
@@ -2212,7 +2778,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter,side,printlevel);
     println!("The QP energy of LUMO obtained by GWA is {}",lumo_qp);
 }
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
@@ -2248,7 +2814,7 @@ fn get_homo_lumo_qp_only_lowrank(
     low_rank_tolerance: f64,
 ) {
     let printlevel = scf_data.mol.ctrl.print_level.clone();
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -2293,12 +2859,9 @@ fn get_homo_lumo_qp_only_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
     let n = homo;
-    let mut exchange = 0.0;
-    for i in 0..homo + 1 {
-        exchange -= v_matrix[[n, i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts = eigenenergies[n] + exchange - vxc_nn[n];
     if printlevel > 1 {
         println!("for n={},exchange={}", n, exchange);
@@ -2311,16 +2874,13 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
+        eigenenergies[n], qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of HOMO obtained by GWA (low-rank) is {}", homo_qp);
 
     // LUMO
     let n = lumo;
-    let mut exchange = 0.0;
-    for i in 0..homo + 1 {
-        exchange -= v_matrix[[n, i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts = eigenenergies[n] + exchange - vxc_nn[n];
     if printlevel > 1 {
         println!("for n={},exchange={}", n, exchange);
@@ -2333,7 +2893,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
+        eigenenergies[n], qp_ctrl.qpe_tol, qp_ctrl.qpe_max_iter, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of LUMO obtained by GWA (low-rank) is {}", lumo_qp);
 }
@@ -2364,6 +2924,7 @@ pub struct LowRankVChiV {
 }
 
 /// Collection of low-rank sqrt(v)*chi*sqrt(v) on a real-axis frequency grid
+
 pub struct RealAxisVChiV {
     pub grid: Vec<LowRankVChiV>,
     pub omega_min: f64,
@@ -2464,9 +3025,15 @@ pub fn low_rank_vchi_vsqrt(
         col_start = col_end;
     }
 
-    // Step 3: Diagonalize chi0 in place (LAPACK dsyev overwrites the input with
-    // the eigenvectors, so chi0's buffer is reused — no n² copy).
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    // Step 3: Diagonalize chi0.  `_dsyevd` copies the matrix into its LAPACK
+    // workspace; the returned eigenvectors are the only n² object kept.
+    //
+    // `dsyevd`, not `dsyev`.  This call is the *entire* cost of the real-axis low-rank grid
+    // (400 points), and `dsyev` is dominated by its serial tridiagonal QR iteration: measured on
+    // xc03n02, `dsyev(408)` takes 131 ms at one thread and 100 ms at 40 -- it does not scale at
+    // all -- while `dsyevd(408)` takes 20 ms.  The same note already exists on
+    // `gw_grad::eigh_symmetric`, which is why that path uses `dsyevd`; this one did not.
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd(&chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt: dsyev failed");
 
     // _dsyev returns eigenvalues in ascending order, but we want descending by
@@ -2549,8 +3116,10 @@ pub fn low_rank_vchi_vsqrt_total(
         chi0.self_multiple(2.0);
     }
 
-    // Diagonalize chi0 in place and form the RPA low-rank representation.
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    // Diagonalize chi0 and form the RPA low-rank representation.
+    // `dsyevd` for the same reason as in `low_rank_vchi_vsqrt`: this loop runs once per
+    // real-axis grid point and `dsyev` is a serial-QR-bound 5x slower there.
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd(&chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt_total: dsyev failed");
 
     let mut idx_eig: Vec<(usize, f64)> = eigvals_raw.iter().enumerate()
@@ -2676,25 +3245,53 @@ pub fn generate_real_axis_vchiv(
         println!("[DEBUG] de_max (after 1.05* + 0.1) = {:.10} Ha", de_max);
     }
 
-    // Step 2: Determine grid scaling factor
-    // omega_chi_max > 0.0  means user-specified max frequency for grid distribution;
-    // otherwise fall back to de_max (original behavior).
-    let grid_scale = if omega_chi_max > 0.0 {
-        if omega_chi_max < de_max && print_level > 0 {
-            println!("[omega_chi_max={:.6} Ha < de_max={:.6} Ha] Grid clamped at user-specified max;",
-                     omega_chi_max, de_max);
-            println!("  frequencies > omega_chi_max will use boundary v*chi*v value.");
-        }
-        omega_chi_max
-    } else {
-        de_max
+    // Step 2: Determine grid scaling factor and node count.
+    // `omega_chi_max > 0.0` means a user-specified max frequency for the grid
+    // distribution; otherwise the best-practice automatic rule applies when
+    // `nomega_chi_real == 0`, and `de_max` is the historical fallback.
+    if omega_chi_max > 0.0 && omega_chi_max < de_max && print_level > 0 {
+        println!("[omega_chi_max={:.6} Ha < de_max={:.6} Ha] Grid clamped at user-specified max;",
+                 omega_chi_max, de_max);
+        println!("  frequencies > omega_chi_max will use boundary v*chi*v value.");
+    }
+    let (n_points, grid_scale) = match crate::ri_gw::gw_grad::auto_real_axis_grid(
+        quasiparticle_energies_g,
+        occ_size,
+        nsemin,
+        nsemax,
+        de_max,
+        None,
+        omega_chi_max,
+        nomega_chi_real,
+        0.0,
+    ) {
+        Some((n, scale, _)) => (n, scale),
+        None if omega_chi_max > 0.0 => (nomega_chi_real, omega_chi_max),
+        None => (nomega_chi_real, de_max),
     };
+    if print_level > 0 && n_points != nomega_chi_real {
+        println!(
+            "Low-rank contour: automatic real-axis grid -> {} points on [0, {:.6} Ha] \
+             (z_need-driven; de_max = {:.6} Ha)",
+            n_points, grid_scale, de_max
+        );
+    }
 
-    // Step 3: Build low-rank representation at each grid point
-    let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(nomega_chi_real);
-    for i_omega in 0..nomega_chi_real {
-        let omega_real = if nomega_chi_real > 1 {
-            let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
+    // Step 3: Build low-rank representation at each grid point.
+    //
+    // Deliberately **serial**: each point is one `dsyevd`-class diagonalisation of an
+    // `naux x naux` matrix, which is inherently serial in LAPACK (measured on xc03n02:
+    // `dsyev(408)` = 100 ms at 1 thread and 100 ms at 40) and whose only large BLAS-3
+    // (`chi0 += ri_ov ri_block^T`) already uses the whole pool.  Splitting the loop over the
+    // pool instead would multiply the per-point scratch (`chi0` + `ri_block` + the eigenvector
+    // buffer, tens of MB each) by the number of points in flight and fragment the BLAS-3 into
+    // smaller problems.  The win has to come from making one point cheaper, not from running
+    // more of them at once.
+    let t_ra = Instant::now();
+    let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(n_points);
+    for i_omega in 0..n_points {
+        let omega_real = if n_points > 1 {
+            let t = (i_omega as f64) / ((n_points - 1) as f64);
             if grid_type == 1 {
                 // Power-law grid: omega = grid_scale * t^2, denser near zero
                 grid_scale * t * t
@@ -2707,8 +3304,8 @@ pub fn generate_real_axis_vchiv(
         };
         if print_level > 2 {
             println!("[DEBUG] Real-axis freq {} / {} : omega = {:.10} Ha = {:.6} eV  (t={:.6})",
-                     i_omega + 1, nomega_chi_real, omega_real, omega_real * EV,
-                     (i_omega as f64) / ((nomega_chi_real - 1) as f64));
+                     i_omega + 1, n_points, omega_real, omega_real * EV,
+                     if n_points > 1 { (i_omega as f64) / ((n_points - 1) as f64) } else { 0.0 });
         }
         let lr = low_rank_vchi_vsqrt(
             quasiparticle_energies_w, occ_size, vir_size, ri_ov, omega_real, tolerance, 'R', eta,
@@ -2719,12 +3316,17 @@ pub fn generate_real_axis_vchiv(
         }
         grid.push(lr);
     }
+    if print_level > 0 {
+        println!("Real-axis low-rank grid: {} points in {:.2} s ({:.2} ms/point)",
+                 n_points, t_ra.elapsed().as_secs_f64(),
+                 t_ra.elapsed().as_secs_f64() * 1000.0 / (n_points.max(1) as f64));
+    }
 
     RealAxisVChiV {
         grid,
         omega_min: 0.0,
         omega_max: de_max,
-        n_points: nomega_chi_real,
+        n_points,
         grid_type: grid_type,
         interp: 1,
     }
@@ -2801,18 +3403,20 @@ pub fn generate_real_axis_vchiv_spin(
     println!("Low-rank contour (unrestricted): Computing total sqrt(v)*chi*sqrt(v) at {} real-axis grid points",
              nomega_chi_real);
 
+    // Serial for the same reason as `generate_real_axis_vchiv`: the cost of a point is a
+    // serial LAPACK diagonalisation plus one pool-wide BLAS-3.
     let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(nomega_chi_real);
     for i_omega in 0..nomega_chi_real {
-        let omega_real = if nomega_chi_real > 1 {
-            let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
-            if grid_type == 1 {
-                grid_scale * t * t
+            let omega_real = if nomega_chi_real > 1 {
+                let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
+                if grid_type == 1 {
+                    grid_scale * t * t
+                } else {
+                    grid_scale * t
+                }
             } else {
-                grid_scale * t
-            }
-        } else {
-            grid_scale
-        };
+                grid_scale
+            };
         let lr = low_rank_vchi_vsqrt_total(
             quasiparticle_energies_w,
             occ_params,
@@ -2924,6 +3528,21 @@ pub fn interpolate_vchiv_bracket<'a>(
 /// under the sign and the ordering of the eigenvectors, so the two
 /// factorisations can simply be contracted separately and combined with the
 /// interpolation weights.
+/// The single mapping from the card string `low_rank_interp` to the internal
+/// interpolation code: `0 = nearest`, `1 = linear`.
+///
+/// This used to be open-coded at five places (three here, two in `scgw`), and a
+/// value the copies did not know about was silently downgraded to `linear` --
+/// which is how the QP energy kept using the linear rule while the gradient
+/// engine would have used a different rule.  Always call this.
+pub fn low_rank_interp_code(s: &str) -> usize {
+    if s.eq_ignore_ascii_case("nearest") {
+        0
+    } else {
+        1
+    }
+}
+
 pub fn compute_residue_lowrank_interp(
     real_axis: &RealAxisVChiV,
     de_abs: f64,
@@ -2953,19 +3572,18 @@ pub fn compute_single_residue_lowrank(lr: &LowRankVChiV, ri_vec: &[f64]) -> f64 
     if lr.n_keep == 0 {
         return 0.0;
     }
-
-    let n_aux = lr.eigvec.size[0];
+    // `proj[v] = eigvec[:, v]^T ri_vec`, i.e. the matrix-vector product the old
+    // hand-written double loop over `n_aux * n_keep` computed element by
+    // element.  `eigvec` is stored column-major with exactly `n_keep` columns,
+    // so this is a plain transposed GEMV (BLAS-2, vectorised) instead of a
+    // scalar loop with `MatrixFull` indexing in the innermost body.
     let n_keep = lr.n_keep;
+    let mut proj = vec![0.0_f64; n_keep];
+    _dgemv(&lr.eigvec, ri_vec, &mut proj, 'T', 1.0, 0.0, 1, 1);
     let mut residue = 0.0_f64;
-
     for v in 0..n_keep {
-        let mut tmp = 0.0_f64;
-        for aux in 0..n_aux {
-            tmp += ri_vec[aux] * lr.eigvec[[aux, v]];
-        }
-        residue += tmp * tmp * lr.eigval[v];
+        residue += proj[v] * proj[v] * lr.eigval[v];
     }
-
     residue
 }
 
@@ -3663,7 +4281,7 @@ pub fn gw_calculations_lowrank(
 ) -> Vec<f64> {
     let mut ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let (_start_mo, num_state_cutoff, _occ_size, _vir_size_cutoff, _homo, _lumo) =
@@ -3719,7 +4337,7 @@ pub fn gw_calculations_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     // Check whether self-energy correction is enabled
     let use_fourier = qp_ctrl.fourier_self_energy;
@@ -3736,10 +4354,7 @@ pub fn gw_calculations_lowrank(
     save_energies_no_se = (0..num_state_cutoff)
         .map(|n| {
             let consts = if cancel_dfa_xc == true {
-                let mut exchange = 0.0;
-                for i in 0..homo + 1 {
-                    exchange -= v_matrix[[n, i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
             } else {
                 quasiparticle_energies_g[n]
@@ -3786,10 +4401,7 @@ pub fn gw_calculations_lowrank(
             .map(|n| {
                 let origin = save_energies_no_se[n];
                 let consts = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
                 } else {
                     quasiparticle_energies_g[n]
@@ -3833,10 +4445,7 @@ pub fn gw_calculations_lowrank(
             .map(|n| {
                 let origin = save_energies_no_se[n];
                 let consts = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
                 } else {
                     quasiparticle_energies_g[n]
@@ -3892,7 +4501,7 @@ pub fn linearized_gw_lowrank(
 ) -> Vec<f64> {
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta = qp_ctrl.gw_linearize_shift;
-    let v_matrix = v_matrix_from_scf(scf_data);
+    let v_matrix = exchange_matrix_from_scf(scf_data);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');
     let mut num_state_qp_range = num_state;
@@ -3943,7 +4552,7 @@ pub fn linearized_gw_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
-    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+    real_axis_vchiv.interp = low_rank_interp_code(&qp_ctrl.low_rank_interp);
 
     let h = qp_ctrl.gw_linearize_derivative_h;
     let use_fourier = qp_ctrl.fourier_self_energy;
@@ -4007,10 +4616,7 @@ pub fn linearized_gw_lowrank(
             let spectral_weight = (1.0 - derivative).powf(-1.0);
             println!("spectral weight at n={}: {}", n, spectral_weight);
             let real_qp = if cancel_dfa_xc == true {
-                let mut exchange = 0.0;
-                for i in 0..homo + 1 {
-                    exchange -= v_matrix[[n, i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted
                     + (spectral_weight * (contour - imag_n + exchange - vxc_nn[n]))
             } else {
@@ -4070,10 +4676,7 @@ pub fn linearized_gw_lowrank(
                 println!("spectral weight at n={} (with FSE): {}", n, spectral_weight);
 
                 let real_qp = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     omega_shifted
                         + (spectral_weight
                             * (self_energy_at_omega + exchange - vxc_nn[n]))
@@ -4126,10 +4729,7 @@ pub fn linearized_gw_lowrank(
                 println!("spectral weight at n={} (with HSE): {}", n, spectral_weight);
 
                 let real_qp = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     omega_shifted
                         + (spectral_weight
                             * (self_energy_at_omega + exchange - vxc_nn[n]))

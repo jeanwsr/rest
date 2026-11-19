@@ -788,9 +788,17 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
         epsilon = quasiparticle_energies.clone();
     }
     // The static matvec uses the GW quasiparticle gaps on its diagonal
-    // (`diagonal_elements_contribution`), so the kernel and the preconditioner
-    // use the same one-particle energies.
-    let diag = construct_energy_diag_for_a(&quasiparticle_energies, occ_size, vir_size);
+    // (`diagonal_elements_contribution`).  The dynamical kernel's poles may
+    // instead use the Kohn-Sham gaps, matching the paper's "kernel built with
+    // KS-LDA eigenvalues" choice (this lowers the RPA/double poles into the
+    // optical range).  `dynamic_bse_kernel_energies = "qp" | "ks"`.
+    let kernel_energies: &Vec<f64> =
+        if qp_ctrl.dynamic_bse_kernel_energies.eq_ignore_ascii_case("ks") {
+            &epsilon
+        } else {
+            &quasiparticle_energies
+        };
+    let diag = construct_energy_diag_for_a(kernel_energies, occ_size, vir_size);
 
     // ── Static singles block S (implicit matvec) ──
     //   "bse"  : screened GW-BSE (inverse dielectric from the RPA response)

@@ -502,7 +502,7 @@ GW-BSE方法相关的设置在 `[quasiparticle_methods]` 区块中进行。GW计
 
 GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
 
-- `gw_or_bse`: 取值String，必须参数。设置为 `"gw"` 开启GW准粒子能量计算，设置为 `"bse"` 在自动完成GW计算后进一步进行BSE激发能计算（当配合 `gw_scheme = "parse from file"` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW）。缺省为空，不触发任何计算。
+- `gw_or_bse`: 取值String，必须参数。设置为 `"gw"` 开启GW准粒子能量计算，设置为 `"bse"` 在自动完成GW计算后进一步进行BSE激发能计算，设置为 `"cvs bse"` 进行**芯层激发**的core-valence separation（CVS）BSE计算（同样自动完成所需的GW计算）。当配合 `gw_scheme = "parse from file"` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW。缺省为空，不触发任何计算。
 - `gw_scheme`: 取值String，决定GW准粒子方程的求解方式。可选项：
     - `"extrapolated"`（**推荐**）：在费米面附近一定能量窗口内精确求解准粒子方程，其余轨道通过外推获得。兼备高效率与准确性，适合大多数体系。
     - `"linearize"`：线性化GW准粒子方程，对所有轨道逐一求解。
@@ -511,33 +511,19 @@ GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
     - 缺省为 `"no gw"`。
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
     - `"g0w0"`（缺省）：单次GW计算，不做自洽迭代。
-    - `"evgw"`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
-- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 时需要设置。缺省为0。
+    - `"evgw"`：本征值自洽GW（evGW），每轮用更新后的准粒子能量同时重建 G 和 W。需配合 `evgw_rounds` 设置迭代次数。
+    - `"evgw0"`：本征值自洽 G0W0（evGW0），每轮只把更新后的准粒子能量用于 G，**W 固定为初始 G0W0 水平**（初值为 KS 能量；若 `w_rs = true` 则为 RS 能量）。同样使用 `evgw_rounds`、`evgw_damping`、`evgw_diis` 等外循环控制。
+- `evgw_rounds`: 取值usize，evGW/evGW0 自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 或 `"evgw0"` 时需要设置。缺省为0。
 
 #### evGW 外循环收敛控制
 
 evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不动点迭代。与 PySCF、MolGW 的经验一致，**不做任何加速的朴素迭代对多数分子不会收敛**：`F` 的 Jacobian 在不动点附近有接近甚至超过单位模的特征值，迭代会落入极限环；若再叠加低秩等离面路径中"最近格点"选取带来的分段常值（不连续）误差，连迭代轨迹的逐次可复现性都会丧失。
 
-REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
-
-- `evgw_solver`: 取值String，evGW 外循环求解技巧。
-    - `"molgw"`（缺省）：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
-      `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
-    - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
-    - `"z_update"`：Z 阻尼（线性化牛顿）单步更新，每个轨道每轮只走一步
-      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被截断到 [0, 1]（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。使用该选项时不再施加 DIIS。
-    - `"molgw"`：MolGW 的 evGW 实际执行的更新规则——每个轨道每轮只做一次求值
-      `E_out = consts + Σ_c(E_in)`（即 `E_in + 1.0 · (consts + Σ_c(E_in) − E_in)`，`Z ≡ 1`）。
-
 - `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
     - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
-- `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
-
-  该步长必须同时满足两个尺度条件：明显大于最小的虚轴求积频点（`num_freq = 20` 时约为 `1.7e-3 Ha`），且不大于留数判据 `cdgw_res_tol`（否则差分被截断偏差污染）。
-
 - `evgw_degeneracy_tol`: 取值f64，单位Hartree，缺省 `1e-4`。evGW 的简并投影容差。
 
-- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推。它叠加在 `evgw_solver` 所选用的每轮映射之上。
+- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推。
 - `evgw_diis_space`: DIIS 历史长度。缺省 8。
 - `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
 - `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。
@@ -618,11 +604,6 @@ use_low_rank_contour = true
 - `gw_variant`: 取值String，GW 变体类型：
     - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
     - `"ac"`：解析延拓（Analytic Continuation）路径。配合 `gw_scheme = "extrapolated"` 使用。`ac` 路径暂不支持 `fourier_self_energy` 或 `hermite_self_energy`。
-- `ac_num_samples`: 取值usize，Padé 虚轴采样点数。从 quadrature 频点中按 PySCF 风格的指数递减步长选取。缺省为 16。
-- `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
-- `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
-- `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
-
 ### GW结果导出
 
 - `save_qp`: 取值bool，设置为 `true` 将准粒子能量保存到文件。缺省为false。
@@ -654,6 +635,36 @@ BSE计算在 `gw_or_bse = "bse"` 时进行，在GW准粒子能量（或从文件
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
+
+### Core-Valence Separation（CVS）BSE：芯层激发
+
+`gw_or_bse = "cvs bse"` 触发 CVS-BSE：跃迁空间只保留芯层占据轨道到虚轨道的激发，屏蔽相互作用默认仍由全部占据轨道构建。
+
+CVS 会自动扩展 GW 的占据窗口以包含所有芯层轨道，要求 `frozen_core_postscf = 0`；使用 `gw_scheme = "parse from file"` 时，`parse_qp_path` 必须包含芯层和虚轨道的完整 QP 能量。
+
+- `cvs_ncore`: 取值usize，芯层占据轨道数；缺省 `0` 表示自动检测。
+- `cvs_core_energy_max`: 取值f64，单位Hartree。自动检测时判定芯层的能量上限，缺省 `-10.0`。
+- `cvs_screening`: 取值String，`"full"`（缺省）或 `"core"`。
+- `cvs_nroots`: 取值usize，报告的 CVS 根数；缺省 `0`。
+- `cvs_eigenvalue_min` / `cvs_eigenvalue_max`: 取值f64，单位Hartree。CVS 根的筛选窗口，缺省 `[0, 1e30]`。
+- `bse_spin`、`bse_tda`、`bse_davidson_solver`、`davidson_*`、`bse_cutoff_energy` 等与普通 BSE 共用。
+
+CVS 输入卡示例：
+
+```toml
+[quasiparticle_methods]
+gw_or_bse = "cvs bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+cvs_ncore = 1
+cvs_screening = "full"
+bse_spin = "singlet"
+bse_tda = true
+bse_davidson_solver = true
+davidson_target_excitations = 5
+cvs_nroots = 5
+```
+
 
 ### GW输入卡示例
 
@@ -690,14 +701,10 @@ gw_or_bse = "gw"
 gw_scheme = "extrapolated"
 scgw = "evgw"
 evgw_rounds = 5
-# 外循环求解技巧与收敛判据（缺省即为下列取值；'diis' 鲁棒性最好，'z_update' 在
-# 无近简并前线轨道的体系上更快，但两者互斥）
-evgw_solver = "diis"        # 或 "z_update"（Z 阻尼牛顿单步）/ "molgw"（MolGW 的单次求值）
 evgw_freeze_outside = false # true = 窗口外轨道保持 KS 能量（MolGW 行为）
 evgw_diis = true
 evgw_diis_space = 8
 evgw_damping = 1.0
-evgw_z_step = 0.01          # 仅 evgw_solver = "z_update" 时使用
 evgw_conv_tol = 1e-5
 evgw_stop_on_convergence = true
 renormalized_singles = true
@@ -1369,6 +1376,36 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
          electronic_energy = -114.5521
          conc = "1.0M"
     ```
+
+## GW-BSE 激发态构型优化（`job_type = "excited_state_opt"`）
+
+该任务把 GW-BSE 解析梯度接到 geomeTRIC，优化 `E_SCF(R) + Omega_S(R)`；`[quasiparticle_methods]` 中的 GW/BSE 设置与 `bse_gradient` 卡相同。
+
+- `gradient_pin_active_space`（默认开启）：固定第一次 BSE 梯度使用的活性空间，避免能量窗口随几何漂移。
+- `gradient_follow_state`（默认开启）：跟踪同一个电子态而不是根序号；`gradient_nroots` 需覆盖可能交换的根。
+- `gradient_track_mode`：`"auto"`（缺省，`excited_state_opt` 用 `"ao_transition"`）或 `"amplitude"`。
+
+```toml
+[ctrl]
+job_type = "excited_state_opt"
+opt_engine = "geometric_pyo3"
+xc = "pbeh"
+
+[quasiparticle_methods]
+gw_or_bse = "bse_gradient"
+gw_variant = "ac"
+bse_tda = true
+gradient_state = 0
+gradient_nroots = 3
+bse_active_occ_start = 0
+bse_active_vir_end = 73
+
+[geometric_pyo3]
+maxiter = 25
+convergence_grms = 1.0e-3
+```
+
+`excited_state_opt` 只支持解析梯度，且不允许同时开启 `analytic_hessian`。
 
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300

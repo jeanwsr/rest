@@ -46,7 +46,9 @@
 use rayon::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm, _dgemm_full, _dsymm};
 use rest_tensors::MatrixFull;
+use std::sync::Arc;
 
+use crate::ri_gw::ao_local::{window_weights, AoLocalIndex, LocalFoldScratch};
 use crate::scf_io::SCF;
 
 /// Shape and orbital-window bookkeeping.
@@ -82,6 +84,20 @@ pub struct GwAoPlan {
     /// Bookkeeping bytes only — the AO tensor itself is **not** owned here.
     pub bytes: usize,
     screen: Option<Screen>,
+    /// Per-auxiliary-function AO support (the part of the pre-screening that
+    /// removes floating-point work).  `None` when `gw_ao_screening_tol = 0`.
+    pub local: Option<Arc<AoLocalIndex>>,
+}
+
+/// The global pair mask to use for a dense unpack, or `None` when the per-`q`
+/// support index supersedes it (see `AoLocalIndex`).
+#[inline]
+fn screen_of(plan: &GwAoPlan) -> Option<&Screen> {
+    if plan.local.is_some() {
+        None
+    } else {
+        plan.screen.as_ref()
+    }
 }
 
 #[inline(always)]
@@ -179,17 +195,19 @@ impl GwAoPlan {
             return None;
         }
 
-        // ---- optional pre-screening index (at most n_packed usizes) ---------
-        let (screen, kept_pairs) = if screening_tol > 0.0 {
-            let mut w = vec![0.0f64; n_bas];
-            for m in start_mo..num_state {
-                for mu in 0..n_bas {
-                    let a = eig.data[mu + m * n_bas].abs();
-                    if a > w[mu] {
-                        w[mu] = a;
-                    }
-                }
-            }
+        // ---- optional pre-screening -----------------------------------------
+        //
+        // Two levels are built from the same weighted criterion
+        // `|J_q[mu,nu]| * w_mu * w_nu > tol`, `w_mu = max_{m in window} |X[mu,m]|`:
+        //
+        //  * `Screen`     — the historical *global* pair mask (a pair is kept if
+        //                   **any** `q` needs it).  It only shortens the unpack.
+        //  * `AoLocalIndex` — the *per-`q`* AO support `S_q`.  This is what
+        //                   removes floating-point work: the fold for `q` runs
+        //                   on the compressed `|S_q| x |S_q|` block, so the cost
+        //                   stops scaling with `n_bas` once `|S_q|` saturates.
+        let (screen, kept_pairs, local) = if screening_tol > 0.0 {
+            let w = window_weights(&eig.data, n_bas, start_mo, num_state);
             let mut mx = vec![0.0f64; n_packed];
             for q in 0..n_aux {
                 let col = &rimatr.data[q * n_packed..(q + 1) * n_packed];
@@ -228,13 +246,23 @@ impl GwAoPlan {
                 100.0 * kept as f64 / n_packed as f64,
                 screening_tol
             );
-            let bytes = row_items.len() * 8 + row_start.len() * 8;
-            (Some(Screen { row_start, row_items }), kept)
+            let local = Arc::new(AoLocalIndex::build(
+                &rimatr.data,
+                n_bas,
+                n_aux,
+                &w,
+                screening_tol,
+            ));
+            (
+                Some(Screen { row_start, row_items }),
+                kept,
+                Some(local),
+            )
         } else {
-            (None, n_packed)
+            (None, n_packed, None)
         };
 
-        let bytes = kept_pairs * 8;
+        let bytes = kept_pairs * 8 + local.as_ref().map_or(0, |l| l.bytes);
         let dims = GwAoDims {
             n_bas,
             n_aux,
@@ -260,6 +288,7 @@ impl GwAoPlan {
             build_seconds,
             bytes,
             screen,
+            local,
         })
     }
 
@@ -318,6 +347,7 @@ pub fn fold_block(
         MatrixFull<f64>, // xc:   [n_bas, n_cols]
         MatrixFull<f64>, // tmp:  [n_bas, n_rows]
         MatrixFull<f64>, // g:    [n_rows, n_cols]
+        LocalFoldScratch,
     );
     let make = || -> Buffers {
         let mut xsel = MatrixFull::new([n_bas, n_rows], 0.0);
@@ -336,16 +366,45 @@ pub fn fold_block(
             xc,
             MatrixFull::new([n_bas, n_rows], 0.0),
             MatrixFull::new([n_rows, n_cols], 0.0),
+            LocalFoldScratch::default(),
         )
     };
+
+    // aggregate gate: weak thresholds stay purely dense (no mixed-path penalty)
+    let engage = plan.local.as_ref().is_some_and(|li| li.engage(n_rows, n_cols));
 
     out.par_chunks_mut(block)
         .enumerate()
         .for_each_init(make, |buf, (q, oq)| {
-            let (sym, xsel, xc, tmp, g) = buf;
+            let (sym, xsel, xc, tmp, g, scratch) = buf;
             let jq = &jpacked[q * n_packed..(q + 1) * n_packed];
 
-            match &plan.screen {
+            // ---- compressed per-q path (pre-screening that removes FLOPs) ----
+            //
+            // Only taken for the `q` whose compressed fold is predicted cheaper
+            // than the dense one (see `AoLocalIndex::worth_local`); the rest fall
+            // through to the historical kernel, so a weak threshold can never
+            // make the fold slower than no screening at all.
+            if let Some(li) = &plan.local {
+                if engage && li.worth_local(q, n_rows, n_cols) {
+                    let support = li.support(q).expect("worth_local implies a support");
+                    let gl =
+                        scratch.fold(jq, n_bas, support, &xsel.data, n_rows, &xc.data, n_cols);
+                    for r in 0..n_rows {
+                        let obase = r * row_stride;
+                        for c in 0..n_cols {
+                            oq[obase + c * col_stride] = gl[r + c * n_rows];
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // The per-`q` support index supersedes the global pair mask: with the
+            // index present the pair-level dropping is already accounted for by
+            // `S_q`, and the masked unpack is an indirect loop that would make
+            // the dense fallback *slower* than no screening at all.
+            match screen_of(plan) {
                 None => {
                     for hi in 0..n_bas {
                         let base = hi * (hi + 1) / 2;
@@ -485,6 +544,96 @@ fn fold_occ_batch(scf_data: &SCF, plan: &GwAoPlan, chunk: &[usize]) -> MatrixFul
         let src = (d.start_mo + i) * n_bas;
         xb.data[bi * n_bas..(bi + 1) * n_bas].copy_from_slice(&x[src..src + n_bas]);
     }
+
+    // ---- compressed per-q path ------------------------------------------------
+    //
+    // With pre-screening active the whole batch is folded directly on each
+    // `S_q`: `u^(chunk[bi])[q, a] = sum_{mu,nu in S_q} J_q[mu,nu] X[mu,i] X[nu,a]`.
+    // That removes both the full-`N` half transform and the `[M, nb, N]`
+    // `tb` scatter of the dense path (`M*nb*N` doubles copied per batch).
+    if let Some(li) = &plan.local {
+        if li.engage(nb, n_v) {
+            let mut ucat = MatrixFull::new([n_aux, nb * n_v], 0.0);
+            let mut scratch = LocalFoldScratch::default();
+            let xv = &x[d.lumo * n_bas..];
+            // Orbital-independent part of the response lives in `tb` on the dense
+            // path; here each `q` is folded once, on its own support.
+            let mut tq = MatrixFull::new([n_bas, nb], 0.0);
+            let mut tb: Vec<MatrixFull<f64>> =
+                (0..nb).map(|_| MatrixFull::new([n_bas, n_aux], 0.0)).collect();
+            let mut used_local = 0usize;
+            for q in 0..n_aux {
+                let jq = &jpacked[q * n_packed..(q + 1) * n_packed];
+                if li.worth_local(q, nb, n_v) {
+                    used_local += 1;
+                    let support = li.support(q).expect("worth_local implies a support");
+                    let gl = scratch.fold(jq, n_bas, support, &xb.data, nb, xv, n_v);
+                    for bi in 0..nb {
+                        for a in 0..n_v {
+                            ucat.data[(bi * n_v + a) * n_aux + q] = gl[bi + a * nb];
+                        }
+                    }
+                    continue;
+                }
+                // dense `q`: the historical half-transform + scatter
+                match screen_of(plan) {
+                    None => {
+                        for hi in 0..n_bas {
+                            let base = hi * (hi + 1) / 2;
+                            let col = &mut sym.data[hi * n_bas..(hi + 1) * n_bas];
+                            col[..=hi].copy_from_slice(&jq[base..base + hi + 1]);
+                        }
+                    }
+                    Some(s) => {
+                        for hi in 0..n_bas {
+                            let base = hi * (hi + 1) / 2;
+                            for &lo in &s.row_items[s.row_start[hi]..s.row_start[hi + 1]] {
+                                sym.data[lo + hi * n_bas] = jq[base + lo];
+                            }
+                        }
+                    }
+                }
+                _dsymm(&sym, &xb, &mut tq, 'L', 'U', 1.0, 0.0);
+                for bi in 0..nb {
+                    tb[bi].data[q * n_bas..(q + 1) * n_bas]
+                        .copy_from_slice(&tq.data[bi * n_bas..(bi + 1) * n_bas]);
+                }
+            }
+            if used_local == n_aux {
+                // every `q` was folded on its own support: nothing left to finish
+                return ucat;
+            }
+            if used_local > 0 {
+                // finish the dense `q`s exactly as the historical path does
+                for bi in 0..nb {
+                    let mut u = MatrixFull::new([n_aux, n_v], 0.0);
+                    _dgemm(
+                        &tb[bi],
+                        (0..n_bas, 0..n_aux),
+                        'T',
+                        &scf_data.eigenvectors[0],
+                        (0..n_bas, d.lumo..d.lumo + n_v),
+                        'N',
+                        &mut u,
+                        (0..n_aux, 0..n_v),
+                        1.0,
+                        0.0,
+                    );
+                    // `ucat` already holds the compressed `q`s; add the dense ones
+                    let cbase = bi * n_v;
+                    for a in 0..n_v {
+                        let col = &mut ucat.data[(cbase + a) * n_aux..(cbase + a + 1) * n_aux];
+                        for (dst, src) in col.iter_mut().zip(u.data[a * n_aux..(a + 1) * n_aux].iter())
+                        {
+                            *dst += *src;
+                        }
+                    }
+                }
+                return ucat;
+            }
+        }
+    }
+
     let mut tq = MatrixFull::new([n_bas, nb], 0.0);
     let mut tb: Vec<MatrixFull<f64>> =
         (0..nb).map(|_| MatrixFull::new([n_bas, n_aux], 0.0)).collect();
