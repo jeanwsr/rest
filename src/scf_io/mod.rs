@@ -501,7 +501,10 @@ impl SCF {
 
         //========================================
         // For four-center integrals
-        self.ijkl = if self.mol.ctrl.use_auxbas {
+        // eri_type = analytic: keep the four-center tensor in memory only on explicit request;
+        // the default is the on-the-fly J (no O(N^4) storage).
+        let keep_stored_4c = std::env::var("REST_ERIFOLD4_STORED").is_ok();
+        self.ijkl = if self.mol.ctrl.use_auxbas || !keep_stored_4c {
             None
         } else {
             Some(self.mol.int_ijkl_erifold4())
@@ -2148,6 +2151,16 @@ impl SCF {
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
         let spin_channel = self.mol.spin_channel;
+        let dm_ready = self.density_matrix.len() >= spin_channel
+            && self.density_matrix.iter().take(spin_channel)
+                .all(|d| d.size()[0] == num_basis && d.size()[1] == num_basis)
+            && self.density_matrix.iter().take(spin_channel)
+                .any(|d| d.data.iter().any(|&x| x != 0.0));
+        if !dm_ready {
+            println!("[erifold4] empty/zero density matrix during initialization; using the core Hamiltonian");
+            for i_spin in 0..spin_channel { self.hamiltonian[i_spin] = self.h_core.clone(); }
+            return;
+        }
         //let homo = &self.homo;
         //let vj = if self.mol.ctrl.num_threads>1 {
         //    self.generate_vj_with_erifold4_sync(1.0);
@@ -2159,12 +2172,28 @@ impl SCF {
         //} else {
         //    self.generate_vk_with_erifold4_v02(-0.5)
         //};
-        let vj = self.generate_vj_with_erifold4_sync(1.0);
+        let vj = if self.ijkl.is_some() {
+            self.generate_vj_with_erifold4_sync(1.0)
+        } else {
+            let dm_for_j: Vec<MatrixFull<f64>> = if spin_channel == 2 {
+                let mut d = self.density_matrix[0].clone();
+                for (a, b) in d.data.iter_mut().zip(self.density_matrix[1].data.iter()) { *a += *b; }
+                vec![d.clone(), d]
+            } else {
+                vec![self.density_matrix[0].clone()]
+            };
+            vj_on_the_fly_par(&self.mol, &dm_for_j)
+        };
         let scaling_factor = match self.scftype {
             SCFType::RHF => -0.5,
             _ => -1.0,
         };
-        let vk = self.generate_vk_with_erifold4_sync(scaling_factor);
+        let vk = if self.ijkl.is_some() {
+            self.generate_vk_with_erifold4_sync(scaling_factor)
+        } else {
+            println!("[erifold4] eri_type=analytic without stored 4-center tensor: K is skipped (use RI for hybrid functionals)");
+            Vec::new()
+        };
         // let tmp_matrix = &self.h_core;
         // let mut tmp_num = 0;
         // let (i_len,j_len) =  (self.mol.num_basis,self.mol.num_basis);
@@ -2182,12 +2211,15 @@ impl SCF {
                             .for_each(|(h_ij,vj_ij)| {
                                 *h_ij += vj_ij
                             });
-            self.hamiltonian[i_spin].data
-                            .par_iter_mut()
-                            .zip(vj[1].data.par_iter())
-                            .for_each(|(h_ij,vj_ij)| {
-                                *h_ij += vj_ij
-                            });
+            if self.ijkl.is_some() {
+                // stored path: vj[i_spin] is the per-spin Coulomb; vj[0]+vj[1] = J(D_total)
+                self.hamiltonian[i_spin].data
+                                .par_iter_mut()
+                                .zip(vj[1].data.par_iter())
+                                .for_each(|(h_ij,vj_ij)| {
+                                    *h_ij += vj_ij
+                                });
+            }
             self.hamiltonian[i_spin].data
                             .par_iter_mut()
                             .zip(vk[i_spin].data.par_iter())
@@ -2324,6 +2356,16 @@ impl SCF {
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
         let spin_channel = self.mol.spin_channel;
+        let dm_ready = self.density_matrix.len() >= spin_channel
+            && self.density_matrix.iter().take(spin_channel)
+                .all(|d| d.size()[0] == num_basis && d.size()[1] == num_basis)
+            && self.density_matrix.iter().take(spin_channel)
+                .any(|d| d.data.iter().any(|&x| x != 0.0));
+        if !dm_ready {
+            println!("[erifold4] empty/zero density matrix during initialization; using the core Hamiltonian");
+            for i_spin in 0..spin_channel { self.hamiltonian[i_spin] = self.h_core.clone(); }
+            return (0.0, 0.0);
+        }
         let mut exc_total = 0.0;
         let mut vxc_total = 0.0;
         //let homo = &self.homo;
@@ -2332,17 +2374,23 @@ impl SCF {
         }
         let dt1 = time::Local::now();
         //let vj = self.generate_vj_with_ri_v_sync(1.0);
-        let vj = self.generate_vj_with_erifold4_sync(1.0);
+        let vj = if self.ijkl.is_some() {
+            self.generate_vj_with_erifold4_sync(1.0)
+        } else {
+            let dm_for_j: Vec<MatrixFull<f64>> = if spin_channel == 2 {
+                let mut d = self.density_matrix[0].clone();
+                for (a, b) in d.data.iter_mut().zip(self.density_matrix[1].data.iter()) { *a += *b; }
+                vec![d.clone(), d]
+            } else {
+                vec![self.density_matrix[0].clone()]
+            };
+            vj_on_the_fly_par(&self.mol, &dm_for_j)
+        };
         for i_spin in (0..spin_channel) {
+            if i_spin >= vj.len() { continue; }
             self.hamiltonian[i_spin].data
                 .par_iter_mut()
-                .zip(vj[0].data.par_iter())
-                .for_each(|(h_ij,vj_ij)| {
-                    *h_ij += vj_ij
-                });
-            self.hamiltonian[i_spin].data
-                .par_iter_mut()
-                .zip(vj[1].data.par_iter())
+                .zip(vj[i_spin].data.par_iter())
                 .for_each(|(h_ij,vj_ij)| {
                     *h_ij += vj_ij
                 });
@@ -2354,7 +2402,12 @@ impl SCF {
         }*self.mol.dfadef.dfa_hybrid_scf ;
         if ! scaling_factor.eq(&0.0) {
             //let vk = self.generate_vk_with_ri_v(scaling_factor);
-            let vk = self.generate_vk_with_erifold4_sync(scaling_factor);
+                let vk = if self.ijkl.is_some() {
+                self.generate_vk_with_erifold4_sync(scaling_factor)
+            } else {
+                println!("[erifold4] eri_type=analytic without stored 4-center tensor: K is skipped (use RI for hybrid functionals)");
+                Vec::new()
+            };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
                     .par_iter_mut()
@@ -2371,8 +2424,16 @@ impl SCF {
             println!("[jk-time] J {:.3}s | K {:.3}s (wall per iteration)", j_s, k_s);
         }
         if self.mol.dfadef.is_dfa_scf() {
-            let (exc,vxc) = self.generate_vxc(1.0);
-            //println!("{:?}",vxc[0].data);
+            // use_dm_only (initial-guess phase): MOs / grids.ao are not ready yet,
+            // so the XC terms must come from the density-only kernel.
+            // NOTE: the XC kernels return (total_elec: [f64;2], exc: f64, vxc: Vec<MatrixUpper>).
+            let (exc, vxc) = if self.mol.ctrl.use_dm_only {
+                let (_total_elec, exc, vxc) = self.generate_vxc_rayon_dm_only(1.0);
+                (exc, vxc)
+            } else {
+                let (_total_elec, exc, vxc) = self.generate_vxc_rayon(1.0);
+                (exc, vxc)
+            };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
                                 .par_iter_mut()
@@ -2921,7 +2982,10 @@ impl SCF {
             }
         } else {
             if self.mol.ctrl.eri_type.eq("analytic") {
+                let origin_dm_only = self.mol.ctrl.use_dm_only;
+                self.mol.ctrl.use_dm_only = true;
                 self.generate_ks_hamiltonian_erifold4();
+                self.mol.ctrl.use_dm_only = origin_dm_only;
             } else if  self.mol.ctrl.eri_type.eq("ri_v") {
                 let origin_dm_only = self.mol.ctrl.use_dm_only;
                 self.mol.ctrl.use_dm_only = true;
