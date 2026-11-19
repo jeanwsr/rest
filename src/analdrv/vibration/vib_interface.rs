@@ -59,9 +59,9 @@ pub fn vibration_analysis_interface(
         let e0 = scf_data.scf_energy;
         let multiplicity = scf_data.mol.ctrl.spin;
 
-        use crate::analdrv::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
+        use crate::symmetry::detect_point_group_with_masses;
         let tol_pg = cfg.tol_point_group / (1.0 + natm as f64).sqrt();
-        let (pg_name, pg_sigma) = get_full_point_group_for_vib(&elems, &mass, &geom, tol_pg);
+        let pg = detect_point_group_with_masses(&elems, &geom, &mass, tol_pg);
 
         let thermo_ctrl = scf_data.mol.ctrl.thermo.as_ref();
         let temperature = thermo_ctrl.map(|t| t.temperature).unwrap_or(298.15);
@@ -73,9 +73,9 @@ pub fn vibration_analysis_interface(
         }
 
         // if control input has symmetry number, use it; otherwise, use point group detected sigma.
-        let mut symmetry_number = thermo_ctrl.map(|t| t.symmetry_number as i64).unwrap_or(pg_sigma as i64);
+        let mut symmetry_number = thermo_ctrl.map(|t| t.symmetry_number as i64).unwrap_or(pg.sigma as i64);
         if symmetry_number <= 0 {
-            symmetry_number = pg_sigma as i64;
+            symmetry_number = pg.sigma as i64;
         }
 
         let th = thermo(
@@ -89,7 +89,7 @@ pub fn vibration_analysis_interface(
             &rc_cm,
             rotor,
         );
-        println!("Point group: {}, sigma (rotation symmetry number): {}", pg_name, pg_sigma);
+        println!("Point group: {}, sigma (rotation symmetry number): {}", pg.label, pg.sigma);
         let msg_th = print_gau_thermo(&th, multiplicity as _, mass_sum);
         println!("{}", msg_th);
         println!("");

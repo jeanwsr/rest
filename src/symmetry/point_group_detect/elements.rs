@@ -46,6 +46,16 @@ const TABLE: &[(&str, u8, f64)] = &[
     ("I", 53, 126.9044719),
 ];
 
+/// Pseudo atomic numbers for isotopes (avoid collision with real Z <= 118).
+/// A distinct Z from H(1) ensures isotope-substituted atoms are never
+/// equivalent to their parent element in the Z+mass equivalence test.
+pub const Z_DEUTERIUM: u8 = 200;
+pub const Z_TRITIUM: u8 = 201;
+/// First pseudo-Z used for interning symbols absent from [`TABLE`] (assigned
+/// sequentially per molecule in [`super::SymmMolecule::new`], so distinct
+/// unknown elements never compare equal).
+pub const Z_UNKNOWN_BASE: u8 = 210;
+
 /// Normalize a user-supplied symbol to the table form (first letter upper,
 /// rest lower), matching Psi4's element lookup. "X" → dummy (Z=0).
 fn normalize(s: &str) -> String {
@@ -56,18 +66,28 @@ fn normalize(s: &str) -> String {
     }
 }
 
-/// Atomic number for an element symbol, or `None` if unknown. "X" → 0 (dummy).
+/// Atomic number for an element symbol, or `None` if unknown. "X" → 0
+/// (dummy); "D"/"T" → isotope pseudo-Z ([`Z_DEUTERIUM`]/[`Z_TRITIUM`]).
 pub fn symbol_to_z(s: &str) -> Option<u8> {
     let n = normalize(s);
-    if n == "X" {
-        return Some(0);
+    match n.as_str() {
+        "X" => return Some(0),
+        "D" => return Some(Z_DEUTERIUM),
+        "T" => return Some(Z_TRITIUM),
+        _ => {},
     }
     TABLE.iter().find(|(sym, _, _)| *sym == n).map(|(_, z, _)| *z)
 }
 
 /// Default most-abundant-isotope mass for atomic number `z`, or `0.0` if
-/// unknown (dummy `z==0` → 0.0).
+/// unknown (dummy `z==0` → 0.0). Isotope pseudo-Z resolve to their isotope
+/// masses.
 pub fn z_to_mass(z: u8) -> f64 {
+    match z {
+        Z_DEUTERIUM => return 2.01410177812, // ²H atom mass (NIST)
+        Z_TRITIUM => return 3.01604928199,   // ³H atom mass (NIST)
+        _ => {},
+    }
     TABLE.iter().find(|(_, zz, _)| *zz == z).map(|(_, _, m)| *m).unwrap_or(0.0)
 }
 
@@ -86,5 +106,18 @@ mod tests {
         assert!((z_to_mass(1) - 1.00782503223).abs() < 1e-12);
         assert!((z_to_mass(8) - 15.99491461957).abs() < 1e-12);
         assert_eq!(z_to_mass(0), 0.0);
+    }
+
+    #[test]
+    fn isotopes() {
+        assert_eq!(symbol_to_z("D"), Some(Z_DEUTERIUM));
+        assert_eq!(symbol_to_z("d"), Some(Z_DEUTERIUM));
+        assert_eq!(symbol_to_z("T"), Some(Z_TRITIUM));
+        assert_eq!(symbol_to_z("t"), Some(Z_TRITIUM));
+        assert_eq!(z_to_mass(Z_DEUTERIUM), 2.01410177812);
+        assert_eq!(z_to_mass(Z_TRITIUM), 3.01604928199);
+        // isotopes must never be equivalent to their parent element
+        assert_ne!(symbol_to_z("D"), symbol_to_z("H"));
+        assert_ne!(z_to_mass(Z_DEUTERIUM), z_to_mass(1));
     }
 }

@@ -15,7 +15,7 @@
 //!
 //! # Example
 //! ```ignore
-//! use rest::analdrv::point_group_detect::SymmMolecule;
+//! use rest::symmetry::point_group_detect::SymmMolecule;
 //!
 //! // H2O (Bohr) -> C2v
 //! let mol = SymmMolecule::new(
@@ -36,8 +36,6 @@ pub mod linalg;
 pub mod matrix;
 pub mod molecule;
 pub mod vec3;
-
-pub mod interface_to_rest;
 
 pub use detect::PointGroup;
 pub use molecule::SymmMolecule;
