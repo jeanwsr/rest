@@ -19,7 +19,7 @@ use crate::grad::rhf::{RIRHFGradient, RIHFGradientFlags};
 use crate::dft::{Grids, DFA4REST};
 use crate::dft::xc_deriv::XCType;
 use crate::dft::num_int::{NumInt, XCData, BlockSettings};
-use crate::dft::num_int::{GRID_BLOCK_AO_NS, GRID_BLOCK_RHOXC_NS, GRID_BLOCK_CONTRACT_NS, GRID_BLOCK_COUNT, GRID_BLOCK_ACTIVE_SUM, GRID_BLOCK_GTO_NS};
+use crate::dft::num_int::{GRID_BLOCK_AO_NS, GRID_BLOCK_RHOXC_NS, GRID_BLOCK_XC_NS, GRID_BLOCK_CONTRACT_NS, GRID_BLOCK_COUNT, GRID_BLOCK_ACTIVE_SUM, GRID_BLOCK_GTO_NS};
 use crate::dft::num_int::{eval_rho5_batch, eval_rho5_dm_only_batch, eval_ao_batch};
 use crate::dft::libxc_itrf::{eval_xc_eff};
 use crate::utilities::{self, balancing};
@@ -233,6 +233,7 @@ impl RIRHFGradient<'_> {
         let xc_block_mb = utilities::memory_batch::xc_grad_block_mb(self.flags.max_memory, 16.0);
         GRID_BLOCK_AO_NS.store(0, std::sync::atomic::Ordering::Relaxed);
         GRID_BLOCK_RHOXC_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        GRID_BLOCK_XC_NS.store(0, std::sync::atomic::Ordering::Relaxed);
         GRID_BLOCK_CONTRACT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
         GRID_BLOCK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
         GRID_BLOCK_ACTIVE_SUM.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -249,11 +250,12 @@ impl RIRHFGradient<'_> {
             let nbb_avg = GRID_BLOCK_ACTIVE_SUM.load(std::sync::atomic::Ordering::Relaxed) as f64
                 / (nblk.max(1) as f64);
             let gto_s = GRID_BLOCK_GTO_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e9;
-            println!("XC grad profile: grid {} ({:.3} s) + Morton reorder {:.3} s; block pipeline {:.3} s wall over {} blocks / {} threads; avg active basis {:.0}/{}; worker-sums: ao_eval {:.3} s (gto {:.3} s + screen/asm {:.3} s), rho+xc {:.3} s, contraction {:.3} s (est. wall shares: {:.3}, {:.3}, {:.3} s)",
+            let xc_s = GRID_BLOCK_XC_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e9;
+            println!("XC grad profile: grid {} ({:.3} s) + Morton reorder {:.3} s; block pipeline {:.3} s wall over {} blocks / {} threads; avg active basis {:.0}/{}; worker-sums: ao_eval {:.3} s (gto {:.3} s + screen/asm {:.3} s), rho+xc {:.3} s, contraction {:.3} s (est. wall shares: {:.3}, {:.3}, {:.3} s); rho-only {:.3} s, xc-only {:.3} s",
                 if grids_reused { "reused from SCF" } else { "freshly built" },
                 t_grid_build.as_secs_f64(), t_reorder.as_secs_f64(), t_pipeline.as_secs_f64(),
                 nblk, nthr as usize, nbb_avg, mol.num_basis,
-                ao_s, gto_s, ao_s - gto_s, rho_s, con_s, ao_s / nthr, rho_s / nthr, con_s / nthr);
+                ao_s, gto_s, ao_s - gto_s, rho_s, con_s, ao_s / nthr, rho_s / nthr, con_s / nthr, rho_s - xc_s, xc_s);
         }
         utilities::memory_batch::mem_probe("calc_de_xc: after get_vxc_rayon_new", mem_probe_on);
         // println!("Print dao_vxc: {:?}", dao_vxc);
@@ -881,8 +883,11 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
                 eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, dm_use, 1, ng)
             };
 
+            let t_rho_done = std::time::Instant::now();
             let xc_ten = eval_xc_eff(&xc_data.funcs, xc_data.xc_type, 0, &loc_rho.raw(), ng, deriv);
-            GRID_BLOCK_RHOXC_NS.fetch_add(t_rhoxc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let t_xc_done = std::time::Instant::now();
+            GRID_BLOCK_RHOXC_NS.fetch_add((t_xc_done - t_rhoxc).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            GRID_BLOCK_XC_NS.fetch_add((t_xc_done - t_rho_done).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let loc_vxc = rt::asarray(xc_ten[1].as_ref().expect("vxc not provided for this xc_type"));
 
             let loc_w = rt::asarray((block.weights, device));

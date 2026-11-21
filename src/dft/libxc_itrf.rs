@@ -305,6 +305,18 @@ fn generate_rho_vec(rho_u:&[f64], spin:usize, nvar: usize, np: usize) -> Vec<f64
 }
 
 
+/// Cached default BLAS device for the per-block XC evaluation path.
+///
+/// `DeviceBLAS::default()` builds a brand-new rayon thread pool, and the grid
+/// block loops call this once per block (thousands of times per gradient). The
+/// pool construction then dominates the block time and, with many worker
+/// threads, serialises on the glibc loader/TLS locks. Cloning a single cached
+/// device shares the same pool and keeps the per-call semantics.
+fn xc_eval_device() -> DeviceBLAS {
+    static DEVICE: std::sync::OnceLock<DeviceBLAS> = std::sync::OnceLock::new();
+    DEVICE.get_or_init(DeviceBLAS::default).clone()
+}
+
 pub fn eval_xc_eff(funcs:&[(f64, LibXCFunctional)], xc_type:XCType, spin:usize, rho_array:&[f64], np:usize, deriv:usize) -> Vec<Option<Tensor<f64, DeviceBLAS>>> {
 
     // let (xc_type, nvar) = match xc_family {
@@ -345,7 +357,7 @@ pub fn eval_xc_eff(funcs:&[(f64, LibXCFunctional)], xc_type:XCType, spin:usize, 
     let libxc_out = eval_xc1(funcs, xc_type, spin, rho, sigma, lapl, tau, np, deriv);
 
     let (_, xc_n_components) = get_nvar(xc_type, spin, deriv);
-    let device = DeviceBLAS::default();
+    let device = xc_eval_device();
     let rho_ten_shape: Vec<usize> = match spin {
         0 => vec![np, nvar], // unpolarized case
         1 => vec![np, nvar, 2], // polarized case
