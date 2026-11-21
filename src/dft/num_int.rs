@@ -30,6 +30,7 @@ use rest_libcint::prelude::CInt;
 /// without an external profiler.
 pub static GRID_BLOCK_AO_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRID_BLOCK_RHOXC_NS: AtomicU64 = AtomicU64::new(0);
+pub static GRID_BLOCK_XC_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRID_BLOCK_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRID_BLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Sum of the per-block active (locality-screened) basis counts; averaged by
@@ -2889,11 +2890,34 @@ impl<'a> GridParallelIterator<'a> {
         // tighter than `ao_cutoff` to cover the amplification of the AO first
         // and second derivatives used by the gradient contraction. Disabled
         // when `ao_cutoff <= 0` (exact, dense path).
+        // The tightening factor is tunable for gradient-locality experiments
+        // (`REST_XC_ROW_FACTOR`; default 1e-3; 0 or a non-finite/invalid value
+        // outside [0, inf) falls back to the default; a factor of exactly 0 is
+        // accepted and disables row screening, giving dense rows).
+        let row_factor = match std::env::var("REST_XC_ROW_FACTOR") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(f) if f.is_finite() && f >= 0.0 => f,
+                _ => {
+                    eprintln!(
+                        "[xc-grad] cannot parse REST_XC_ROW_FACTOR='{}', using 1e-3",
+                        v
+                    );
+                    1.0e-3
+                }
+            },
+            Err(_) => 1.0e-3,
+        };
         let row_cutoff = if mol.ctrl.ao_cutoff > 0.0 {
-            mol.ctrl.ao_cutoff * 1.0e-3
+            mol.ctrl.ao_cutoff * row_factor
         } else {
             0.0
         };
+        if mol.ctrl.print_level >= 3 {
+            println!(
+                "[xc-grad] row cutoff = ao_cutoff ({:.3e}) * factor ({:.3e}) = {:.3e}",
+                mol.ctrl.ao_cutoff, row_factor, row_cutoff
+            );
+        }
         let active_radii = if row_cutoff > 0.0 {
             std::sync::Arc::new(atom_influence_radii(mol, row_cutoff))
         } else {

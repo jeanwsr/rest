@@ -315,32 +315,6 @@ impl RIRHFGradient<'_> {
         let aux = ri_jk::util::get_cint_aux(mol_obj);
         let device = DeviceBLAS::default();
 
-        // Integral-level Schwartz screening of the derivative batches: the
-        // engine evaluates only the (shell pair, aux shell) triples whose
-        // exact Schwarz bound can contribute above
-        // `ri_jk.c3_screen_threshold / DERIV_AMP`, filling the rest of the
-        // batch tensors with zeros (same shape and layout as the unscreened
-        // driver). `c3_screen_threshold <= 0` (default) keeps the exact unscreened path.
-        let deriv_screen = if mol_obj.ctrl.ri_jk.c3_screen_threshold > 0.0 {
-            let engine = ri_jk::schwartz_c3::ScreenedC3Engine::build(
-                &mol,
-                &aux,
-                mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
-            );
-            let log_thresh =
-                (mol_obj.ctrl.ri_jk.c3_screen_threshold / ri_jk::schwartz_c3::DERIV_AMP).ln();
-            if mol_obj.ctrl.print_level >= 2 {
-                println!(
-                    "de-jk Schwartz screen: keeping {:.1}% of (pair, aux shell) triples at threshold {:.1e}.",
-                    engine.kept_fraction([0, aux.nbas()], log_thresh) * 100.0,
-                    mol_obj.ctrl.ri_jk.c3_screen_threshold
-                );
-            }
-            Some((engine, log_thresh))
-        } else {
-            None
-        };
-
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);
         let dm_tp = pack_triu_tilde(dm.view());
@@ -410,6 +384,144 @@ impl RIRHFGradient<'_> {
             Some(rows) => (Some(&rows.ao_mask), Some(&rows.packed_mask)),
             None => (None, None),
         };
+
+        // ---- shell-pair skipping for the derivative integral batches ----
+        // Two sources of sparsity, both applied by skipping whole shell
+        // blocks inside the dense libcint loops (zero-filled output, so all
+        // downstream masked contractions stay bit-exact):
+        //   * row space of the stored RI tensor (`rimatr_pair_map`): AO
+        //     pairs pruned from storage are zeroed in every consumer of the
+        //     derivative integrals (dm_ao, dm_tp_masked, ao_pair_mask,
+        //     packed_mask), so their integral blocks can be skipped exactly;
+        //   * c3 Schwarz bounds (`c3_screen_threshold`): replaces the
+        //     per-task engine with the same bound applied as a loop mask.
+        // REST_DEJK_PAIR_SKIP: "0"/"off" keeps the legacy paths (dense, or
+        // the Schwartz task-list engine when c3 > 0); "rowspace" uses only
+        // the row-space mask; unset (default) additionally ANDs the c3
+        // bounds when `c3_screen_threshold > 0`.
+        #[derive(Clone, Copy)]
+        enum SkipMode {
+            Legacy,
+            RowSpace,
+            RowSpaceAndC3,
+        }
+        let skip_mode = match std::env::var("REST_DEJK_PAIR_SKIP").unwrap_or_default().as_str() {
+            "0" | "off" => SkipMode::Legacy,
+            "rowspace" => SkipMode::RowSpace,
+            "" => SkipMode::RowSpaceAndC3,
+            other => {
+                eprintln!(
+                    "[de-jk] unrecognized REST_DEJK_PAIR_SKIP=\"{}\", falling back to legacy paths",
+                    other
+                );
+                SkipMode::Legacy
+            }
+        };
+        let c3_screen_threshold = mol_obj.ctrl.ri_jk.c3_screen_threshold;
+        let use_c3_mask = matches!(skip_mode, SkipMode::RowSpaceAndC3) && c3_screen_threshold > 0.0;
+        let mut deriv_screen = None;
+        let mut pair_skip_mask = None;
+        if matches!(skip_mode, SkipMode::Legacy) || pair_map.is_none() {
+            // legacy paths: dense loops, or the Schwartz task-list engine
+            if c3_screen_threshold > 0.0 {
+                let engine = ri_jk::schwartz_c3::ScreenedC3Engine::build(
+                    &mol,
+                    &aux,
+                    mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
+                );
+                let log_thresh =
+                    (c3_screen_threshold / ri_jk::schwartz_c3::DERIV_AMP).ln();
+                if mol_obj.ctrl.print_level >= 2 {
+                    println!(
+                        "de-jk Schwartz screen: keeping {:.1}% of (shell pair, aux shell) triples at threshold {:.1e}.",
+                        engine.kept_fraction([0, aux.nbas()], log_thresh) * 100.0,
+                        c3_screen_threshold
+                    );
+                }
+                deriv_screen = Some((engine, log_thresh));
+            }
+        } else if let Some(map) = pair_map {
+            let nbas_mol = mol.nbas();
+            let nbas_merged = nbas_mol + aux.nbas();
+            let ao_loc = mol.ao_loc();
+            // conservative projection of the stored rows onto shell pairs: a
+            // shell pair is kept as soon as any of its AO pairs is stored
+            let mut shell_keep = vec![false; nbas_mol * nbas_mol];
+            for row in &map.rows {
+                let mu = row[0] as usize;
+                let nu = row[1] as usize;
+                let ishl = ao_loc.partition_point(|&a0| a0 <= mu) - 1;
+                let jshl = ao_loc.partition_point(|&a0| a0 <= nu) - 1;
+                shell_keep[ishl * nbas_mol + jshl] = true;
+                shell_keep[jshl * nbas_mol + ishl] = true;
+            }
+            // only the k in [nbas_mol, nbas_merged) slab (aux shells of the
+            // merged molecule) is ever queried; storing the full cube would
+            // cost nbas_merged^3 bytes (1.7 GB here) instead of
+            // nbas_mol^2 * n_aux (53 MB here)
+            let mut mask = rest_libcint::CIntPairMask::all_keep_offset(
+                nbas_mol,
+                nbas_mol,
+                nbas_mol,
+                nbas_merged,
+            );
+            for ishl in 0..nbas_mol {
+                for jshl in 0..nbas_mol {
+                    if shell_keep[ishl * nbas_mol + jshl] {
+                        continue;
+                    }
+                    for kshl in nbas_mol..nbas_merged {
+                        mask.set(ishl, jshl, kshl, false);
+                    }
+                }
+            }
+            if use_c3_mask {
+                let engine = ri_jk::schwartz_c3::ScreenedC3Engine::build(
+                    &mol,
+                    &aux,
+                    mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
+                );
+                let log_thresh = (c3_screen_threshold / ri_jk::schwartz_c3::DERIV_AMP).ln();
+                for pair in &engine.pairs.pairs {
+                    let cutoff = log_thresh - pair.q_cond;
+                    for (pshl, &q_aux) in engine.q_aux.iter().enumerate() {
+                        if q_aux < cutoff {
+                            let kshl = nbas_mol + pshl;
+                            mask.set(pair.ish, pair.jsh, kshl, false);
+                            mask.set(pair.jsh, pair.ish, kshl, false);
+                        }
+                    }
+                }
+            }
+            if mol_obj.ctrl.print_level >= 2 {
+                let n_tri = nbas_mol * (nbas_mol + 1) / 2;
+                let n_aux = aux.nbas();
+                let mut kept_pairs = 0usize;
+                let mut kept_blocks = 0usize;
+                for ishl in 0..nbas_mol {
+                    for jshl in ishl..nbas_mol {
+                        if mask.keep(ishl, jshl, nbas_mol) {
+                            kept_pairs += 1;
+                        }
+                        for pshl in 0..n_aux {
+                            if mask.keep(ishl, jshl, nbas_mol + pshl) {
+                                kept_blocks += 1;
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "[de-jk] dense-loop pair skip: keeping {}/{} shell pairs and {}/{} of (pair-triu, aux shell) blocks ({:.1}%), mode = {}",
+                    kept_pairs,
+                    n_tri,
+                    kept_blocks,
+                    n_tri * n_aux,
+                    100.0 * kept_blocks as f64 / (n_tri * n_aux) as f64,
+                    if use_c3_mask { "rowspace AND c3" } else { "rowspace" }
+                );
+            }
+            pair_skip_mask = Some(mask);
+        }
 
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -538,31 +650,47 @@ impl RIRHFGradient<'_> {
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
             time_records.count_start("de-jk batch int");
+            time_records.count_start("de-jk batch int ip1");
             // int3c2e_ip1
             let tsr_int3c2e_ip1 = {
-                let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
-                    Some((engine, thr)) => engine.evaluate_s1_ip1([shl0, shl1], *thr),
-                    None => merged_ijk
-                        .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
-                        .into(),
-                };
-                rt::asarray((out, shape, &device))
-            };
-
-            // int3c2e_ip2
-            let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
-            if self.flags.auxbasis_response {
-                tsr_int3c2e_ip2 = {
-                    let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
-                        Some((engine, thr)) => {
-                            engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr, None)
-                        }
-                        None => merged_ijk
-                            .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                let (out, shape): (Vec<f64>, Vec<usize>) =
+                    match (&deriv_screen, &pair_skip_mask) {
+                        (Some((engine, thr)), _) => engine.evaluate_s1_ip1([shl0, shl1], *thr),
+                        (None, Some(mask)) => merged_ijk
+                            .integrate_with_pair_mask("int3c2e_ip1", "s1", &shl_slices_merged, mask)
+                            .into(),
+                        (None, None) => merged_ijk
+                            .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
                             .into(),
                     };
+                rt::asarray((out, shape, &device))
+            };
+            time_records.count("de-jk batch int ip1");
+
+            let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
+            if self.flags.auxbasis_response {
+                time_records.count_start("de-jk batch int ip2");
+                tsr_int3c2e_ip2 = {
+                    let (out, shape): (Vec<f64>, Vec<usize>) =
+                        match (&deriv_screen, &pair_skip_mask) {
+                            (Some((engine, thr)), _) => {
+                                engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr, None)
+                            },
+                            (None, Some(mask)) => merged_ijk
+                                .integrate_with_pair_mask(
+                                    "int3c2e_ip2",
+                                    "s2ij",
+                                    &shl_slices_merged,
+                                    mask,
+                                )
+                                .into(),
+                            (None, None) => merged_ijk
+                                .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                                .into(),
+                        };
                     rt::asarray((out, shape, &device))
                 };
+                time_records.count("de-jk batch int ip2");
             }
             time_records.count("de-jk batch int");
             if batch_probe_left > 0 {
@@ -909,31 +1037,135 @@ impl RIRHFGradient<'_> {
             }
         }
 
-        let mut deriv_hcore = vec![0.0; 3 * nao * nao];
-
-        let mut temp_mol = mol.clone();
-
-        for i in 0..num_ghosts {
-            let q_i = ghost_pc_chrg[i];
-            let pos_i = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
-
-            temp_mol.with_rinv_origin(pos_i, |mol_mut| {
-                let cint = mol_mut.initialize_cint(false);
-                let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
-
-                if let Some(out_vec) = iprinv_out.out {
-                    for t in 0..3 {
-                        for nu in 0..nao {
-                            for mu in 0..nao {
-                                let idx = mu + nu * nao + t * (nao * nao);
-                                if let Some(&val) = out_vec.get(idx) {
-                                    deriv_hcore[t * nao * nao + mu * nao + nu] += q_i * val;
+        // The AO part of the gradient is
+        //     sum_a sum_{mu in a} sum_nu D[mu,nu] sum_i q_i <d_mu/dR_a | 1/|r-R_i| |nu>
+        // Two things made the naive implementation expensive here: a full
+        // `initialize_cint` per point charge (1502 of them) and a
+        // bounds-checked, element-by-element transposing copy of every
+        // integral block (3*nao^2 entries each time). Both are removed:
+        //   * each worker builds ONE CInt engine and only re-sets its rinv
+        //     origin per charge (`set_rinv_origin` bumps the optimizer cache
+        //     generation, so nothing stale is reused);
+        //   * the charges are split into contiguous chunks that accumulate the
+        //     raw libcint block with a dense axpy, and the block is transposed
+        //     once at the end into the [t][mu][nu] layout used by the density
+        //     contraction.
+        // Only the summation order changes, so the result moves at the level of
+        // floating-point roundoff.
+        let nao2 = nao * nao;
+        // Small persistent worker pool for the point-charge AO gradient: every
+        // slot owns a CInt engine plus a 3*nao^2 accumulator (and each
+        // integrate call allocates another transient block of the same size),
+        // so the slot count — not the global thread count — bounds this
+        // part's transient memory. REST_QMMM_SLOTS: 0 = legacy (one slot per
+        // global thread), N > 0 = at most N slots (default 16; always clamped
+        // to the global thread count). The pool is built once and reused for
+        // every call (geometry steps included).
+        static QMMM_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        let global_threads = rayon::current_num_threads().max(1);
+        let slot_cap = match std::env::var("REST_QMMM_SLOTS") {
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!(
+                        "[de-qmmm] cannot parse REST_QMMM_SLOTS='{}', using the default 16",
+                        v
+                    );
+                    16
+                }
+            },
+            Err(_) => 16,
+        };
+        let nthreads = if slot_cap == 0 {
+            global_threads
+        } else {
+            slot_cap.min(global_threads).max(1)
+        };
+        if mol.ctrl.print_level >= 2 {
+            println!(
+                "[de-qmmm] worker slots: {} (cap {}, global threads {})",
+                nthreads, slot_cap, global_threads
+            );
+        }
+        let qmmm_pool = QMMM_POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(nthreads)
+                .thread_name(|i| format!("qmmm-slot-{}", i))
+                .build()
+                .expect("failed to build the de-qmmm worker pool")
+        });
+        let chunk = num_ghosts.div_ceil(nthreads);
+        let mem_probe_on = mem_probe_enabled(mol.ctrl.print_level);
+        mem_probe(
+            &format!("de-qmmm AO part: enter ({} slots)", nthreads),
+            mem_probe_on,
+        );
+        let deriv_hcore_raw = qmmm_pool.install(|| {
+            (0..nthreads)
+                .into_par_iter()
+                .map(|w| {
+                let lo = (w * chunk).min(num_ghosts);
+                let hi = ((w + 1) * chunk).min(num_ghosts);
+                if lo >= hi {
+                    return Vec::new();
+                }
+                let mut acc = vec![0.0_f64; 3 * nao2];
+                let mut cint = mol.initialize_cint(false);
+                for i in lo..hi {
+                    let q_i = ghost_pc_chrg[i];
+                    if q_i == 0.0 {
+                        continue;
+                    }
+                    cint.set_rinv_origin([
+                        ghost_pc_pos[[0, i]],
+                        ghost_pc_pos[[1, i]],
+                        ghost_pc_pos[[2, i]],
+                    ]);
+                    let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
+                    if let Some(out_vec) = iprinv_out.out {
+                        if out_vec.len() == acc.len() {
+                            for (slot, val) in acc.iter_mut().zip(out_vec.iter()) {
+                                *slot += q_i * val;
+                            }
+                        } else {
+                            // Defensive fallback for an unexpected output shape.
+                            for (idx, val) in out_vec.iter().enumerate() {
+                                if idx < acc.len() {
+                                    acc[idx] += q_i * val;
                                 }
                             }
                         }
                     }
                 }
-            });
+                acc
+            })
+            .reduce(
+                || Vec::new(),
+                |mut acc, part| {
+                    if part.is_empty() {
+                        return acc;
+                    }
+                    if acc.is_empty() {
+                        return part;
+                    }
+                    for (slot, val) in acc.iter_mut().zip(part.iter()) {
+                        *slot += val;
+                    }
+                    acc
+                },
+            )
+        });
+        mem_probe("de-qmmm AO part: done (chunks accumulated)", mem_probe_on);
+        // libcint hands back the Cartesian blocks as [nu][mu] (mu fastest); the
+        // density contraction below walks [mu][nu] with mu the atom-local index.
+        let mut deriv_hcore = vec![0.0_f64; 3 * nao2];
+        for t in 0..3 {
+            for nu in 0..nao {
+                for mu in 0..nao {
+                    deriv_hcore[t * nao2 + mu * nao + nu] =
+                        deriv_hcore_raw[t * nao2 + nu * nao + mu];
+                }
+            }
         }
 
         let is_sp = mol.ctrl.spin_polarization;

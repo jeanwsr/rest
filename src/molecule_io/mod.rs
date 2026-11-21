@@ -1242,19 +1242,58 @@ impl Molecule {
             // for the ghost point charge term
             // <a|-Za/|Ra-r||b> -> -Za*<a|1/|r||b> by setting PTR_RINV_ORIG as Ra
             let orig_orig = cint_data.get_rinv_origin();
-            self.geom.ghost_pc_chrg.iter().zip(self.geom.ghost_pc_pos.iter_columns_full()).for_each(|(charge, pos)| {
-                let mut tmp_out = vec![];
-                let mut tmp_out_shape = vec![];
-                cint_data.set_rinv_origin([pos[0], pos[1], pos[2]]);
-                (tmp_out, tmp_out_shape) = cint_data.integral_s2ij::<int1e_rinv>(None);
-                //println!("debug pos: {:?}, charge: {}", pos, charge);
-                if out.len() == 0 {
-                    out = vec![0.0;tmp_out.len()];
-                }
-                out.iter_mut().zip(tmp_out.iter()).for_each(|(o, t)| {
-                    *o -= *t * charge
+            let serial = std::env::var("REST_PC_PAR").map(|v| v == "0").unwrap_or(false);
+            if serial {
+                self.geom.ghost_pc_chrg.iter().zip(self.geom.ghost_pc_pos.iter_columns_full()).for_each(|(charge, pos)| {
+                    let mut tmp_out = vec![];
+                    let mut tmp_out_shape = vec![];
+                    cint_data.set_rinv_origin([pos[0], pos[1], pos[2]]);
+                    (tmp_out, tmp_out_shape) = cint_data.integral_s2ij::<int1e_rinv>(None);
+                    //println!("debug pos: {:?}, charge: {}", pos, charge);
+                    if out.len() == 0 {
+                        out = vec![0.0;tmp_out.len()];
+                    }
+                    out.iter_mut().zip(tmp_out.iter()).for_each(|(o, t)| {
+                        *o -= *t * charge
+                    });
                 });
-            });
+            } else {
+                use rayon::prelude::*;
+                // The serial loop above walks the charges one by one, each with
+                // a full s2ij evaluation; here every rayon worker owns a private
+                // CInt environment (raw pointers, not Sync), built once, and
+                // accumulates its round-robin share of the charges into a local
+                // buffer. Only the floating-point summation order changes.
+                let charges: Vec<(f64, [f64; 3])> = self.geom.ghost_pc_chrg.iter()
+                    .zip(self.geom.ghost_pc_pos.iter_columns_full())
+                    .map(|(charge, pos)| (*charge, [pos[0], pos[1], pos[2]]))
+                    .collect();
+                let n_workers = rayon::current_num_threads().max(1);
+                out = (0..n_workers).into_par_iter().map(|worker| {
+                    let mut cint_local = self.initialize_cint(false);
+                    let mut acc: Vec<f64> = vec![];
+                    for idx in (worker..charges.len()).step_by(n_workers) {
+                        let (charge, pos) = charges[idx];
+                        cint_local.set_rinv_origin(pos);
+                        let (tmp_out, _) = cint_local.integral_s2ij::<int1e_rinv>(None);
+                        if acc.is_empty() {
+                            acc = vec![0.0; tmp_out.len()];
+                        }
+                        acc.iter_mut().zip(tmp_out.iter()).for_each(|(o, t)| {
+                            *o -= *t * charge
+                        });
+                    }
+                    acc
+                }).reduce(Vec::new, |mut a, b| {
+                    if a.is_empty() {
+                        return b;
+                    }
+                    if !b.is_empty() {
+                        a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x += *y);
+                    }
+                    a
+                });
+            }
 
             cint_data.set_rinv_origin(orig_orig);
         } else if op_name.eq("hcore") {
